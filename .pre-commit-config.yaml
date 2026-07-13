@@ -1,0 +1,93 @@
+repos:
+  - repo: local
+    hooks:
+      - id: repository-file-hygiene
+        name: repository file hygiene
+        entry: .venv/bin/python scripts/check_file_hygiene.py
+        language: system
+
+      - id: repository-config-syntax
+        name: repository config syntax
+        entry: .venv/bin/python scripts/check_config_syntax.py
+        language: system
+        files: \.(json|toml|ya?ml)$
+
+      - id: github-workflow-structure
+        name: github workflow structure
+        entry: .venv/bin/python scripts/check_github_workflows.py
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$
+
+      - id: quality-gate-parity
+        name: quality gate parity
+        entry: .venv/bin/python scripts/check_quality_gate_parity.py
+        language: system
+        pass_filenames: false
+        files: ^(\.pre-commit-config\.yaml|\.github/workflows/quality-gate\.yml)$
+
+      - id: uv-lock-check
+        name: uv lock check
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock)$
+
+      - id: runwatch-ruff
+        name: runwatch ruff
+        entry: .venv/bin/ruff check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-black
+        name: runwatch black
+        entry: .venv/bin/black --check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-pyright-strict
+        name: runwatch pyright strict
+        entry: .venv/bin/pyright --project pyrightconfig.json --pythonpath .venv/bin/python
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-complexity
+        name: runwatch cognitive complexity
+        entry: .venv/bin/python scripts/check_cognitive_complexity.py --package runwatch:src/runwatch --max-complexity 15 --max-exceptions-per-package 2 --allowlist scripts/complexity_allowlist.json
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-public-api-docs
+        name: runwatch public API docs
+        entry: .venv/bin/python scripts/check_api_docs.py --source-root src/runwatch --package-name runwatch --require-docstring --require-sections --json
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-skill
+        name: runwatch agent skill
+        entry: .venv/bin/python scripts/check_skill.py
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-skill-probe
+        name: runwatch agent skill probe
+        entry: .venv/bin/python scripts/run_agent_skill_probes.py
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-wheel
+        name: runwatch wheel
+        entry: .venv/bin/python scripts/check_wheel.py
+        language: system
+        pass_filenames: false
+
+      - id: runwatch-tests-coverage
+        name: runwatch tests with coverage
+        entry: uv run --extra test python -m pytest tests --cov=runwatch --cov-branch --cov-report=term-missing --cov-fail-under=80
+        language: system
+        pass_filenames: false
+
+      - id: docs-strict
+        name: sphinx docs strict
+        entry: uv run --extra docs sphinx-build -W --keep-going -n docs .build/sphinx
+        language: system
+        pass_filenames: false

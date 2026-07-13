@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "ruff.exclude": ["typings/**"],
+  "files.exclude": {".venv": true},
+  "search.exclude": {".venv": true},
+  "files.watcherExclude": {"**/.venv/**": true},
+  "yaml.validate": false,
+  "myst.preview.enable": true,
+  "markdown.validate.enabled": false
+}

@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Any
+
+from nbformat.notebooknode import NotebookNode
+
+nbformat: int
+nbformat_minor: int
+
+def new_notebook(**kwargs: Any) -> NotebookNode: ...
+def new_markdown_cell(source: str = "", **kwargs: Any) -> NotebookNode: ...
+def new_code_cell(source: str = "", **kwargs: Any) -> NotebookNode: ...
+def new_raw_cell(source: str = "", **kwargs: Any) -> NotebookNode: ...
+def new_output(
+    output_type: str,
+    data: Any | None = None,
+    **kwargs: Any,
+) -> NotebookNode: ...
+def validate(node: NotebookNode, ref: str | None = None) -> None: ...

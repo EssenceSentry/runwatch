@@ -1,0 +1,231 @@
+name: quality-gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: "3.12"
+
+permissions:
+  contents: read
+
+jobs:
+  repository-hygiene:
+    name: repository-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra test --extra dev --extra docs
+      - name: Lockfile
+        run: uv lock --check
+      - name: File Hygiene
+        run: uv run python scripts/check_file_hygiene.py
+      - name: Config Syntax
+        run: uv run python scripts/check_config_syntax.py
+      - name: GitHub Workflows
+        run: uv run python scripts/check_github_workflows.py
+      - name: Quality Gate Parity
+        run: uv run python scripts/check_quality_gate_parity.py
+
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra test --extra dev --extra docs
+      - name: Ruff
+        run: >
+          uv run ruff check
+          src
+          tests
+          scripts
+          agent_skills
+          web_artifacts_fake_sessions/runwatch/run.py
+          docs/conf.py
+
+  black:
+    name: black
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra test --extra dev --extra docs
+      - name: Black
+        run: >
+          uv run black --check
+          src
+          tests
+          scripts
+          agent_skills
+          web_artifacts_fake_sessions/runwatch/run.py
+          docs/conf.py
+
+  pyright:
+    name: pyright-strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra test --extra dev --extra docs
+      - name: Pyright
+        run: >
+          uv run pyright --project pyrightconfig.json
+          --pythonpath .venv/bin/python
+
+  complexity:
+    name: complexity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Cognitive Complexity
+        run: >
+          uv run python scripts/check_cognitive_complexity.py
+          --package runwatch:src/runwatch
+          --max-complexity 15
+          --max-exceptions-per-package 2
+          --allowlist scripts/complexity_allowlist.json
+
+  api-docs:
+    name: public-api-docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Public API Docs
+        run: >
+          uv run python scripts/check_api_docs.py
+          --source-root src/runwatch
+          --package-name runwatch
+          --require-docstring
+          --require-sections
+          --json
+
+  agent-skill:
+    name: agent-skill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra test --extra dev
+      - name: Validate Skill
+        run: uv run python scripts/check_skill.py
+      - name: Forward Probe
+        run: uv run python scripts/run_agent_skill_probes.py
+
+  wheel:
+    name: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Wheel
+        run: uv run python scripts/check_wheel.py
+
+  docs:
+    name: docs-strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install
+        run: uv sync --locked --extra docs
+      - name: Sphinx
+        run: uv run sphinx-build -W --keep-going -n docs .build/sphinx
+
+  quality-gate:
+    name: quality-gate
+    if: always()
+    needs:
+      - repository-hygiene
+      - ruff
+      - black
+      - pyright
+      - complexity
+      - api-docs
+      - agent-skill
+      - wheel
+      - docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all gates
+        run: |
+          test "${{ needs.repository-hygiene.result }}" = success
+          test "${{ needs.ruff.result }}" = success
+          test "${{ needs.black.result }}" = success
+          test "${{ needs.pyright.result }}" = success
+          test "${{ needs.complexity.result }}" = success
+          test "${{ needs.api-docs.result }}" = success
+          test "${{ needs.agent-skill.result }}" = success
+          test "${{ needs.wheel.result }}" = success
+          test "${{ needs.docs.result }}" = success

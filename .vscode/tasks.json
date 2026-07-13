@@ -1,0 +1,71 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "check: all (pre-commit)",
+      "type": "shell",
+      "command": "uv",
+      "args": ["run", "pre-commit", "run", "--all-files"],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "tests: coverage",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "--cov=runwatch",
+        "--cov-branch",
+        "--cov-report=term-missing",
+        "--cov-fail-under=80"
+      ],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "fake session: phone demo",
+      "type": "shell",
+      "command": "web_artifacts_fake_sessions/runwatch/run.sh",
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "repo: install agent skill",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "scripts/install_skills.py",
+        "update",
+        "--target",
+        "all"
+      ],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    },
+    {
+      "label": "docs: build",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "--extra",
+        "docs",
+        "sphinx-build",
+        "-W",
+        "--keep-going",
+        "-n",
+        "docs",
+        ".build/sphinx"
+      ],
+      "options": {"cwd": "${workspaceFolder}"},
+      "problemMatcher": []
+    }
+  ]
+}

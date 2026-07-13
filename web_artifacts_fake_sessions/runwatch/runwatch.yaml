@@ -1,0 +1,12 @@
+schema_version: 2
+
+notebook:
+  timeout_seconds: 600
+  resource_completion_timeout_seconds: 30
+
+server:
+  linger_seconds: null
+
+notifications:
+  ntfy_base_url: ${RUNWATCH_NTFY_BASE_URL}
+  ntfy_topic: ${RUNWATCH_NTFY_TOPIC}

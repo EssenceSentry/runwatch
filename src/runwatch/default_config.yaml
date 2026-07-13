@@ -1,0 +1,64 @@
+# Runwatch configuration schema. Version 2 intentionally rejects 0.1 run state.
+schema_version: 2
+
+notebook:
+  # null selects the notebook kernelspec; otherwise use an installed kernel name.
+  kernel_name: null
+  # Per-cell execution timeout. null allows long-running cells.
+  timeout_seconds: null
+  startup_timeout_seconds: 60
+  checkpoint_interval_seconds: 2.0
+  # Wait for resources explicitly registered as blocking after notebook execution.
+  wait_for_blocking_resources: true
+  # Recommended for unattended runs; null waits without a deadline.
+  resource_completion_timeout_seconds: null
+
+aws:
+  # null uses the normal boto3 credential and region resolution chain.
+  profile_name: null
+  region_name: null
+  poll_interval_seconds: 15.0
+  stop_timeout_seconds: 300.0
+  final_log_drain_seconds: 3.0
+  # Bound terminal log catch-up even when CloudWatch pagination never stabilizes.
+  final_log_drain_max_pages: 20
+  max_log_lines_per_poll: 250
+  max_log_streams: 8
+
+server:
+  host: 127.0.0.1
+  port: 8765
+  # none keeps the dashboard local; lan binds all interfaces; cloudflared creates a tunnel.
+  share: none
+  # Optional externally managed base URL. Pairing tokens are appended at runtime.
+  public_url: null
+  open_browser: true
+  show_qr: true
+  cloudflared_binary: cloudflared
+  # null keeps the dashboard alive until Ctrl+C; 0 exits immediately after the run.
+  linger_seconds: null
+
+notifications:
+  # Generic endpoints receive {title, message, data} JSON.
+  webhook_urls: []
+  # Set both values to enable ntfy push notifications.
+  ntfy_base_url: null
+  ntfy_topic: null
+  # Optional periodic status notification interval; null disables status reminders.
+  periodic_seconds: null
+  # Failed destinations retry independently through the durable SQLite outbox.
+  request_timeout_seconds: 15.0
+  max_delivery_attempts: 4
+  retry_initial_seconds: 1.0
+  retry_max_seconds: 60.0
+
+storage:
+  max_observations_per_resource: 10000
+  max_log_lines_per_resource: 2000
+  max_events_per_run: 10000
+  dashboard_chart_points: 300
+
+# Static resources can be declared here. Dynamically created resources should use
+# runwatch.aws or runwatch.local emitters from notebook cells. Blocking resources are
+# accepted only when their adapter has a valid terminal condition.
+resources: []

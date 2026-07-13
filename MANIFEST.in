@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include src/runwatch *.py *.typed *.yaml
+recursive-include web_artifacts *.css *.html *.js

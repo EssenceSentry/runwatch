@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <title>Simulation results</title>
+    <style>
+      :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; min-height: 100vh; color: #25354f; background: #edf2f8; }
+      main { width: min(42rem, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0; }
+      section { padding: 1.4rem; border: 1px solid rgba(255,255,255,.8); border-radius: 1.3rem; background: rgba(255,255,255,.72); box-shadow: 14px 14px 30px #c9d1dc, -14px -14px 30px #fff; }
+      h1 { margin: 0 0 .4rem; font-size: clamp(1.8rem, 8vw, 3rem); letter-spacing: -.05em; }
+      p { color: #66758c; line-height: 1.5; }
+      dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; margin: 1.4rem 0 0; }
+      div { min-width: 0; padding: 1rem; border-radius: 1rem; background: #f2f6fb; box-shadow: inset 3px 3px 8px #d5dce6, inset -3px -3px 8px #fff; }
+      dt { color: #75849a; font-size: .7rem; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+      dd { margin: .35rem 0 0; font: 650 1.2rem ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+      .error { color: #ad3d4d; }
+      @media (max-width: 34rem) { dl { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Simulation results</h1>
+        <p id="message">Waiting for the notebook to report progress…</p>
+        <dl id="metrics"></dl>
+      </section>
+    </main>
+    <script>
+      const message = document.querySelector('#message');
+      const metrics = document.querySelector('#metrics');
+      const label = key => key.replaceAll('_', ' ');
+      const render = async () => {
+        try {
+          const response = await fetch(`status.json?t=${Date.now()}`, {cache: 'no-store'});
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const status = await response.json();
+          message.className = '';
+          message.textContent = status.message;
+          metrics.innerHTML = Object.entries(status.metrics).map(([key, value]) =>
+            `<div><dt>${label(key)}</dt><dd>${value}</dd></div>`).join('');
+        } catch (error) {
+          message.className = 'error';
+          message.textContent = 'Waiting for simulation status…';
+        }
+      };
+      render();
+      setInterval(render, 1000);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runwatch"
+  short_description: "Execute, monitor, and recover notebook runs"
+  default_prompt: "Use $runwatch to execute or recover this notebook run and provide its dashboard URL."
