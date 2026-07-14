@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from sysconfig import get_path
@@ -37,11 +38,28 @@ from .supervisor import RunSupervisor
 from .tunnel import with_token
 
 _COOKIE_NAME = DASHBOARD_ACCESS_COOKIE
+_MASCOT_ASSET_NAMES = frozenset(
+    {
+        "alert.png",
+        "confused.png",
+        "inspecting.png",
+        "phrases.json",
+        "ready.png",
+        "running.png",
+        "sleeping.png",
+        "success.png",
+        "waiting.png",
+    }
+)
 _REQUIRED_WEB_ARTIFACTS = (
     Path("common/neumorphic-gloss-components.css"),
     Path("runwatch/index.html"),
     Path("runwatch/app.js"),
     Path("runwatch/styles.css"),
+    *(
+        Path("runwatch/mascot") / asset_name
+        for asset_name in sorted(_MASCOT_ASSET_NAMES)
+    ),
 )
 
 
@@ -323,6 +341,7 @@ async def _dashboard(
             "run_id": supervisor.run_id,
             "run_name": supervisor.name,
             "asset_version": request.app.state.runwatch_asset_version,
+            "mascot_showcase": request.app.state.runwatch_mascot_showcase,
             "ntfy_enabled": _ntfy_deep_link(supervisor.config.notifications)
             is not None,
         },
@@ -721,7 +740,10 @@ def create_app(
     access_token: str,
     *,
     web_artifacts_root: Path | None = None,
+    mascot_showcase: bool | None = None,
 ) -> FastAPI:
+    if mascot_showcase is None:
+        mascot_showcase = os.environ.get("RUNWATCH_MASCOT_SHOWCASE") == "1"
     artifacts_root = _web_artifacts_root(web_artifacts_root)
     runwatch_assets = artifacts_root / "runwatch"
     asset_digest = hashlib.sha256()
@@ -734,6 +756,7 @@ def create_app(
     app.state.runwatch_auth = DashboardAuth(access_token)
     app.state.runwatch_templates = templates
     app.state.runwatch_asset_version = asset_digest.hexdigest()[:12]
+    app.state.runwatch_mascot_showcase = mascot_showcase
 
     async def security_headers(request: Request, call_next: Any) -> Any:
         response = await call_next(request)
@@ -761,6 +784,11 @@ def create_app(
     async def runwatch_script() -> FileResponse:
         return FileResponse(runwatch_assets / "app.js")
 
+    async def runwatch_mascot_asset(asset_name: str) -> FileResponse:
+        if asset_name not in _MASCOT_ASSET_NAMES:
+            raise HTTPException(404, "Mascot asset not found")
+        return FileResponse(runwatch_assets / "mascot" / asset_name)
+
     auth_dependency = [Depends(_require_auth)]
     app.add_api_route("/health", _health, methods=["GET"])
     app.add_api_route(
@@ -772,6 +800,11 @@ def create_app(
         "/static/runwatch/styles.css", runwatch_stylesheet, methods=["GET"]
     )
     app.add_api_route("/static/runwatch/app.js", runwatch_script, methods=["GET"])
+    app.add_api_route(
+        "/static/runwatch/mascot/{asset_name}",
+        runwatch_mascot_asset,
+        methods=["GET"],
+    )
     app.add_api_route("/", _dashboard, methods=["GET"], response_class=HTMLResponse)
     app.add_api_route(
         "/api/state", _state_snapshot, methods=["GET"], dependencies=auth_dependency

@@ -125,6 +125,30 @@
     </section>
   </main>
 
+  <aside
+    id="mascot-narrator"
+    class="mascot-narrator"
+    aria-live="polite"
+    aria-atomic="true"
+    aria-hidden="true"
+    data-catalog-url="/static/runwatch/mascot/phrases.json?v={{ asset_version }}"
+    data-asset-root="/static/runwatch/mascot/"
+    data-asset-version="{{ asset_version }}"
+    data-showcase="{{ 'true' if mascot_showcase else 'false' }}"
+    hidden
+  >
+    <div class="mascot-bubble">
+      <span id="mascot-showcase-label" class="mascot-showcase-label" hidden></span>
+      <p id="mascot-message">Ready when you are, human!</p>
+    </div>
+    <img
+      id="mascot-image"
+      class="mascot-image"
+      src="/static/runwatch/mascot/ready.png?v={{ asset_version }}"
+      alt=""
+    />
+  </aside>
+
   <dialog id="stop-dialog">
     <form method="dialog" class="dialog-card modal-card">
       <div class="danger-icon">!</div>

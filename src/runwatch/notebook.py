@@ -16,6 +16,7 @@ from uuid import uuid4
 import nbformat
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
+from nbclient.util import run_sync
 from nbformat import NotebookNode
 
 from ._fs import atomic_write_bytes
@@ -182,6 +183,17 @@ class MonitoredNotebookClient(NotebookClient):
         self.output_callback = output_callback
         self.current_attempt = 0
         self._output_poll_task: asyncio.Task[None] | None = None
+        self._kernel_cleanup_lock = asyncio.Lock()
+
+    async def _async_cleanup_kernel(self) -> None:
+        """Serialize signal and context-manager cleanup of the owned kernel."""
+
+        async with self._kernel_cleanup_lock:
+            if self.km is None:
+                return
+            await super()._async_cleanup_kernel()
+
+    _cleanup_kernel = run_sync(_async_cleanup_kernel)
 
     async def _async_poll_output_msg(
         self, parent_msg_id: str, cell: NotebookNode, cell_index: int

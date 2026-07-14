@@ -29,12 +29,15 @@ dashboard available until interrupted. It also creates a private, unguessable nt
 topic for the replay. After opening the dashboard on the phone, use **Open ntfy app**
 to subscribe; terminal run notifications are then delivered to that topic. Runtime
 runs and notebook-generated files are isolated under `.runtime/` and ignored by Git.
+By default, the simulated work lasts about five minutes. During fake sessions only,
+the mascot cycles through every Runwatch status and labels the simulated state; the
+dashboard's actual run status and metrics remain unchanged.
 
 Useful variants:
 
 ```bash
-# Keep visible progress moving for five minutes.
-./run.sh --batches 300 --delay-seconds 1
+# Run a shorter 20-second smoke replay.
+./run.sh --batches 20 --delay-seconds 1
 
 # Reuse an existing private ntfy topic.
 ./run.sh --ntfy-topic my-private-runwatch-topic

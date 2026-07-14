@@ -96,6 +96,17 @@ runwatch = ["py.typed", "*.yaml"]
     "web_artifacts/runwatch/app.js",
     "web_artifacts/runwatch/styles.css",
 ]
+"share/runwatch/web_artifacts/runwatch/mascot" = [
+    "web_artifacts/runwatch/mascot/alert.png",
+    "web_artifacts/runwatch/mascot/confused.png",
+    "web_artifacts/runwatch/mascot/inspecting.png",
+    "web_artifacts/runwatch/mascot/phrases.json",
+    "web_artifacts/runwatch/mascot/ready.png",
+    "web_artifacts/runwatch/mascot/running.png",
+    "web_artifacts/runwatch/mascot/sleeping.png",
+    "web_artifacts/runwatch/mascot/success.png",
+    "web_artifacts/runwatch/mascot/waiting.png",
+]
 
 [tool.black]
 line-length = 88

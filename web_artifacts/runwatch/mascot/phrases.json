@@ -1,0 +1,152 @@
+{
+    "created": {
+        "image": "ready.png",
+        "phrases": [
+            "Ready when you are, human!",
+            "Paws ready!",
+            "Standing by with maximum tail wag.",
+            "Just say the word!",
+            "All ears and ready to go.",
+            "Your loyal run buddy is ready.",
+            "Waiting for something to chase!",
+            "No job yet, but I am watching.",
+            "Systems sniffed. Everything looks good!",
+            "Ready to fetch some results."
+        ]
+    },
+    "starting": {
+        "image": "inspecting.png",
+        "phrases": [
+            "Sniffing the notebook before we begin.",
+            "Booting up my tiny paw-powered engine.",
+            "Finding the perfect stick to start with.",
+            "One moment—preflight snoot inspection!",
+            "Warming up the paws.",
+            "Getting the run ready for zoomies.",
+            "Checking every leash, loop, and library.",
+            "The starting bark is almost here!",
+            "Point me at the first cell.",
+            "Preparing to fetch some results."
+        ]
+    },
+    "running": {
+        "image": "running.png",
+        "phrases": [
+            "Zoomies in progress!",
+            "Off I go!",
+            "Running as fast as my little paws can!",
+            "Chasing down your results.",
+            "Fetching data at top speed!",
+            "Paws on the move!",
+            "Your job is racing along.",
+            "Full-speed tail-wag mode activated!",
+            "Bounding through the workflow!",
+            "I am on it—woof woof!"
+        ]
+    },
+    "paused": {
+        "image": "alert.png",
+        "phrases": [
+            "Bork! This run needs a human!",
+            "I found a pause. Come take a look!",
+            "Paws off the keyboard until you say so.",
+            "The notebook would like a little attention.",
+            "I am holding this spot for you.",
+            "Paused, alert, and accepting treats.",
+            "My ears are up. Something needs fixing.",
+            "The run stopped here to think.",
+            "I saved your place with a paw.",
+            "Ready to continue when you are."
+        ]
+    },
+    "restarting": {
+        "image": "inspecting.png",
+        "phrases": [
+            "New kernel, same determined pup.",
+            "One more lap around the notebook!",
+            "Resetting the zoomies.",
+            "Sniffing out a fresh start.",
+            "Back to the beginning, tail first!",
+            "Repacking the treats and trying again.",
+            "Fresh paws are on the way.",
+            "Restarting the chase from a clean trail.",
+            "The notebook gets another throw.",
+            "Round two—woof!"
+        ]
+    },
+    "waiting_external": {
+        "image": "waiting.png",
+        "phrases": [
+            "Keeping a close eye on the remote work.",
+            "I am watching your run like a good pup.",
+            "Monitoring every little paw-step.",
+            "Nothing gets past this watchdog!",
+            "Eyes on the dashboard, tail on standby.",
+            "Your run is safe with me.",
+            "Watching for updates and snack opportunities.",
+            "I will bark if anything changes.",
+            "Still watching. Still adorable.",
+            "Guarding your job one heartbeat at a time."
+        ]
+    },
+    "succeeded": {
+        "image": "success.png",
+        "phrases": [
+            "We did it! Tail wags for everyone!",
+            "Good job, human!",
+            "Success! Who is a clever team?",
+            "Run complete—time for celebratory zoomies!",
+            "Everything worked! Best day ever!",
+            "Fetched successfully!",
+            "No errors, only happy borks!",
+            "Paws up—we nailed it!",
+            "Mission accomplished. Treats are appropriate.",
+            "The results are in, and they are paw-some!"
+        ]
+    },
+    "failed": {
+        "image": "confused.png",
+        "phrases": [
+            "Uh-oh... I may have chased the wrong stick.",
+            "Something went a little ruff.",
+            "I found an error. Please do not be mad.",
+            "This was not the result I ordered.",
+            "My tail says something went wrong.",
+            "Oops! The run tripped over its own paws.",
+            "I could not fetch that one.",
+            "There is a bug, and sadly it is not chewable.",
+            "Confused pup noises...",
+            "We hit a snag. I brought my worried face."
+        ]
+    },
+    "cancelling": {
+        "image": "alert.png",
+        "phrases": [
+            "Putting the brakes on these zoomies!",
+            "Calling all paws back home.",
+            "Stopping the chase now.",
+            "Heel, notebook! Heel!",
+            "Packing up the run as requested.",
+            "The cancellation bark has been sent.",
+            "Bringing the runaway sticks back in.",
+            "Stopping safely takes a moment.",
+            "Tail down to idle speed.",
+            "Almost stopped—one last sniff."
+        ]
+    },
+    "cancelled": {
+        "image": "sleeping.png",
+        "phrases": [
+            "Run stopped. Nap mode activated.",
+            "The chase is over for now.",
+            "Cancelled! I will guard the comfy spot.",
+            "Paws parked until the next run.",
+            "No more zoomies this time.",
+            "The notebook is tucked in for a nap.",
+            "Stopped as requested. Goodnight, tiny cells.",
+            "I put the results basket down.",
+            "This run has gone to its dog bed.",
+            "Wake me for the next adventure."
+        ]
+    }
+}

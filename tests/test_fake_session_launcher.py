@@ -30,6 +30,8 @@ def test_fake_session_defaults_to_lan_and_ntfy(monkeypatch) -> None:
     assert args.ntfy is True
     assert args.ntfy_base_url == "https://ntfy.sh"
     assert args.ntfy_topic is None
+    assert args.batches == 300
+    assert args.delay_seconds == 1.0
 
 
 def test_fake_session_supports_local_only_replay(monkeypatch) -> None:
@@ -71,3 +73,4 @@ def test_fake_session_executes_a_runtime_notebook_copy() -> None:
     assert "replay_notebook_path.unlink(missing_ok=True)" in launcher
     assert '"linked-dashboard" / replay_id[:8]' in launcher
     assert "shutil.rmtree(linked_dashboard_root, ignore_errors=True)" in launcher
+    assert 'environment["RUNWATCH_MASCOT_SHOWCASE"] = "1"' in launcher

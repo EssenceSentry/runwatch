@@ -1,10 +1,37 @@
 const $ = id => document.getElementById(id);
 let state = null;
 let refreshTimer = null;
+const mascotState = {
+  catalog: null,
+  hideTimer: null,
+  showcaseTimer: null,
+  showcaseIndex: 0,
+  lastMessageAt: 0,
+  lastStatus: null,
+  lastTerminalStatus: null,
+  recentMessages: [],
+};
 
 const RUN_TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 const RUN_LIVE = new Set(['starting', 'running', 'waiting_external', 'restarting', 'cancelling']);
 const RESOURCE_ERRORS = new Set(['failed', 'monitor_error']);
+const MASCOT_MINIMUM_SECONDS = 24;
+const MASCOT_VISIBLE_SECONDS = 7;
+const MASCOT_TERMINAL_SECONDS = 12;
+const MASCOT_RECENT_MESSAGES = 4;
+const MASCOT_SHOWCASE_SECONDS = 6;
+const MASCOT_SHOWCASE_STATUSES = [
+  'created',
+  'starting',
+  'running',
+  'paused',
+  'restarting',
+  'waiting_external',
+  'succeeded',
+  'failed',
+  'cancelling',
+  'cancelled',
+];
 
 const initialUrl = new URL(window.location.href);
 if (initialUrl.searchParams.has('token')) {
@@ -132,6 +159,134 @@ function scheduleRefresh(delay = 160) {
       setConnection('RECONNECTING');
     }
   }, delay);
+}
+
+function mascotAssetUrl(imageName) {
+  const narrator = $('mascot-narrator');
+  if (!narrator || !imageName) return '';
+  const root = narrator.dataset.assetRoot || '/static/runwatch/mascot/';
+  const version = narrator.dataset.assetVersion;
+  const query = version ? `?v=${encodeURIComponent(version)}` : '';
+  return `${root}${encodeURIComponent(imageName)}${query}`;
+}
+
+function mascotEntry(status) {
+  const entry = mascotState.catalog?.[status];
+  if (!entry || typeof entry.image !== 'string' || !Array.isArray(entry.phrases)) return null;
+  return entry;
+}
+
+function mascotShowcaseEnabled() {
+  return $('mascot-narrator')?.dataset.showcase === 'true';
+}
+
+function chooseMascotPhrase(status, entry) {
+  const choices = entry.phrases
+    .filter(phrase => typeof phrase === 'string' && phrase.trim())
+    .map((phrase, index) => ({key: `${status}:${index}`, phrase}));
+  if (!choices.length) return null;
+  const recent = new Set(mascotState.recentMessages);
+  const fresh = choices.filter(choice => !recent.has(choice.key));
+  const pool = fresh.length ? fresh : choices;
+  const selected = pool[Math.floor(Math.random() * pool.length)];
+  mascotState.recentMessages = [selected.key, ...mascotState.recentMessages]
+    .slice(0, MASCOT_RECENT_MESSAGES);
+  return selected.phrase;
+}
+
+function hideMascot() {
+  const narrator = $('mascot-narrator');
+  if (!narrator) return;
+  narrator.classList.remove('is-visible');
+  narrator.setAttribute('aria-hidden', 'true');
+  window.clearTimeout(mascotState.hideTimer);
+  mascotState.hideTimer = window.setTimeout(() => {
+    narrator.hidden = true;
+  }, 260);
+}
+
+function showMascot(status, entry, phrase) {
+  const narrator = $('mascot-narrator');
+  const image = $('mascot-image');
+  const message = $('mascot-message');
+  const showcaseLabel = $('mascot-showcase-label');
+  if (!narrator || !image || !message || !showcaseLabel) return;
+  image.src = mascotAssetUrl(entry.image);
+  message.textContent = phrase;
+  showcaseLabel.hidden = !mascotShowcaseEnabled();
+  showcaseLabel.textContent = friendlyStatus(status);
+  narrator.dataset.status = status;
+  narrator.hidden = false;
+  narrator.setAttribute('aria-hidden', 'false');
+  window.requestAnimationFrame(() => narrator.classList.add('is-visible'));
+  window.clearTimeout(mascotState.hideTimer);
+  const seconds = RUN_TERMINAL.has(status)
+    ? MASCOT_TERMINAL_SECONDS
+    : MASCOT_VISIBLE_SECONDS;
+  mascotState.hideTimer = window.setTimeout(hideMascot, seconds * 1000);
+}
+
+function showNextMascotShowcaseState() {
+  if (!mascotShowcaseEnabled() || !mascotState.catalog) return;
+  const status = MASCOT_SHOWCASE_STATUSES[
+    mascotState.showcaseIndex % MASCOT_SHOWCASE_STATUSES.length
+  ];
+  mascotState.showcaseIndex += 1;
+  const entry = mascotEntry(status);
+  const phrase = entry ? chooseMascotPhrase(status, entry) : null;
+  if (entry && phrase) showMascot(status, entry, phrase);
+  window.clearTimeout(mascotState.showcaseTimer);
+  mascotState.showcaseTimer = window.setTimeout(
+    showNextMascotShowcaseState,
+    MASCOT_SHOWCASE_SECONDS * 1000,
+  );
+}
+
+function startMascotShowcase() {
+  window.clearTimeout(mascotState.showcaseTimer);
+  mascotState.showcaseIndex = 0;
+  showNextMascotShowcaseState();
+}
+
+function maybeShowMascot(run, options = {}) {
+  if (mascotShowcaseEnabled() || !mascotState.catalog || !$('mascot-narrator')) return;
+  const status = String(run?.status || '');
+  const terminal = RUN_TERMINAL.has(status);
+  const statusChanged = mascotState.lastStatus !== status;
+  if (!options.force && terminal && mascotState.lastTerminalStatus === status) return;
+  const now = Date.now();
+  if (
+    !options.force
+    && !statusChanged
+    && now - mascotState.lastMessageAt < MASCOT_MINIMUM_SECONDS * 1000
+  ) return;
+  const entry = mascotEntry(status);
+  const phrase = entry ? chooseMascotPhrase(status, entry) : null;
+  if (!entry || !phrase) return;
+  mascotState.lastMessageAt = now;
+  mascotState.lastStatus = status;
+  if (terminal) mascotState.lastTerminalStatus = status;
+  showMascot(status, entry, phrase);
+}
+
+async function loadMascotCatalog() {
+  const narrator = $('mascot-narrator');
+  const catalogUrl = narrator?.dataset.catalogUrl;
+  if (!catalogUrl) return;
+  try {
+    const response = await fetch(catalogUrl, {cache: 'no-store'});
+    if (!response.ok) throw new Error(`mascot catalog ${response.status}`);
+    mascotState.catalog = await response.json();
+    Object.values(mascotState.catalog).forEach(entry => {
+      if (typeof entry?.image !== 'string') return;
+      const image = new Image();
+      image.src = mascotAssetUrl(entry.image);
+    });
+    if (mascotShowcaseEnabled()) startMascotShowcase();
+    else if (state?.run) maybeShowMascot(state.run, {force: true});
+  } catch {
+    mascotState.catalog = null;
+  }
 }
 
 function latestProgress(events, current) {
@@ -755,6 +910,7 @@ function render() {
   renderCells(cells, run);
   renderActivity(events);
   renderEvents(events);
+  maybeShowMascot(run);
   updateFreshness();
 }
 
@@ -762,6 +918,7 @@ const source = new EventSource('/api/events');
 source.addEventListener('open', () => setConnection('LIVE'));
 source.addEventListener('error', () => setConnection('RECONNECTING'));
 source.addEventListener('runwatch', () => scheduleRefresh());
+loadMascotCatalog();
 scheduleRefresh(0);
 setInterval(() => {
   if (!state) return;

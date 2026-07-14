@@ -21,6 +21,15 @@ REQUIRED_DATA_SUFFIXES = {
     "share/runwatch/web_artifacts/common/neumorphic-gloss-components.css",
     "share/runwatch/web_artifacts/runwatch/app.js",
     "share/runwatch/web_artifacts/runwatch/index.html",
+    "share/runwatch/web_artifacts/runwatch/mascot/alert.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/confused.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/inspecting.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/phrases.json",
+    "share/runwatch/web_artifacts/runwatch/mascot/ready.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/running.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/sleeping.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/success.png",
+    "share/runwatch/web_artifacts/runwatch/mascot/waiting.png",
     "share/runwatch/web_artifacts/runwatch/styles.css",
 }
 

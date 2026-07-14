@@ -81,14 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batches",
         type=positive_int,
-        default=20,
-        help="Number of simulated work batches.",
+        default=300,
+        help="Number of simulated work batches. Defaults to 300.",
     )
     parser.add_argument(
         "--delay-seconds",
         type=nonnegative_float,
-        default=0.5,
-        help="Delay between simulated work batches.",
+        default=1.0,
+        help="Delay between simulated work batches. Defaults to one second.",
     )
     parser.add_argument(
         "--name",
@@ -152,6 +152,7 @@ def main() -> int:
     environment = os.environ.copy()
     environment["RUNWATCH_SIMULATION_BATCHES"] = str(args.batches)
     environment["RUNWATCH_SIMULATION_DELAY_SECONDS"] = str(args.delay_seconds)
+    environment["RUNWATCH_MASCOT_SHOWCASE"] = "1"
     linked_dashboard_port = available_port()
     environment["RUNWATCH_SIMULATION_DASHBOARD_URL"] = (
         f"http://127.0.0.1:{linked_dashboard_port}"

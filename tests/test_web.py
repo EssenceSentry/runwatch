@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from runwatch.models import (
     ResourceObservation,
     ResourceSpec,
     ResourceStatus,
+    RunStatus,
     RunwatchConfig,
 )
 from runwatch.supervisor import RunSupervisor
@@ -93,7 +95,10 @@ async def test_linked_dashboard_open_is_authenticated_and_snapshot_is_secret_fre
     await supervisor.close()
 
 
-def test_dashboard_auth_and_reduced_remote_surface(tmp_path: Path) -> None:
+def test_dashboard_auth_and_reduced_remote_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUNWATCH_MASCOT_SHOWCASE", raising=False)
     notebook_path = tmp_path / "empty.ipynb"
     nbformat.write(nbformat.v4.new_notebook(), notebook_path)
     supervisor = RunSupervisor(
@@ -128,12 +133,22 @@ def test_dashboard_auth_and_reduced_remote_surface(tmp_path: Path) -> None:
     )
     assert f"/static/runwatch/styles.css?v={asset_version}" in response.text
     assert f"/static/runwatch/app.js?v={asset_version}" in response.text
+    assert f"/static/runwatch/mascot/phrases.json?v={asset_version}" in response.text
+    assert f"/static/runwatch/mascot/ready.png?v={asset_version}" in response.text
+    assert 'data-showcase="false"' in response.text
     assert "pixability" not in response.text.lower()
     assert (
         client.get("/static/common/neumorphic-gloss-components.css").status_code == 200
     )
     assert client.get("/static/runwatch/styles.css").status_code == 200
     assert client.get("/static/runwatch/app.js").status_code == 200
+    mascot_catalog = client.get("/static/runwatch/mascot/phrases.json")
+    assert mascot_catalog.status_code == 200
+    assert mascot_catalog.headers["content-type"].startswith("application/json")
+    mascot_image = client.get("/static/runwatch/mascot/ready.png")
+    assert mascot_image.status_code == 200
+    assert mascot_image.headers["content-type"] == "image/png"
+    assert client.get("/static/runwatch/mascot/not-a-dog.png").status_code == 404
     assert client.get("/static/common/pixability.jpg").status_code == 404
     assert client.get("/static/runwatch/index.html").status_code == 404
     assert "default-src 'self'" in response.headers["content-security-policy"]
@@ -718,6 +733,88 @@ def test_dashboard_prioritizes_user_signals_and_collapses_diagnostics() -> None:
     assert 'id="kernel-epoch"' not in template
     assert "function meaningfulEvents" in script
     assert "events.slice(-100)" in script
+
+
+def test_dashboard_mascot_catalog_covers_every_run_status() -> None:
+    mascot_root = _WEB_ARTIFACTS / "runwatch/mascot"
+    catalog = json.loads((mascot_root / "phrases.json").read_text(encoding="utf-8"))
+
+    assert set(catalog) == {status.value for status in RunStatus}
+    referenced_images: set[str] = set()
+    for status in RunStatus:
+        entry = catalog[status.value]
+        assert set(entry) == {"image", "phrases"}
+        assert isinstance(entry["image"], str)
+        assert (mascot_root / entry["image"]).is_file()
+        referenced_images.add(entry["image"])
+        phrases = entry["phrases"]
+        assert len(phrases) == 10
+        assert len(set(phrases)) == len(phrases)
+        assert all(isinstance(phrase, str) and phrase.strip() for phrase in phrases)
+
+    assert referenced_images == {
+        "alert.png",
+        "confused.png",
+        "inspecting.png",
+        "ready.png",
+        "running.png",
+        "sleeping.png",
+        "success.png",
+        "waiting.png",
+    }
+
+
+def test_dashboard_mascot_narrator_is_status_driven_and_mobile_safe() -> None:
+    runwatch_root = _WEB_ARTIFACTS / "runwatch"
+    template = (runwatch_root / "index.html").read_text(encoding="utf-8")
+    script = (runwatch_root / "app.js").read_text(encoding="utf-8")
+    styles = (runwatch_root / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="mascot-narrator"' in template
+    assert 'id="mascot-message"' in template
+    assert 'id="mascot-image"' in template
+    assert 'id="mascot-showcase-label"' in template
+    assert "data-showcase=\"{{ 'true' if mascot_showcase else 'false' }}\"" in template
+    assert 'aria-live="polite"' in template
+    assert "function loadMascotCatalog()" in script
+    assert "function maybeShowMascot(run, options = {})" in script
+    assert "function chooseMascotPhrase(status, entry)" in script
+    assert "function startMascotShowcase()" in script
+    assert "function showNextMascotShowcaseState()" in script
+    assert "if (mascotShowcaseEnabled()) startMascotShowcase();" in script
+    assert "MASCOT_SHOWCASE_SECONDS = 6" in script
+    assert "showcaseLabel.textContent = friendlyStatus(status);" in script
+    assert "Mascot preview" not in script
+    assert all(f"'{status.value}'" in script for status in RunStatus)
+    assert "mascotState.lastTerminalStatus === status" in script
+    assert "maybeShowMascot(run);" in script
+    assert ".mascot-narrator.is-visible" in styles
+    assert ".mascot-showcase-label" in styles
+    assert "@keyframes mascot-float" in styles
+    assert "max-width: calc(100vw - 112px)" in styles
+    assert "@media (prefers-reduced-motion: reduce)" in styles
+
+
+def test_dashboard_can_enable_the_fake_session_mascot_showcase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNWATCH_MASCOT_SHOWCASE", "1")
+    notebook_path = tmp_path / "empty.ipynb"
+    nbformat.write(nbformat.v4.new_notebook(), notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+
+    response = TestClient(create_app(supervisor, "secret-token")).get(
+        "/?token=secret-token"
+    )
+
+    assert response.status_code == 200
+    assert 'data-showcase="true"' in response.text
 
 
 def test_dashboard_scopes_tqdm_progress_and_prefers_the_outermost_bar() -> None:

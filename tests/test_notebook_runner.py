@@ -10,6 +10,7 @@ from typing import Any
 
 import nbformat
 import pytest
+from jupyter_client.manager import AsyncKernelManager
 
 import runwatch.notebook as notebook_module
 from runwatch.models import (
@@ -59,6 +60,47 @@ def timeout_config() -> RunwatchConfig:
             wait_for_blocking_resources=False,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_monitored_client_serializes_concurrent_kernel_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_calls = 0
+
+    async def fake_cleanup(active: Any) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await cleanup_release.wait()
+        active.km = None
+
+    monkeypatch.setattr(
+        notebook_module.NotebookClient,
+        "_async_cleanup_kernel",
+        fake_cleanup,
+    )
+
+    def ignore_output(_output: Any, _cell_index: int, _attempt: int) -> None:
+        return
+
+    client = notebook_module.MonitoredNotebookClient(
+        nbformat.v4.new_notebook(),
+        km=AsyncKernelManager(),
+        output_callback=ignore_output,
+    )
+
+    signal_cleanup = asyncio.create_task(client._async_cleanup_kernel())
+    await cleanup_started.wait()
+    context_cleanup = asyncio.create_task(client._async_cleanup_kernel())
+    await asyncio.sleep(0)
+    cleanup_release.set()
+    await asyncio.gather(signal_cleanup, context_cleanup)
+
+    assert cleanup_calls == 1
+    assert client.km is None
 
 
 def immediate_cancel_config() -> RunwatchConfig:
