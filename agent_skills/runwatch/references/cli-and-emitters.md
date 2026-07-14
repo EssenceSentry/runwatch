@@ -68,7 +68,10 @@ Cell insertion, deletion, or reordering requires restart.
 ```python
 from runwatch import aws, emit_progress, local
 
-aws.emit_sagemaker_processing_job(job_name, logical_key="build")
+# Safe default for an existing job: borrowed and observation-only.
+aws.emit_sagemaker_processing_job(existing_job_name, logical_key="observed-build")
+# Only for a job this run created and is allowed to stop.
+aws.emit_owned_sagemaker_processing_job(created_job_name, logical_key="owned-build")
 aws.emit_s3_prefix(uri, expected_count=100, completion_marker="_SUCCESS", blocking=True)
 aws.emit_s3_manifest(uri, blocking=True)
 aws.emit_cloudwatch_metric(namespace="Pipeline", metric_name="Rows")
@@ -88,7 +91,9 @@ emit_progress(50, total=100, unit="parts", message="Building")
 ```
 
 Metrics and logs are nonblocking. A blocking S3 prefix or local file monitor must define
-a completion condition.
+a completion condition. The generic SageMaker emitter is borrowed and does not stop the
+job during cancellation unless ownership is explicitly opted in; prefer the owned helper
+for a job created by the current run.
 
 `local.emit_dashboard` registers an existing loopback HTTP application. It is external,
 nonblocking, and cannot be stopped by Runwatch. With LAN or Cloudflare sharing, the

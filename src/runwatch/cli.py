@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -13,11 +14,13 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
+import psutil
 import qrcode
 import typer
 import uvicorn
 
 from . import __version__
+from ._fs import PRIVATE_DIRECTORY_MODE, ensure_private_directory
 from .config import dump_default_config, load_config
 from .dashboard_links import DashboardLinkManager
 from .events import EventBus
@@ -51,42 +54,73 @@ resource_app = typer.Typer(
 app.add_typer(resource_app, name="resource")
 
 
+def _machine_identity() -> tuple[str, str | None]:
+    """Return the host and a best-effort identity for its current boot."""
+
+    hostname = socket.gethostname()
+    boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        boot_id = boot_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        try:
+            boot_id = f"boot-time:{psutil.boot_time():.6f}"
+        except (OSError, RuntimeError):
+            boot_id = ""
+    return hostname, boot_id or None
+
+
 class RunLock:
     def __init__(self, run_dir: Path, *, controller_token: str | None = None) -> None:
         self.path = run_dir / "runwatch.lock"
+        self.cleanup_path = run_dir.parent / f".{run_dir.name}.cleanup.lock"
         self.held = False
         self.controller_token = controller_token or str(uuid4())
         self._fd: int | None = None
+        self._cleanup_fd: int | None = None
+        self.hostname, self.boot_id = _machine_identity()
 
     def acquire(self) -> None:
         if self.held:
             raise RuntimeError(f"Runwatch lock {self.path} is already held")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._remove_stale_record_or_raise(self.cleanup_path, cleanup=True)
+        self.path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+            mode=PRIVATE_DIRECTORY_MODE,
+        )
         while True:
             try:
-                self._fd = self._publish_lock_record()
+                self._fd = self._publish_lock_record(self.path)
             except FileExistsError:
                 self._remove_stale_lock_or_raise()
                 continue
             self.held = True
-            self._fsync_parent()
+            try:
+                ensure_private_directory(self.path.parent)
+                self._fsync_parent(self.path)
+                self._remove_stale_record_or_raise(self.cleanup_path, cleanup=True)
+            except BaseException:
+                self.release()
+                raise
             return
 
-    def _publish_lock_record(self) -> int:
-        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+    def _publish_lock_record(self, path: Path) -> int:
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         record = json.dumps(
             {
                 "pid": os.getpid(),
                 "started_at": process_start_time(os.getpid()),
                 "controller_token": self.controller_token,
+                "hostname": self.hostname,
+                "boot_id": self.boot_id,
             },
             separators=(",", ":"),
         ).encode("utf-8")
         try:
             self._write_all(fd, record)
             os.fsync(fd)
-            os.link(temporary, self.path)
+            os.link(temporary, path)
         except BaseException:
             os.close(fd)
             raise
@@ -105,23 +139,36 @@ class RunLock:
             remaining = remaining[written:]
 
     def _remove_stale_lock_or_raise(self) -> None:
+        self._remove_stale_record_or_raise(self.path, cleanup=False)
+
+    def _remove_stale_record_or_raise(self, path: Path, *, cleanup: bool) -> None:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(self.path, flags)
+            fd = os.open(path, flags)
         except FileNotFoundError:
             return
         try:
-            pid, started_at, _token = self._read_lock_record(fd)
-            if process_is_alive(pid, started_at):
-                self._raise_lock_owned(pid)
-            if self._path_matches_fd(fd):
-                self.path.unlink(missing_ok=True)
-                self._fsync_parent()
+            pid, started_at, _token, hostname, boot_id = self._read_lock_record(fd)
+            if hostname is not None and hostname != self.hostname:
+                self._raise_lock_owned(pid, hostname=hostname, cleanup=cleanup)
+            same_boot = not (
+                hostname == self.hostname
+                and boot_id is not None
+                and self.boot_id is not None
+                and boot_id != self.boot_id
+            )
+            if same_boot and process_is_alive(pid, started_at):
+                self._raise_lock_owned(pid, hostname=hostname, cleanup=cleanup)
+            if self._path_matches_fd(fd, path):
+                path.unlink(missing_ok=True)
+                self._fsync_parent(path)
         finally:
             os.close(fd)
 
     @staticmethod
-    def _read_lock_record(fd: int) -> tuple[int | None, float | None, str | None]:
+    def _read_lock_record(
+        fd: int,
+    ) -> tuple[int | None, float | None, str | None, str | None, str | None]:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
             raw = b""
@@ -134,7 +181,11 @@ class RunLock:
             started_value = value.get("started_at")
             started_at = float(started_value) if started_value is not None else None
             token = str(value["controller_token"])
-            return pid, started_at, token
+            hostname_value = value.get("hostname")
+            hostname = str(hostname_value) if hostname_value else None
+            boot_id_value = value.get("boot_id")
+            boot_id = str(boot_id_value) if boot_id_value else None
+            return pid, started_at, token, hostname, boot_id
         except (
             OSError,
             UnicodeError,
@@ -143,38 +194,92 @@ class RunLock:
             KeyError,
             json.JSONDecodeError,
         ):
-            return None, None, None
+            return None, None, None, None, None
 
-    def _raise_lock_owned(self, pid: int | None) -> None:
-        owner = f"process {pid}" if pid is not None else "another process"
+    def _raise_lock_owned(
+        self,
+        pid: int | None,
+        *,
+        hostname: str | None = None,
+        cleanup: bool = False,
+    ) -> None:
+        if hostname is not None and hostname != self.hostname:
+            owner = f"host {hostname}"
+        else:
+            owner = f"process {pid}" if pid is not None else "another process"
+        if cleanup:
+            owner += " while it cleans"
         raise RuntimeError(f"Runwatch {owner} already owns {self.path.parent}")
 
-    def _path_matches_fd(self, fd: int) -> bool:
+    @staticmethod
+    def _path_matches_fd(fd: int, path: Path) -> bool:
         try:
-            current = self.path.stat(follow_symlinks=False)
+            current = path.stat(follow_symlinks=False)
         except FileNotFoundError:
             return False
         opened = os.fstat(fd)
         return (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
 
-    def _fsync_parent(self) -> None:
+    @staticmethod
+    def _fsync_parent(path: Path) -> None:
         with contextlib.suppress(OSError):
-            fd = os.open(self.path.parent, os.O_RDONLY)
+            fd = os.open(path.parent, os.O_RDONLY)
             try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
 
+    def begin_cleanup(self) -> None:
+        """Fence new owners with a guard that survives run-directory deletion."""
+
+        if not self.held:
+            raise RuntimeError("Successful cleanup requires the held run lock")
+        if self._cleanup_fd is not None:
+            raise RuntimeError("Runwatch cleanup is already fenced")
+        while True:
+            try:
+                self._cleanup_fd = self._publish_lock_record(self.cleanup_path)
+            except FileExistsError:
+                self._remove_stale_record_or_raise(self.cleanup_path, cleanup=True)
+                continue
+            self._fsync_parent(self.cleanup_path)
+            return
+
+    def finish_cleanup(self) -> None:
+        fd = self._cleanup_fd
+        if fd is None:
+            return
+        try:
+            if self._path_matches_fd(fd, self.cleanup_path):
+                _pid, _started_at, token, _hostname, _boot_id = self._read_lock_record(
+                    fd
+                )
+                if token == self.controller_token:
+                    self.cleanup_path.unlink(missing_ok=True)
+                    self._fsync_parent(self.cleanup_path)
+        finally:
+            os.close(fd)
+            self._cleanup_fd = None
+
+    @property
+    def cleanup_fenced(self) -> bool:
+        """Return whether an external cleanup guard is currently held."""
+
+        return self._cleanup_fd is not None
+
     def release(self) -> None:
         if not self.held:
             return
+        self.finish_cleanup()
         fd = self._fd
         try:
-            if fd is not None and self._path_matches_fd(fd):
-                _pid, _started_at, token = self._read_lock_record(fd)
+            if fd is not None and self._path_matches_fd(fd, self.path):
+                _pid, _started_at, token, _hostname, _boot_id = self._read_lock_record(
+                    fd
+                )
                 if token == self.controller_token:
                     self.path.unlink(missing_ok=True)
-                    self._fsync_parent()
+                    self._fsync_parent(self.path)
         finally:
             if fd is not None:
                 os.close(fd)
@@ -199,16 +304,38 @@ def _default_run_dir(working_dir: Path, notebook: Path) -> Path:
     )
 
 
-def _cleanup_successful_run(run_dir: Path, working_dir: Path) -> None:
+def _cleanup_successful_run(
+    run_dir: Path,
+    working_dir: Path,
+    *,
+    run_lock: RunLock | None = None,
+) -> None:
     run_dir = run_dir.resolve()
     required = (run_dir / "run-manifest.json", run_dir / "runwatch.sqlite3")
     if not run_dir.exists():
         return
+    active_lock = run_dir / "runwatch.lock"
+    owns_cleanup = (
+        run_lock is not None
+        and run_lock.held
+        and run_lock.path.parent.resolve() == run_dir
+        and run_lock.cleanup_fenced
+    )
+    if active_lock.exists() and not owns_cleanup:
+        raise RuntimeError(
+            f"Refusing to remove actively owned Runwatch state {run_dir}"
+        )
     if not all(path.is_file() for path in required):
         raise RuntimeError(
             f"Refusing to remove unrecognized Runwatch directory {run_dir}"
         )
     shutil.rmtree(run_dir)
+
+    _cleanup_empty_runwatch_parents(run_dir, working_dir)
+
+
+def _cleanup_empty_runwatch_parents(run_dir: Path, working_dir: Path) -> None:
+    run_dir = run_dir.resolve()
 
     runs_root = (working_dir.resolve() / ".runwatch" / "runs").resolve()
     if run_dir.parent != runs_root:
@@ -262,8 +389,12 @@ def _token(run_dir: Path) -> str:
     return value
 
 
-def _require_new_run_dir(run_dir: Path) -> None:
-    if run_dir.exists() and any(run_dir.iterdir()):
+def _require_new_run_dir(run_dir: Path, *, run_lock: RunLock | None = None) -> None:
+    allowed_lock = run_lock.path if run_lock is not None and run_lock.held else None
+    occupied = run_dir.exists() and any(
+        path != allowed_lock for path in run_dir.iterdir()
+    )
+    if occupied:
         raise typer.BadParameter(
             f"Run directory {run_dir} is not empty; choose a new directory"
         )
@@ -302,6 +433,7 @@ def _announce_run(supervisor: RunSupervisor, pairing_url: str) -> None:
 
 async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
     if not start_run:
+        await supervisor.notifications.start()
         await asyncio.Event().wait()
         return 0
     await supervisor.start()
@@ -320,6 +452,79 @@ async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
         )
         await asyncio.sleep(linger)
     return 0 if status is RunStatus.SUCCEEDED else 1
+
+
+async def _successful_cleanup_decision(
+    supervisor: RunSupervisor,
+) -> tuple[bool, str | None]:
+    if not getattr(supervisor, "cleanup_on_success", True):
+        return False, None
+    try:
+        run = supervisor.store.get_run(supervisor.run_id)
+    except Exception:
+        return False, None
+    if RunStatus(run["status"]) is not RunStatus.SUCCEEDED:
+        return False, None
+    try:
+        drain = await supervisor.notifications.drain(
+            supervisor.config.notifications.terminal_drain_timeout_seconds
+        )
+    except Exception as error:
+        reason = f"notification drain failed: {type(error).__name__}: {error}"
+        return False, reason
+    if drain.complete:
+        return True, None
+    return False, drain.reason or "notification delivery is incomplete"
+
+
+async def _publish_cleanup_retention(
+    supervisor: RunSupervisor, reason: str | None
+) -> None:
+    if reason is None:
+        return
+    with contextlib.suppress(Exception):
+        await supervisor.bus.publish(
+            "run.cleanup_retained",
+            {
+                "reason": reason,
+                "recovery_command": f"runwatch open {supervisor.run_dir}",
+            },
+        )
+
+
+async def _finish_serve(supervisor: RunSupervisor, lock: RunLock) -> None:
+    try:
+        try:
+            await supervisor.quiesce()
+        except BaseException as quiesce_error:
+            try:
+                await supervisor.close()
+            except BaseException as close_error:
+                raise close_error from quiesce_error
+            raise
+        cleanup_successful_run, retain_reason = await _successful_cleanup_decision(
+            supervisor
+        )
+        await _publish_cleanup_retention(supervisor, retain_reason)
+        await supervisor.close()
+        if cleanup_successful_run:
+            lock.begin_cleanup()
+            _cleanup_successful_run(
+                supervisor.run_dir,
+                supervisor.working_dir,
+                run_lock=lock,
+            )
+    finally:
+        lock.release()
+    if cleanup_successful_run:
+        _cleanup_empty_runwatch_parents(supervisor.run_dir, supervisor.working_dir)
+        typer.echo(f"Removed successful Runwatch state: {supervisor.run_dir}")
+    elif retain_reason is not None:
+        typer.echo(f"Retained successful Runwatch state: {supervisor.run_dir}")
+        typer.echo(f"Reason: {retain_reason}")
+        typer.echo(
+            "Retry notification delivery with: runwatch open " + str(supervisor.run_dir)
+        )
 
 
 async def _serve(
@@ -374,19 +579,7 @@ async def _serve(
             server.should_exit = True
         if server_task is not None:
             await asyncio.gather(server_task, return_exceptions=True)
-        cleanup_successful_run = False
-        if start_run and getattr(supervisor, "cleanup_on_success", True):
-            with contextlib.suppress(Exception):
-                run = supervisor.store.get_run(supervisor.run_id)
-                cleanup_successful_run = RunStatus(run["status"]) is RunStatus.SUCCEEDED
-        try:
-            await supervisor.close()
-        finally:
-            lock.release()
-        if cleanup_successful_run:
-            successful_run_dir = supervisor.run_dir
-            _cleanup_successful_run(successful_run_dir, supervisor.working_dir)
-            typer.echo(f"Removed successful Runwatch state: {successful_run_dir}")
+        await _finish_serve(supervisor, lock)
 
 
 def _serve_lock(supervisor: RunSupervisor, run_lock: RunLock | None) -> RunLock:
@@ -398,7 +591,7 @@ def _serve_lock(supervisor: RunSupervisor, run_lock: RunLock | None) -> RunLock:
         created.acquire()
         return created
     if not run_lock.held or run_lock.path.parent.resolve() != supervisor.run_dir:
-        raise RuntimeError("Stopped-process recovery did not retain the run lock")
+        raise RuntimeError("The caller did not retain the run lock")
     if run_lock.controller_token != supervisor.controller_token:
         raise RuntimeError("Run lock and supervisor controller identities differ")
     return run_lock
@@ -410,8 +603,14 @@ def _run_store(run_dir: Path) -> tuple[dict[str, Any], RunwatchConfig, RunStore]
     store = RunStore(
         run_dir.resolve() / "runwatch.sqlite3",
         max_observations_per_resource=config.storage.max_observations_per_resource,
+        max_observation_bytes_per_resource=(
+            config.storage.max_observation_bytes_per_resource
+        ),
         max_log_lines_per_resource=config.storage.max_log_lines_per_resource,
+        max_log_bytes_per_resource=config.storage.max_log_bytes_per_resource,
         max_events_per_run=config.storage.max_events_per_run,
+        max_event_bytes_per_run=config.storage.max_event_bytes_per_run,
+        max_resource_payload_bytes=config.storage.max_resource_payload_bytes,
     )
     return manifest, config, store
 
@@ -576,27 +775,39 @@ def execute(
     notebook = notebook.resolve()
     working = (working_dir or notebook.parent).resolve()
     target_run_dir = (run_dir or _default_run_dir(working, notebook)).resolve()
-    _require_new_run_dir(target_run_dir)
-    supervisor = RunSupervisor(
-        notebook_path=notebook,
-        output_path=(output or target_run_dir / "executed.ipynb").resolve(),
-        working_dir=working,
-        run_dir=target_run_dir,
-        config=loaded,
-        name=name,
-        cleanup_on_success=not keep_run,
-    )
+    run_dir_existed = target_run_dir.exists()
+    lock = RunLock(target_run_dir)
+    lock.acquire()
     try:
-        raise typer.Exit(asyncio.run(_serve(supervisor, start_run=True)))
-    except KeyboardInterrupt:
-        if target_run_dir.exists():
-            typer.echo(
-                "\nRunwatch process stopped. Resume with: runwatch resume "
-                + str(target_run_dir)
+        _require_new_run_dir(target_run_dir, run_lock=lock)
+        supervisor = RunSupervisor(
+            notebook_path=notebook,
+            output_path=(output or target_run_dir / "executed.ipynb").resolve(),
+            working_dir=working,
+            run_dir=target_run_dir,
+            config=loaded,
+            name=name,
+            cleanup_on_success=not keep_run,
+        )
+        supervisor.controller_token = lock.controller_token
+        try:
+            raise typer.Exit(
+                asyncio.run(_serve(supervisor, start_run=True, run_lock=lock))
             )
-        else:
-            typer.echo("\nRunwatch dashboard closed after successful cleanup.")
-        raise typer.Exit(130) from None
+        except KeyboardInterrupt:
+            if target_run_dir.exists():
+                typer.echo(
+                    "\nRunwatch process stopped. Resume with: runwatch resume "
+                    + str(target_run_dir)
+                )
+            else:
+                typer.echo("\nRunwatch dashboard closed after successful cleanup.")
+            raise typer.Exit(130) from None
+    finally:
+        lock.release()
+        if not run_dir_existed:
+            with contextlib.suppress(OSError):
+                target_run_dir.rmdir()
 
 
 @app.command()
@@ -1073,12 +1284,25 @@ def _finish_offline_stop_action(
 def open(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
 ) -> None:
-    """Open a persisted run as a read-only dashboard."""
-    supervisor = RunSupervisor.reopen(run_dir)
+    """Open a persisted run dashboard and recover pending notifications."""
+    run_dir = run_dir.resolve()
+    lock = RunLock(run_dir)
+    lock.acquire()
     try:
-        asyncio.run(_serve(supervisor, start_run=False))
-    except KeyboardInterrupt:
-        raise typer.Exit(130) from None
+        supervisor = RunSupervisor.reopen(run_dir)
+        supervisor.controller_token = lock.controller_token
+        try:
+            asyncio.run(
+                _serve(
+                    supervisor,
+                    start_run=False,
+                    run_lock=lock,
+                )
+            )
+        except KeyboardInterrupt:
+            raise typer.Exit(130) from None
+    finally:
+        lock.release()
 
 
 @app.command("init-config")

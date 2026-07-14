@@ -86,6 +86,43 @@ class FailOnceAfterCursorMutationAdapter(ResourceAdapter):
         )
 
 
+class StopRaceAdapter(ResourceAdapter):
+    provider = "fake"
+    resource_type = "stop_race"
+    supports_stop = True
+    inspect_started: ClassVar[asyncio.Event]
+    release_inspect: ClassVar[asyncio.Event]
+    stop_started: ClassVar[asyncio.Event]
+    release_stop: ClassVar[asyncio.Event]
+    stopped: ClassVar[bool]
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.inspect_started = asyncio.Event()
+        cls.release_inspect = asyncio.Event()
+        cls.stop_started = asyncio.Event()
+        cls.release_stop = asyncio.Event()
+        cls.stopped = False
+
+    async def inspect(
+        self, resource: dict[str, Any], cursor: dict[str, Any]
+    ) -> ResourceObservation:
+        if not self.inspect_started.is_set():
+            self.inspect_started.set()
+            await self.release_inspect.wait()
+            cursor["stale_inspection_committed"] = True
+            return ResourceObservation(status=ResourceStatus.RUNNING)
+        return ResourceObservation(
+            status=(ResourceStatus.STOPPED if self.stopped else ResourceStatus.RUNNING),
+            terminal=self.stopped,
+        )
+
+    async def stop(self, resource: dict[str, Any]) -> None:
+        self.stop_started.set()
+        await self.release_stop.wait()
+        self.__class__.stopped = True
+
+
 def build_store(root: Path) -> RunStore:
     source = root / "source.ipynb"
     source.write_text("{}", encoding="utf-8")
@@ -101,6 +138,113 @@ def build_store(root: Path) -> RunStore:
         source_digest="digest",
     )
     return store
+
+
+@pytest.mark.asyncio
+async def test_provider_observation_cannot_overwrite_local_stop_intent(
+    tmp_path: Path,
+) -> None:
+    StopRaceAdapter.reset()
+    store = build_store(tmp_path)
+    manager = ResourceManager(
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+        working_dir=tmp_path,
+        aws_settings=AwsSettings(poll_interval_seconds=0.001),
+    )
+    manager.register_adapter(StopRaceAdapter)
+    internal_id = await manager.register(
+        ResourceEvent(
+            resource=ResourceSpec(
+                provider="fake",
+                type="stop_race",
+                id="job",
+                ownership=Ownership.EXCLUSIVE,
+            )
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+    )
+    await StopRaceAdapter.inspect_started.wait()
+
+    stop_task = asyncio.create_task(manager.stop_resource(internal_id))
+    await StopRaceAdapter.stop_started.wait()
+    assert store.get_resource(internal_id)["status"] == "stopping"  # type: ignore[index]
+
+    StopRaceAdapter.release_inspect.set()
+    for _ in range(100):
+        current = store.get_resource(internal_id)
+        if current and current["cursor"].get("stale_inspection_committed"):
+            break
+        await asyncio.sleep(0.001)
+    current = store.get_resource(internal_id)
+    assert current is not None
+    assert current["cursor"]["stale_inspection_committed"] is True
+    assert current["status"] == "stopping"
+
+    StopRaceAdapter.release_stop.set()
+    await stop_task
+    assert store.get_resource(internal_id)["status"] == "stopped"  # type: ignore[index]
+    await manager.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_error_cannot_overwrite_local_stop_intent(tmp_path: Path) -> None:
+    store = build_store(tmp_path)
+    manager = ResourceManager(
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+        working_dir=tmp_path,
+        aws_settings=AwsSettings(),
+    )
+    manager.register_adapter(FakeStoppableAdapter)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(
+                provider="fake",
+                type="job",
+                id="error-race",
+                ownership=Ownership.EXCLUSIVE,
+            ),
+            lifecycle=ResourceLifecycle(
+                blocking=True,
+                max_consecutive_monitor_errors=1,
+            ),
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=True,
+    )
+    before_stop = store.get_resource(internal_id)
+    assert before_stop is not None
+    store.request_resource_stop(internal_id, ResourceDisposition.CANCELLED)
+
+    error = RuntimeError("stale provider error")
+    await manager._record_monitor_error(internal_id, error, 1)  # noqa: SLF001
+    failed = await manager._fail_blocking_resource_after_monitor_errors(  # noqa: SLF001
+        internal_id,
+        before_stop,
+        error,
+        {},
+        1,
+    )
+
+    current = store.get_resource(internal_id)
+    assert current is not None
+    assert current["status"] == "stopping"
+    assert current["terminal"] is False
+    assert failed is False
+    event = store.recent_events("run")[-1]
+    assert event["type"] == "resource.monitor_error"
+    assert event["payload"]["stop_intent_preserved"] is True
+    await manager.shutdown()
+    store.close()
 
 
 @pytest.mark.asyncio

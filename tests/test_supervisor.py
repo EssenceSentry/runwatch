@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,28 @@ def build_supervisor(root: Path) -> RunSupervisor:
         run_dir=root / "run",
         config=RunwatchConfig(),
     )
+
+
+def test_run_state_is_created_with_private_permissions(tmp_path: Path) -> None:
+    old_umask = os.umask(0o000)
+    try:
+        supervisor = build_supervisor(tmp_path)
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(supervisor.run_dir.stat().st_mode) == 0o700
+    for path in (
+        supervisor.input_snapshot_path,
+        supervisor.source_path,
+        supervisor.run_dir / "run-manifest.json",
+        supervisor.store.path,
+    ):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{supervisor.store.path}{suffix}")
+        if sidecar.exists():
+            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+    supervisor.store.close()
 
 
 @pytest.mark.parametrize(
@@ -130,9 +154,7 @@ async def test_close_attempts_all_cleanup_after_multiple_failures(
     with pytest.raises(RuntimeError, match="Runwatch cleanup failed") as raised:
         await supervisor.close()
 
-    assert calls[0] == "runtime"
-    assert set(calls[1:3]) == {"notifications", "resources"}
-    assert calls[3:] == ["controller", "store"]
+    assert calls == ["runtime", "resources", "notifications", "controller", "store"]
     assert all(
         message in str(raised.value)
         for message in (
@@ -147,6 +169,68 @@ async def test_close_attempts_all_cleanup_after_multiple_failures(
     completed_calls = list(calls)
     await supervisor.close()
     assert calls == completed_calls
+
+
+@pytest.mark.asyncio
+async def test_quiesce_is_idempotent_and_keeps_notifications_and_store_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = build_supervisor(tmp_path)
+    shutdown_calls = 0
+    original_shutdown = supervisor.resources.shutdown
+
+    async def counted_shutdown() -> None:
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        await original_shutdown()
+
+    monkeypatch.setattr(supervisor.resources, "shutdown", counted_shutdown)
+
+    await supervisor.quiesce()
+    await supervisor.quiesce()
+
+    assert shutdown_calls == 1
+    assert supervisor.store.get_run(supervisor.run_id)["status"] == "created"
+    assert not supervisor.notifications._client.is_closed
+    await supervisor.close()
+    assert supervisor.notifications._client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_joins_kernel_escalation_before_store_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = build_supervisor(tmp_path)
+    store_closed = False
+    joined = asyncio.Event()
+    wait_forever = asyncio.Event()
+    original_store_close = supervisor.store.close
+
+    def tracked_store_close() -> None:
+        nonlocal store_closed
+        store_closed = True
+        original_store_close()
+
+    async def escalation() -> None:
+        try:
+            await wait_forever.wait()
+        finally:
+            assert not store_closed
+            await supervisor.bus.publish("notebook.cancel_shutdown_joined", {})
+            joined.set()
+
+    monkeypatch.setattr(supervisor.store, "close", tracked_store_close)
+    task = asyncio.create_task(escalation())
+    supervisor.runner._cancel_escalation_task = task
+    await asyncio.sleep(0)
+
+    await supervisor.close()
+
+    assert joined.is_set()
+    assert task.cancelled()
+    assert supervisor.runner._cancel_escalation_task is None
+    assert store_closed
+    await supervisor.runner.shutdown()
 
 
 @pytest.mark.asyncio

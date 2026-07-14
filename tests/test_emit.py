@@ -16,7 +16,9 @@ from runwatch.resources import (
 )
 
 
-def test_namespaced_sagemaker_event_has_owned_stoppable_defaults(monkeypatch) -> None:
+def test_namespaced_sagemaker_event_is_borrowed_and_safe_by_default(
+    monkeypatch,
+) -> None:
     captured: list[dict] = []
     monkeypatch.setattr(
         "runwatch.emit._display_payload",
@@ -27,10 +29,32 @@ def test_namespaced_sagemaker_event_has_owned_stoppable_defaults(monkeypatch) ->
     assert event.schema_version == 2
     assert event.resource.type == "sagemaker_processing_job"
     assert event.resource.logical_key == "build"
-    assert event.resource.ownership.value == "exclusive"
+    assert event.resource.ownership.value == "borrowed"
     assert event.lifecycle.blocking is True
-    assert event.lifecycle.stop_on_cancel is True
+    assert event.lifecycle.stop_on_cancel is False
     assert captured == [payload]
+
+
+def test_owned_sagemaker_helper_opts_in_to_provider_stop(monkeypatch) -> None:
+    monkeypatch.setattr("runwatch.emit._display_payload", lambda *args: None)
+
+    owned = ResourceEvent.model_validate(
+        aws.emit_owned_sagemaker_processing_job("job-owned")
+    )
+    explicit_legacy = ResourceEvent.model_validate(
+        aws.emit_sagemaker_processing_job("job-explicit", stop_on_cancel=True)
+    )
+
+    assert owned.resource.ownership.value == "exclusive"
+    assert owned.lifecycle.stop_on_cancel is True
+    assert explicit_legacy.resource.ownership.value == "exclusive"
+    assert explicit_legacy.lifecycle.stop_on_cancel is True
+    with pytest.raises(ValueError, match="requires ownership='exclusive'"):
+        aws.emit_sagemaker_processing_job(
+            "job-borrowed",
+            ownership="borrowed",
+            stop_on_cancel=True,
+        )
 
 
 def test_impossible_blocking_monitors_are_rejected(monkeypatch) -> None:

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from runwatch.dashboard_links import DashboardLinkManager
 from runwatch.models import (
+    ActionKind,
     NotificationSettings,
     Ownership,
     ResourceDisposition,
@@ -24,6 +25,7 @@ from runwatch.models import (
 )
 from runwatch.supervisor import RunSupervisor
 from runwatch.web import (
+    _dashboard_event_signal,
     _delivery_batch,
     _event_stream,
     _events_after,
@@ -86,6 +88,7 @@ async def test_linked_dashboard_open_is_authenticated_and_snapshot_is_secret_fre
     opened = client.get(f"/api/resources/{internal_id}/open", follow_redirects=False)
     assert opened.status_code == 303
     assert opened.headers["location"] == "http://127.0.0.1:8501"
+    assert opened.headers["cache-control"] == "no-store"
 
     await supervisor.close()
 
@@ -137,7 +140,9 @@ def test_dashboard_auth_and_reduced_remote_surface(tmp_path: Path) -> None:
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-frame-options"] == "DENY"
     assert "Remote notebook assistant" not in response.text
-    assert client.get("/api/state").status_code == 200
+    state_response = client.get("/api/state")
+    assert state_response.status_code == 200
+    assert state_response.headers["cache-control"] == "no-store"
     assert client.post("/api/actions/cancel", json={}).status_code == 404
     assert client.get("/notifications/ntfy/open").status_code == 404
     supervisor.store.close()
@@ -174,6 +179,107 @@ def test_dashboard_exposes_authenticated_ntfy_app_handoff(tmp_path: Path) -> Non
     handoff = client.get("/notifications/ntfy/open", follow_redirects=False)
     assert handoff.status_code == 303
     assert handoff.headers["location"] == ("ntfy://ntfy.example/base/phone%20topic")
+    assert handoff.headers["cache-control"] == "no-store"
+    supervisor.store.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_and_sse_are_allowlisted_presentations(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "sensitive.ipynb"
+    nbformat.write(
+        nbformat.v4.new_notebook(
+            cells=[nbformat.v4.new_code_cell("SOURCE_SECRET = 'hidden'")]
+        ),
+        notebook_path,
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(
+            notifications=NotificationSettings(
+                webhook_urls=["https://hooks.example/run?token=WEBHOOK_SECRET"]
+            )
+        ),
+    )
+    internal_id, _ = supervisor.store.register_resource(
+        run_id=supervisor.run_id,
+        event=ResourceEvent(
+            resource=ResourceSpec(
+                provider="local",
+                type="line_count",
+                id=str(tmp_path / "private" / "output.jsonl"),
+                account_id="ACCOUNT_SECRET",
+                metadata={"credential": "METADATA_SECRET"},
+            )
+        ),
+        cell_index=0,
+        attempt=1,
+        kernel_epoch=0,
+        supports_stop=False,
+    )
+    supervisor.store.save_resource_cursor(internal_id, {"token": "CURSOR_SECRET"})
+    supervisor.store.update_resource_observation(
+        supervisor.run_id,
+        internal_id,
+        ResourceObservation(
+            status=ResourceStatus.RUNNING,
+            metrics={"line_count": 4, "credential": "METRIC_SECRET"},
+            raw={"provider_token": "RAW_SECRET"},
+        ),
+    )
+    supervisor.store.create_action(
+        supervisor.run_id,
+        ActionKind.RESUME,
+        payload={"credential": "ACTION_SECRET"},
+    )
+    event = await supervisor.bus.publish(
+        "resource.observed",
+        {
+            "internal_id": internal_id,
+            "status": "running",
+            "credential": "EVENT_SECRET",
+        },
+    )
+
+    client = TestClient(create_app(supervisor, "secret-token"))
+    client.get("/?token=secret-token")
+    response = client.get("/api/state")
+    snapshot = response.json()
+    serialized = response.text
+
+    assert response.headers["cache-control"] == "no-store"
+    assert snapshot["schema_version"] == 1
+    assert "actions" not in snapshot
+    assert set(snapshot["capabilities"]) == {"controller_live"}
+    assert "source" not in snapshot["cells"][0]
+    assert "metadata" not in snapshot["run"]
+    resource = snapshot["resources"][0]
+    assert resource["external_id"] == "output.jsonl"
+    assert resource["metrics"] == {"line_count": 4}
+    assert not {"cursor", "raw", "account_id"}.intersection(resource)
+    for secret in (
+        "SOURCE_SECRET",
+        "WEBHOOK_SECRET",
+        "ACCOUNT_SECRET",
+        "METADATA_SECRET",
+        "METRIC_SECRET",
+        "CURSOR_SECRET",
+        "RAW_SECRET",
+        "ACTION_SECRET",
+        "EVENT_SECRET",
+    ):
+        assert secret not in serialized
+
+    signal = _dashboard_event_signal(event)
+    assert signal == {
+        "seq": event["seq"],
+        "timestamp": event["timestamp"],
+        "type": "resource.observed",
+    }
     supervisor.store.close()
 
 
@@ -435,6 +541,7 @@ async def test_sse_replays_events_after_last_event_id(tmp_path: Path) -> None:
         replay = await anext(stream)
         assert f"id: {second['seq']}" in replay
         assert '"type": "second"' in replay
+        assert '"value"' not in replay
     finally:
         await stream.aclose()
         supervisor.store.close()

@@ -1,4 +1,6 @@
 # Runwatch configuration schema. Version 2 intentionally rejects 0.1 run state.
+# String values expand $NAME or ${NAME}; unset variables are rejected. Use $$ for a
+# literal dollar sign. Placeholders in comments are ignored.
 schema_version: 2
 
 notebook:
@@ -8,6 +10,12 @@ notebook:
   timeout_seconds: null
   startup_timeout_seconds: 60
   checkpoint_interval_seconds: 2.0
+  # Cancellation escalates through interrupt, shutdown, terminate, and kill.
+  # Each grace bounds how long Runwatch waits before advancing to the next stage.
+  cancel_interrupt_grace_seconds: 5.0
+  cancel_shutdown_grace_seconds: 5.0
+  cancel_terminate_grace_seconds: 3.0
+  cancel_kill_grace_seconds: 2.0
   # Automatically mirror tqdm progress from Python kernels into the dashboard.
   capture_tqdm: true
   # Runwatch adds this floor on top of tqdm's own display throttling.
@@ -51,6 +59,8 @@ notifications:
   ntfy_topic: null
   # Optional periodic status notification interval; null disables status reminders.
   periodic_seconds: null
+  # Bound the terminal outbox drain before retaining successful run state for retry.
+  terminal_drain_timeout_seconds: 30.0
   # Failed destinations retry independently through the durable SQLite outbox.
   request_timeout_seconds: 15.0
   max_delivery_attempts: 4
@@ -59,8 +69,12 @@ notifications:
 
 storage:
   max_observations_per_resource: 10000
+  max_observation_bytes_per_resource: 8388608
   max_log_lines_per_resource: 2000
+  max_log_bytes_per_resource: 2097152
   max_events_per_run: 10000
+  max_event_bytes_per_run: 8388608
+  max_resource_payload_bytes: 2097152
   dashboard_chart_points: 300
 
 # Static resources can be declared here. Dynamically created resources should use

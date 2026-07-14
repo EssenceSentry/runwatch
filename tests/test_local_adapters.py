@@ -69,6 +69,38 @@ async def test_file_count_expected_completion(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_file_count_streams_exact_size_and_latest_mtime(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "parts"
+    root.mkdir()
+    early = root / "early.bin"
+    late = root / "late.bin"
+    early.write_bytes(b"abc")
+    late.write_bytes(b"12345")
+    os.utime(
+        early,
+        ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000),
+    )
+    os.utime(
+        late,
+        ns=(1_700_000_010_000_000_000, 1_700_000_010_000_000_000),
+    )
+
+    observation = await adapter(FileCountAdapter, tmp_path).inspect(
+        {
+            "external_id": "parts",
+            "metadata": {"pattern": "*.bin", "recursive": False},
+        },
+        {},
+    )
+
+    assert observation.metrics["file_count"] == 2
+    assert observation.metrics["total_bytes"] == 8
+    assert observation.metrics["latest_modified_at"] == late.stat().st_mtime
+
+
+@pytest.mark.asyncio
 async def test_file_count_reports_settlement_only_when_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -188,6 +220,30 @@ async def test_line_count_detects_truncation_rewrite_and_rotation(
     replacement = await monitor.inspect(resource, cursor)
     assert replacement.metrics["line_count"] == 1
     assert replacement.metrics["reset_reason"] == "rotation"
+
+
+@pytest.mark.asyncio
+async def test_line_count_detects_same_size_rewrite_before_tail_fingerprint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.log"
+    path.write_bytes(b"before-line\n" + b"x" * 128 + b"\n")
+    cursor: dict = {}
+    resource = {"external_id": "worker.log", "metadata": {"tail_lines": 10}}
+    monitor = adapter(LineCountAdapter, tmp_path)
+    first = await monitor.inspect(resource, cursor)
+    assert first.metrics["line_count"] == 2
+    previous_mtime_ns = path.stat().st_mtime_ns
+
+    with path.open("r+b") as handle:
+        handle.write(b"after--line\n")
+    updated_mtime_ns = previous_mtime_ns + 1_000_000
+    os.utime(path, ns=(updated_mtime_ns, updated_mtime_ns))
+
+    rewritten = await monitor.inspect(resource, cursor)
+    assert rewritten.metrics["reset_reason"] == "rewrite"
+    assert rewritten.metrics["line_count"] == 2
+    assert rewritten.log_lines[0] == "after--line"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import asyncio
 import sqlite3
 from collections.abc import Callable, Coroutine
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -74,6 +75,65 @@ def cell_failure(*, kernel_epoch: int, cell_index: int = 1, attempt: int = 1) ->
         "error_name": "ValueError",
         "error_value": "bad input",
     }
+
+
+@pytest.mark.asyncio
+async def test_backlogged_notifiable_event_survives_tiny_retention_budgets(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bounded-run"
+    root.mkdir()
+    source = root / "source.ipynb"
+    source.write_text("{}", encoding="utf-8")
+    store = RunStore(
+        root / "state.sqlite3",
+        max_events_per_run=3,
+        max_event_bytes_per_run=96,
+    )
+    store.initialize_run(
+        run_id="run",
+        name="demo",
+        notebook_path=source,
+        source_path=source,
+        output_path=root / "out.ipynb",
+        working_dir=root,
+        run_dir=root,
+        source_digest="digest",
+    )
+    bus = EventBus(store, "run")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    manager = NotificationManager(
+        settings=NotificationSettings(webhook_urls=["https://hooks.example/backlog"]),
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    failure = await bus.publish("cell.failed", cell_failure(kernel_epoch=4))
+    for index in range(8):
+        await bus.publish("probe.noise", {"index": index, "blob": "x" * 40})
+
+    backlog = store.events_after("run", 0, limit=100)
+    high_water = int(backlog[-1]["seq"])
+    assert len(backlog) == 9
+    assert backlog[0]["seq"] == failure["seq"]
+    assert backlog[0]["type"] == "cell.failed"
+
+    await manager.start()
+    await wait_until(lambda: len(requests) == 1)
+    drained = await manager.drain(1)
+
+    assert drained.complete
+    assert store.notification_event_cursor("run") >= high_water
+    assert len(store.recent_events("run", limit=100)) <= 3
+    await manager.close()
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -156,9 +216,8 @@ async def test_failed_delivery_retries_then_deduplicates_only_after_success(
         title="Runwatch", message="recoverable", dedup_key="retry-me"
     )
     assert intent is not None
-    await wait_until(
-        lambda: notification_intent_has_status(store, intent["intent_id"], "succeeded")
-    )
+    drained = await manager.drain(1)
+    assert drained.complete
     assert len(requests) == 3
     delivery = store.notification_deliveries(intent["intent_id"])[0]
     assert delivery["attempt_count"] == 3
@@ -286,18 +345,193 @@ async def test_slow_failing_destination_does_not_block_fast_destination(
     await manager.start()
     intent = await manager.send(title="Runwatch", message="fan out")
     assert intent is not None
+    drain_task = asyncio.create_task(manager.drain(1))
 
     await asyncio.wait_for(slow_started.wait(), timeout=1)
     await asyncio.wait_for(fast_completed.wait(), timeout=0.2)
+    assert not drain_task.done()
     deliveries = store.notification_deliveries(intent["intent_id"])
     fast = next(item for item in deliveries if "fast.example" in item["destination"])
     assert fast["status"] == "succeeded"
 
     release_slow.set()
-    await wait_until(
-        lambda: notification_intent_has_status(store, intent["intent_id"], "failed")
-    )
+    drained = await drain_task
+    assert drained.complete
+    assert notification_intent_has_status(store, intent["intent_id"], "failed")
     await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_post_http_persistence_failure_is_requeued_and_diagnosed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/persistence-recovery"],
+            max_delivery_attempts=3,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    original_finish = store.finish_notification_delivery
+    persistence_calls = 0
+
+    def fail_first_persistence(
+        delivery_id: str,
+        *,
+        succeeded: bool,
+        max_attempts: int,
+        retry_delay_seconds: float,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        nonlocal persistence_calls
+        persistence_calls += 1
+        if persistence_calls == 1:
+            raise sqlite3.OperationalError("simulated post-HTTP persistence failure")
+        return original_finish(
+            delivery_id,
+            succeeded=succeeded,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            error=error,
+        )
+
+    monkeypatch.setattr(store, "finish_notification_delivery", fail_first_persistence)
+    await manager.start()
+    intent = await manager.send(title="Runwatch", message="persist me")
+    assert intent is not None
+
+    drained = await manager.drain(1)
+
+    assert drained.complete
+    assert len(requests) == 2
+    assert (
+        requests[0].headers["Idempotency-Key"] == requests[1].headers["Idempotency-Key"]
+    )
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    assert delivery["status"] == "succeeded"
+    assert delivery["attempt_count"] == 2
+    recovered = [
+        event
+        for event in store.recent_events("run", limit=1_000)
+        if event["type"] == "notification.delivery_recovered"
+    ]
+    assert recovered[-1]["payload"]["outcome"] == "pending"
+    assert "OperationalError" in recovered[-1]["payload"]["error"]
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_post_http_persistence_failure_is_terminally_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/persistence-failure"],
+            max_delivery_attempts=1,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+
+    def fail_persistence(
+        delivery_id: str,
+        *,
+        succeeded: bool,
+        max_attempts: int,
+        retry_delay_seconds: float,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        raise sqlite3.OperationalError("persistent SQLite failure")
+
+    monkeypatch.setattr(store, "finish_notification_delivery", fail_persistence)
+    await manager.start()
+    intent = await manager.send(title="Runwatch", message="bounded failure")
+    assert intent is not None
+
+    drained = await manager.drain(1)
+
+    assert drained.complete
+    assert len(requests) == 1
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    assert delivery["status"] == "failed"
+    assert delivery["attempt_count"] == 1
+    recovered = [
+        event
+        for event in store.recent_events("run", limit=1_000)
+        if event["type"] == "notification.delivery_recovered"
+    ]
+    assert recovered[-1]["payload"]["outcome"] == "failed"
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_reports_and_close_restores_sending_delivery(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await never_release.wait()
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(webhook_urls=["https://slow.example/hook"]),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    intent = await manager.send(title="Runwatch", message="retain me")
+    assert intent is not None
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    drained = await manager.drain(0.01)
+
+    assert not drained.complete
+    assert drained.nonterminal_intents == 1
+    assert drained.nonterminal_deliveries == 1
+    assert "remain pending" in (drained.reason or "")
+    await manager.close()
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    assert delivery["status"] == "pending"
+    assert delivery["attempt_count"] == 0
+    assert any(
+        event["type"] == "notification.deliveries_recovered"
+        for event in store.recent_events("run", limit=1_000)
+    )
     store.close()
 
 

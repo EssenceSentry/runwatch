@@ -85,7 +85,7 @@ async def test_bounded_log_stream_discovery_rotates_across_polls(
             "max_streams": 1,
         }
     }
-    cursor: dict[str, Any] = {}
+    cursor: dict[str, Any] = {"log_tokens": {"deleted/stream": "stale-token"}}
 
     first = await adapter.inspect(resource, cursor)
     second = await adapter.inspect(resource, cursor)
@@ -95,3 +95,53 @@ async def test_bounded_log_stream_discovery_rotates_across_polls(
     assert "job/two" in second.log_lines[0]
     assert second.metrics["stream_rotation_active"] is True
     assert "stream_discovery_token" not in cursor
+    assert "deleted/stream" not in cursor["log_tokens"]
+
+
+class BusyStreamsLogs:
+    def __init__(self) -> None:
+        self.read_requests: list[dict[str, Any]] = []
+
+    def describe_log_streams(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "logStreams": [
+                {"logStreamName": "job/one"},
+                {"logStreamName": "job/two"},
+            ]
+        }
+
+    def get_log_events(self, **kwargs: Any) -> dict[str, Any]:
+        self.read_requests.append(kwargs)
+        stream = kwargs["logStreamName"]
+        limit = kwargs["limit"]
+        return {
+            "events": [
+                {"timestamp": index, "message": f"{stream}-{index}"}
+                for index in range(limit)
+            ],
+            "nextForwardToken": f"after-{stream}",
+        }
+
+
+@pytest.mark.asyncio
+async def test_log_line_budget_is_shared_across_busy_streams(tmp_path: Path) -> None:
+    aws = FakeAws()
+    logs = BusyStreamsLogs()
+    aws.logs = logs  # type: ignore[assignment]
+    adapter = CloudWatchLogsAdapter(
+        aws=aws,  # type: ignore[arg-type]
+        aws_settings=AwsSettings(max_log_streams=2, max_log_lines_per_poll=4),
+        working_dir=tmp_path,
+    )
+
+    observation = await adapter.inspect(
+        {
+            "region": "us-east-1",
+            "metadata": {"log_group": "/example", "stream_prefix": "job/"},
+        },
+        {},
+    )
+
+    assert [request["limit"] for request in logs.read_requests] == [2, 2]
+    assert sum("job/one" in line for line in observation.log_lines) == 2
+    assert sum("job/two" in line for line in observation.log_lines) == 2

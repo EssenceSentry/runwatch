@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -17,6 +18,7 @@ from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
 from nbformat import NotebookNode
 
+from ._fs import atomic_write_bytes
 from ._tqdm import tqdm_bootstrap_code
 from .emit import EVENT_MIME_TYPE, FALLBACK_PREFIX, RESOURCE_MIME_TYPE
 from .events import EventBus
@@ -35,7 +37,53 @@ from .storage import RunStore, source_hash
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _OUTPUT_PERSIST_INTERVAL_SECONDS = 0.25
 _TIMEOUT_RECOVERY_MAX_SECONDS = 10.0
+_CHECKPOINT_RETRY_MAX_SECONDS = 30.0
 _WRITEBACK_STATE_FILENAME = "writeback-state.json"
+
+
+@dataclass(frozen=True)
+class _FileFingerprint:
+    digest: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+class _CancellationEscalated(RuntimeError):
+    pass
+
+
+def _notebook_bytes(notebook: NotebookNode) -> bytes:
+    return nbformat.writes(notebook).encode("utf-8")
+
+
+def _file_fingerprint(path: Path) -> _FileFingerprint:
+    """Read a stable identity and digest for a regular file."""
+
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        payload = handle.read()
+        after = os.fstat(handle.fileno())
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise RuntimeError(f"File changed while Runwatch was reading it: {path}")
+    return _FileFingerprint(
+        digest=hashlib.sha256(payload).hexdigest(),
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        modified_ns=after.st_mtime_ns,
+    )
 
 
 def _strip_ansi(value: str) -> str:
@@ -78,15 +126,9 @@ def clear_notebook_outputs(notebook: NotebookNode) -> None:
 
 
 def write_notebook_atomic(notebook: NotebookNode, path: Path) -> None:
-    """Write a notebook through an fsynced temporary file and atomic replace."""
+    """Atomically write a notebook, preserving an existing destination's mode."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        nbformat.write(notebook, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    atomic_write_bytes(path, _notebook_bytes(notebook))
 
 
 def _cell_records(notebook: NotebookNode) -> list[dict[str, Any]]:
@@ -266,11 +308,25 @@ class NotebookRunner:
         self._checkpoint_event = asyncio.Event()
         self._checkpoint_task: asyncio.Task[None] | None = None
         self._checkpoint_lock = asyncio.Lock()
+        self._checkpoint_requested_generation = 0
+        self._checkpoint_persisted_generation = 0
+        self._checkpoint_consecutive_failures = 0
         self._finished = asyncio.Event()
         self._paused = asyncio.Event()
         self._cancel_requested = asyncio.Event()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_escalation_task: asyncio.Task[None] | None = None
+        self._cancel_command_enqueued = False
+        self._cancel_abandon_execution = asyncio.Event()
         self._running_cell = False
+        self._cell_stopped = asyncio.Event()
+        self._cell_stopped.set()
+        self._cell_execution_task: asyncio.Future[NotebookNode] | None = None
         self._kernel_dead = False
+        self._kernel_state_lost = any(
+            event["type"] == "notebook.kernel_state_lost"
+            for event in self.store.recent_events(self.run_id, limit=1_000)
+        )
         self._initial_from_cell = initial_from_cell
         self._resume_existing = not initialize_cells
         self.partial_output_path = run_dir / "executed.partial.ipynb"
@@ -292,6 +348,22 @@ class NotebookRunner:
     async def enqueue(self, command: RunnerCommand) -> None:
         await self.command_queue.put(command)
 
+    async def shutdown(self) -> None:
+        """Cancel and join runner-owned background work before services close."""
+
+        async with self._cancel_lock:
+            escalation = self._cancel_escalation_task
+            self._cancel_escalation_task = None
+        if escalation is None or escalation is asyncio.current_task():
+            return
+        if not escalation.done():
+            escalation.cancel()
+        await asyncio.gather(escalation, return_exceptions=True)
+
+    def _cell_execution_active(self) -> bool:
+        execution = self._cell_execution_task
+        return execution is not None and not execution.done()
+
     async def interrupt(self) -> bool:
         client = self.client
         if client is None or client.km is None or not self._running_cell:
@@ -307,26 +379,188 @@ class NotebookRunner:
         return True
 
     async def cancel(self) -> None:
-        if self._cancel_requested.is_set():
-            return
         run_status = RunStatus(self.store.get_run(self.run_id)["status"])
         if run_status.terminal:
             return
-        self._cancel_requested.set()
-        self.store.update_run_status(
-            self.run_id, RunStatus.CANCELLING, message="Cancellation requested"
-        )
-        await self.bus.publish("run.cancel_requested", {})
-        if self.paused:
-            await self.enqueue(
-                RunnerCommand(
-                    action_id="internal-cancel",
-                    kind="cancel",
-                    expected_kernel_epoch=self.kernel_epoch,
-                )
+        if not self._cancel_requested.is_set():
+            self.store.update_run_status(
+                self.run_id, RunStatus.CANCELLING, message="Cancellation requested"
             )
-        else:
-            await self.interrupt()
+            self._cancel_requested.set()
+            await self._publish_cancellation_event_safely("run.cancel_requested", {})
+
+        escalation_task: asyncio.Task[None] | None = None
+        async with self._cancel_lock:
+            if self.paused and not self._cancel_command_enqueued:
+                await self.enqueue(
+                    RunnerCommand(
+                        action_id="internal-cancel",
+                        kind="cancel",
+                        expected_kernel_epoch=self.kernel_epoch,
+                    )
+                )
+                self._cancel_command_enqueued = True
+            elif self._cell_execution_active():
+                current = self._cancel_escalation_task
+                if current is None or current.done():
+                    current = asyncio.create_task(
+                        self._escalate_cancellation(),
+                        name=f"cancel-kernel:{self.run_id}",
+                    )
+                    self._cancel_escalation_task = current
+                escalation_task = current
+        if escalation_task is not None:
+            await asyncio.shield(escalation_task)
+
+    async def _escalate_cancellation(self) -> None:
+        client = self.client
+        if client is None or client.km is None or not self._cell_execution_active():
+            return
+        kernel_manager = cast(Any, client.km)
+        stages: list[tuple[str, Callable[[], Any] | None, float]] = [
+            (
+                "interrupt",
+                getattr(kernel_manager, "interrupt_kernel", None),
+                self.settings.cancel_interrupt_grace_seconds,
+            ),
+            (
+                "shutdown",
+                self._kernel_shutdown_callable(kernel_manager, now=False),
+                self.settings.cancel_shutdown_grace_seconds,
+            ),
+            (
+                "terminate",
+                self._provisioner_callable(kernel_manager, "terminate"),
+                self.settings.cancel_terminate_grace_seconds,
+            ),
+            (
+                "kill",
+                self._provisioner_callable(kernel_manager, "kill")
+                or self._kernel_shutdown_callable(kernel_manager, now=True),
+                self.settings.cancel_kill_grace_seconds,
+            ),
+        ]
+        for stage, action, grace_seconds in stages:
+            if not self._cell_execution_active():
+                return
+            if action is None:
+                continue
+            if stage != "interrupt":
+                await self._mark_kernel_state_lost(stage)
+            await self._publish_cancellation_event_safely(
+                "notebook.cancel_escalated",
+                {
+                    "stage": stage,
+                    "kernel_state_lost": self._kernel_state_lost,
+                    "cell_index": self.current_cell_index,
+                    "attempt": self.current_attempt,
+                    "kernel_epoch": self.kernel_epoch,
+                },
+            )
+            if stage == "interrupt":
+                await self._publish_cancellation_event_safely(
+                    "notebook.interrupt_requested",
+                    {
+                        "cell_index": self.current_cell_index,
+                        "attempt": self.current_attempt,
+                    },
+                )
+            await self._run_cancellation_stage(stage, action, grace_seconds)
+            if not self._cell_execution_active():
+                return
+
+        # A provider implementation may ignore cancellation even after its process is
+        # gone. Let the runner leave that await instead of hanging forever.
+        self._cancel_abandon_execution.set()
+        await self._publish_cancellation_event_safely(
+            "notebook.cancel_execution_abandoned",
+            {
+                "cell_index": self.current_cell_index,
+                "attempt": self.current_attempt,
+                "kernel_epoch": self.kernel_epoch,
+                "kernel_state_lost": self._kernel_state_lost,
+            },
+        )
+
+    async def _mark_kernel_state_lost(self, stage: str) -> None:
+        self._kernel_dead = True
+        if self._kernel_state_lost:
+            return
+        self._kernel_state_lost = True
+        await self._publish_cancellation_event_safely(
+            "notebook.kernel_state_lost",
+            {
+                "stage": stage,
+                "kernel_epoch": self.kernel_epoch,
+                "cell_index": self.current_cell_index,
+                "attempt": self.current_attempt,
+                "kernel_state_lost": True,
+            },
+        )
+
+    async def _run_cancellation_stage(
+        self,
+        stage: str,
+        action: Callable[[], Any],
+        grace_seconds: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace_seconds
+        try:
+            result = action()
+            if inspect.isawaitable(result):
+                await asyncio.wait_for(
+                    result,
+                    timeout=max(0.001, deadline - loop.time()),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._publish_cancellation_event_safely(
+                "notebook.cancel_stage_failed",
+                {
+                    "stage": stage,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "kernel_epoch": self.kernel_epoch,
+                },
+            )
+        remaining = max(0.0, deadline - loop.time())
+        if remaining > 0 and self._cell_execution_active():
+            try:
+                await asyncio.wait_for(self._cell_stopped.wait(), timeout=remaining)
+            except TimeoutError:
+                pass
+
+    @staticmethod
+    def _kernel_shutdown_callable(
+        kernel_manager: Any, *, now: bool
+    ) -> Callable[[], Any] | None:
+        shutdown = getattr(kernel_manager, "shutdown_kernel", None)
+        if shutdown is None:
+            return None
+        return lambda: shutdown(now=now)
+
+    @staticmethod
+    def _provisioner_callable(
+        kernel_manager: Any, method_name: str
+    ) -> Callable[[], Any] | None:
+        provisioner = getattr(kernel_manager, "provisioner", None)
+        method = getattr(provisioner, method_name, None)
+        if method is None:
+            return None
+        return lambda: method(restart=False)
+
+    async def _publish_cancellation_event_safely(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        try:
+            await self.bus.publish(event_type, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The durable cancelling state remains authoritative if diagnostics fail.
+            return
 
     async def finalize_cancelled_without_execution(self) -> RunStatus:
         """Finish crash-recovered cancellation without creating a new kernel."""
@@ -369,18 +603,25 @@ class NotebookRunner:
             )
             return RunStatus.FAILED
         finally:
-            await self._drain_output_tasks()
-            await self._checkpoint(force=True)
-            if self._checkpoint_task:
-                self._checkpoint_task.cancel()
-                await asyncio.gather(self._checkpoint_task, return_exceptions=True)
-            self._finished.set()
+            try:
+                await self._drain_output_tasks()
+                await self._checkpoint(force=True)
+            finally:
+                if self._checkpoint_task:
+                    self._checkpoint_task.cancel()
+                    await asyncio.gather(self._checkpoint_task, return_exceptions=True)
+                self._finished.set()
 
     async def _run_sessions(self) -> RunStatus:
         await self._run_kernel_epochs()
         if self._cancel_requested.is_set():
             return await self._finish_cancelled()
-        self._write_notebook_atomic(self.notebook, self.output_path)
+        output_snapshot = _notebook_bytes(self.notebook)
+        await asyncio.to_thread(
+            self._write_notebook_bytes_atomic,
+            output_snapshot,
+            self.output_path,
+        )
         blocking_status = await self._wait_for_blocking_resources()
         if blocking_status is not None:
             return blocking_status
@@ -512,14 +753,25 @@ class NotebookRunner:
 
     async def _finish_cancelled(self) -> RunStatus:
         await self.resources.stop_cancel_resources()
+        message = (
+            "Run cancelled; in-memory kernel state was lost during escalation"
+            if self._kernel_state_lost
+            else "Run cancelled"
+        )
         self.store.update_run_status(
             self.run_id,
             RunStatus.CANCELLED,
-            message="Run cancelled",
+            message=message,
             current_cell_index=None,
             ended=True,
         )
-        await self.bus.publish("run.cancelled", {"kernel_epoch": self.kernel_epoch})
+        await self.bus.publish(
+            "run.cancelled",
+            {
+                "kernel_epoch": self.kernel_epoch,
+                "kernel_state_lost": self._kernel_state_lost,
+            },
+        )
         return RunStatus.CANCELLED
 
     async def _wait_for_blocking_resources(self) -> RunStatus | None:
@@ -634,88 +886,233 @@ class NotebookRunner:
             )
             started = time.monotonic()
             self._running_cell = True
+            self._cell_stopped.clear()
+            self._cancel_abandon_execution.clear()
             try:
-                await self.client.async_execute_cell(
-                    cell, index, execution_count=self.client.code_cells_executed + 1
+                outcome = await self._execute_cell_attempt(
+                    cell, index, attempt, started
                 )
-                await self._drain_output_tasks()
-                elapsed = time.monotonic() - started
-                self.store.complete_cell(
-                    self.run_id,
-                    index,
-                    status=CellStatus.SUCCEEDED,
-                    elapsed_seconds=elapsed,
-                )
-                await self.bus.publish(
-                    "cell.succeeded",
-                    {
-                        "cell_index": index,
-                        "attempt": attempt,
-                        "elapsed_seconds": elapsed,
-                    },
-                )
-                await self._checkpoint(force=True, writeback=True)
-                return "next"
-            except (CellExecutionError, CellTimeoutError, DeadKernelError) as error:
-                timeout_synchronized = True
-                if isinstance(error, CellTimeoutError):
-                    timeout_synchronized = await self._recover_timed_out_kernel()
-                await self._drain_output_tasks()
-                elapsed = time.monotonic() - started
-                error_name, error_value, traceback = self._extract_error(cell, error)
-                self._kernel_dead = isinstance(error, DeadKernelError) or not (
-                    timeout_synchronized
-                )
-                if self._cancel_requested.is_set():
-                    self.store.complete_cell(
-                        self.run_id,
-                        index,
-                        status=CellStatus.INTERRUPTED,
-                        elapsed_seconds=elapsed,
-                        error_name=error_name,
-                        error_value=error_value,
-                        traceback=traceback,
-                    )
-                    return "cancel"
-                self.failed_cell_index = index
-                self.failed_attempt = attempt
-                self.store.complete_cell(
-                    self.run_id,
-                    index,
-                    status=CellStatus.FAILED,
-                    elapsed_seconds=elapsed,
-                    error_name=error_name,
-                    error_value=error_value,
-                    traceback=traceback,
-                )
-                self.store.update_run_status(
-                    self.run_id,
-                    RunStatus.PAUSED,
-                    message=f"Cell {index + 1} failed: {error_name}: {error_value}",
-                    current_cell_index=index,
-                    failed_cell_index=index,
-                    failed_attempt=attempt,
-                )
-                self._paused.set()
-                await self._checkpoint(force=True, writeback=True)
-                await self.bus.publish(
-                    "cell.failed",
-                    {
-                        "cell_index": index,
-                        "attempt": attempt,
-                        "kernel_epoch": self.kernel_epoch,
-                        "error_name": error_name,
-                        "error_value": error_value,
-                        "traceback": traceback[-20:],
-                        "kernel_dead": self._kernel_dead,
-                    },
-                )
-                decision = await self._recovery_loop(index, attempt)
-                if decision == "resume":
+                if outcome == "resume":
                     continue
-                return decision
+                return outcome
             finally:
                 self._running_cell = False
+                self._cell_stopped.set()
+
+    async def _execute_cell_attempt(
+        self,
+        cell: NotebookNode,
+        index: int,
+        attempt: int,
+        started: float,
+    ) -> str:
+        try:
+            await self._execute_client_cell(cell, index)
+            return await self._complete_successful_cell(index, attempt, started)
+        except (CellExecutionError, CellTimeoutError, DeadKernelError) as error:
+            return await self._handle_execution_failure(
+                cell, index, attempt, started, error
+            )
+        except _CancellationEscalated as error:
+            return await self._handle_cancelled_execution(
+                index, attempt, started, error
+            )
+        except Exception as error:
+            if not self._cancel_requested.is_set():
+                raise
+            return await self._handle_cancelled_execution(
+                index, attempt, started, error
+            )
+
+    async def _complete_successful_cell(
+        self, index: int, attempt: int, started: float
+    ) -> str:
+        await self._drain_output_tasks()
+        elapsed = time.monotonic() - started
+        self.store.complete_cell(
+            self.run_id,
+            index,
+            status=CellStatus.SUCCEEDED,
+            elapsed_seconds=elapsed,
+        )
+        await self.bus.publish(
+            "cell.succeeded",
+            {
+                "cell_index": index,
+                "attempt": attempt,
+                "elapsed_seconds": elapsed,
+            },
+        )
+        await self._checkpoint(force=True, writeback=True)
+        return "next"
+
+    async def _handle_execution_failure(
+        self,
+        cell: NotebookNode,
+        index: int,
+        attempt: int,
+        started: float,
+        error: CellExecutionError | CellTimeoutError | DeadKernelError,
+    ) -> str:
+        timeout_synchronized = True
+        if isinstance(error, CellTimeoutError):
+            timeout_synchronized = await self._recover_timed_out_kernel()
+        await self._drain_output_tasks()
+        elapsed = time.monotonic() - started
+        error_name, error_value, traceback = self._extract_error(cell, error)
+        self._kernel_dead = (
+            isinstance(error, DeadKernelError) or not timeout_synchronized
+        )
+        if self._cancel_requested.is_set():
+            await self._record_interrupted_cell(
+                index,
+                attempt,
+                elapsed,
+                error_name=error_name,
+                error_value=error_value,
+                traceback=traceback,
+            )
+            return "cancel"
+        await self._pause_failed_cell(
+            index,
+            attempt,
+            elapsed,
+            error_name=error_name,
+            error_value=error_value,
+            traceback=traceback,
+        )
+        return await self._recovery_loop(index, attempt)
+
+    async def _pause_failed_cell(
+        self,
+        index: int,
+        attempt: int,
+        elapsed: float,
+        *,
+        error_name: str,
+        error_value: str,
+        traceback: list[str],
+    ) -> None:
+        self.failed_cell_index = index
+        self.failed_attempt = attempt
+        self.store.complete_cell(
+            self.run_id,
+            index,
+            status=CellStatus.FAILED,
+            elapsed_seconds=elapsed,
+            error_name=error_name,
+            error_value=error_value,
+            traceback=traceback,
+        )
+        self.store.update_run_status(
+            self.run_id,
+            RunStatus.PAUSED,
+            message=f"Cell {index + 1} failed: {error_name}: {error_value}",
+            current_cell_index=index,
+            failed_cell_index=index,
+            failed_attempt=attempt,
+        )
+        self._paused.set()
+        await self._checkpoint(force=True, writeback=True)
+        await self.bus.publish(
+            "cell.failed",
+            {
+                "cell_index": index,
+                "attempt": attempt,
+                "kernel_epoch": self.kernel_epoch,
+                "error_name": error_name,
+                "error_value": error_value,
+                "traceback": traceback[-20:],
+                "kernel_dead": self._kernel_dead,
+            },
+        )
+
+    async def _handle_cancelled_execution(
+        self, index: int, attempt: int, started: float, error: Exception
+    ) -> str:
+        await self._drain_output_tasks()
+        await self._record_interrupted_cell(
+            index,
+            attempt,
+            time.monotonic() - started,
+            error_name=type(error).__name__,
+            error_value=str(error),
+            traceback=[str(error)],
+        )
+        return "cancel"
+
+    async def _execute_client_cell(
+        self, cell: NotebookNode, index: int
+    ) -> NotebookNode:
+        assert self.client is not None
+        execution = asyncio.ensure_future(
+            self.client.async_execute_cell(
+                cell,
+                index,
+                execution_count=self.client.code_cells_executed + 1,
+            )
+        )
+        abandon = asyncio.create_task(self._cancel_abandon_execution.wait())
+        self._cell_execution_task = execution
+        try:
+            done, _pending = await asyncio.wait(
+                {execution, abandon}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if abandon in done and not execution.done():
+                execution.cancel()
+                execution.add_done_callback(self._consume_execution_result)
+                raise _CancellationEscalated(
+                    "Kernel execution did not stop after cancellation escalation"
+                )
+            return await execution
+        except asyncio.CancelledError:
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+            raise
+        finally:
+            abandon.cancel()
+            await asyncio.gather(abandon, return_exceptions=True)
+            if self._cell_execution_task is execution:
+                self._cell_execution_task = None
+
+    @staticmethod
+    def _consume_execution_result(execution: asyncio.Future[NotebookNode]) -> None:
+        try:
+            execution.result()
+        except (asyncio.CancelledError, Exception):
+            return
+
+    async def _record_interrupted_cell(
+        self,
+        index: int,
+        attempt: int,
+        elapsed_seconds: float,
+        *,
+        error_name: str,
+        error_value: str,
+        traceback: list[str],
+    ) -> None:
+        self.store.complete_cell(
+            self.run_id,
+            index,
+            status=CellStatus.INTERRUPTED,
+            elapsed_seconds=elapsed_seconds,
+            error_name=error_name,
+            error_value=error_value,
+            traceback=traceback,
+        )
+        await self._publish_cancellation_event_safely(
+            "cell.interrupted",
+            {
+                "cell_index": index,
+                "attempt": attempt,
+                "elapsed_seconds": elapsed_seconds,
+                "error_name": error_name,
+                "error_value": error_value,
+                "kernel_epoch": self.kernel_epoch,
+                "kernel_state_lost": self._kernel_state_lost,
+            },
+        )
 
     async def _recover_timed_out_kernel(self) -> bool:
         """Interrupt and synchronize a timed-out kernel before offering live resume."""
@@ -1105,24 +1502,101 @@ class NotebookRunner:
         return type(error).__name__, str(error), [_strip_ansi(str(error))]
 
     def _request_checkpoint(self) -> None:
+        self._checkpoint_requested_generation += 1
         self._checkpoint_event.set()
 
     async def _checkpoint_loop(self) -> None:
+        delay_before_attempt = True
         while True:
             await self._checkpoint_event.wait()
-            await asyncio.sleep(self.settings.checkpoint_interval_seconds)
-            await self._checkpoint(force=True)
+            if delay_before_attempt:
+                await asyncio.sleep(self.settings.checkpoint_interval_seconds)
+            try:
+                await self._checkpoint(force=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._checkpoint_consecutive_failures += 1
+                retry_seconds = min(
+                    _CHECKPOINT_RETRY_MAX_SECONDS,
+                    max(0.1, self.settings.checkpoint_interval_seconds)
+                    * (2 ** min(self._checkpoint_consecutive_failures - 1, 8)),
+                )
+                await self._publish_checkpoint_diagnostic_safely(
+                    "notebook.checkpoint_failed",
+                    {
+                        "attempt": self._checkpoint_consecutive_failures,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "retry_seconds": retry_seconds,
+                        "requested_generation": (self._checkpoint_requested_generation),
+                        "persisted_generation": (self._checkpoint_persisted_generation),
+                    },
+                )
+                await asyncio.sleep(retry_seconds)
+                delay_before_attempt = False
+            else:
+                if self._checkpoint_consecutive_failures:
+                    await self._publish_checkpoint_diagnostic_safely(
+                        "notebook.checkpoint_recovered",
+                        {
+                            "failed_attempts": self._checkpoint_consecutive_failures,
+                            "persisted_generation": (
+                                self._checkpoint_persisted_generation
+                            ),
+                        },
+                    )
+                    self._checkpoint_consecutive_failures = 0
+                delay_before_attempt = (
+                    self._checkpoint_persisted_generation
+                    >= self._checkpoint_requested_generation
+                )
 
     async def _checkpoint(self, *, force: bool, writeback: bool = False) -> None:
-        if not force and not self._checkpoint_event.is_set():
+        if (
+            not force
+            and self._checkpoint_persisted_generation
+            >= self._checkpoint_requested_generation
+        ):
             return
         async with self._checkpoint_lock:
+            target_generation = self._checkpoint_requested_generation
+            if not force and self._checkpoint_persisted_generation >= target_generation:
+                return
+            # nbclient mutates the notebook on the event-loop thread. Serialize before
+            # crossing into a worker so that worker I/O sees an immutable generation.
+            snapshot = _notebook_bytes(self.notebook)
             await asyncio.to_thread(
-                self._write_notebook_atomic, self.notebook, self.partial_output_path
+                self._write_notebook_bytes_atomic,
+                snapshot,
+                self.partial_output_path,
             )
             if writeback:
-                await asyncio.to_thread(self._write_back_notebook)
-            self._checkpoint_event.clear()
+                await asyncio.to_thread(self._write_back_notebook_bytes, snapshot)
+            self._checkpoint_persisted_generation = max(
+                self._checkpoint_persisted_generation, target_generation
+            )
+            # No await is allowed between the generation comparison and clear. A new
+            # output callback therefore either precedes this check or remains pending.
+            if (
+                self._checkpoint_persisted_generation
+                >= self._checkpoint_requested_generation
+            ):
+                self._checkpoint_event.clear()
+            else:
+                self._checkpoint_event.set()
+
+    async def _publish_checkpoint_diagnostic_safely(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        try:
+            await self.bus.publish(event_type, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A diagnostic failure must not terminate the retry worker. A later forced
+            # checkpoint remains authoritative and still propagates its own failure.
+            return
 
     def _load_writeback_hash(self) -> str:
         if not self.writeback_state_path.exists():
@@ -1146,25 +1620,54 @@ class NotebookRunner:
             raise RuntimeError(f"Invalid notebook hash in {self.writeback_state_path}")
         return digest
 
-    def _write_back_notebook(self) -> None:
+    def _write_back_notebook_bytes(self, snapshot: bytes) -> None:
+        """Best-effort compare-and-swap the original notebook.
+
+        Portable filesystems do not expose an atomic content-compare-and-replace. The
+        destination is fingerprinted, the replacement is fully written and fsynced,
+        and the fingerprint is checked again immediately before ``os.replace``. This
+        narrows the unavoidable final check/rename window while refusing every change
+        that can be observed portably.
+        """
+
         try:
-            current_hash = source_hash(self.notebook_path)
+            current = _file_fingerprint(self.notebook_path)
         except FileNotFoundError as error:
             raise RuntimeError(
                 f"Original notebook disappeared during execution: {self.notebook_path}"
             ) from error
-        if current_hash != self._expected_notebook_hash:
-            checkpoint_hash = source_hash(self.partial_output_path)
-            if current_hash == checkpoint_hash:
-                self._record_writeback_hash(current_hash)
+        snapshot_hash = hashlib.sha256(snapshot).hexdigest()
+        if current.digest != self._expected_notebook_hash:
+            if current.digest == snapshot_hash:
+                self._record_writeback_hash(current.digest)
                 return
             raise RuntimeError(
                 "Original notebook changed outside Runwatch during execution; "
                 f"refusing to overwrite {self.notebook_path}. The executed state "
                 f"is preserved at {self.partial_output_path}."
             )
-        write_notebook_atomic(self.notebook, self.notebook_path)
-        self._record_writeback_hash(source_hash(self.notebook_path))
+
+        def verify_unchanged() -> None:
+            try:
+                latest = _file_fingerprint(self.notebook_path)
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "Original notebook disappeared while Runwatch prepared write-back: "
+                    f"{self.notebook_path}"
+                ) from error
+            if latest != current:
+                raise RuntimeError(
+                    "Original notebook changed while Runwatch prepared write-back; "
+                    f"refusing to overwrite {self.notebook_path}. The executed state "
+                    f"is preserved at {self.partial_output_path}."
+                )
+
+        atomic_write_bytes(
+            self.notebook_path,
+            snapshot,
+            before_replace=verify_unchanged,
+        )
+        self._record_writeback_hash(snapshot_hash)
 
     def _record_writeback_hash(self, digest: str) -> None:
         self._write_writeback_state(digest)
@@ -1177,16 +1680,13 @@ class NotebookRunner:
                 "sha256": digest,
             },
             indent=2,
-        )
-        temporary = self.writeback_state_path.with_name(
-            f".{self.writeback_state_path.name}.{uuid4().hex}.tmp"
-        )
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.writeback_state_path)
+        ).encode("utf-8")
+        atomic_write_bytes(self.writeback_state_path, payload)
 
     @staticmethod
     def _write_notebook_atomic(notebook: NotebookNode, path: Path) -> None:
         write_notebook_atomic(notebook, path)
+
+    @staticmethod
+    def _write_notebook_bytes_atomic(snapshot: bytes, path: Path) -> None:
+        atomic_write_bytes(path, snapshot)

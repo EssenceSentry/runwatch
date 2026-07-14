@@ -34,11 +34,19 @@ def emit_sagemaker_processing_job(
     output_prefixes: list[str] | None = None,
     log_group: str = "/aws/sagemaker/ProcessingJobs",
     blocking: bool = True,
-    stop_on_cancel: bool = True,
+    ownership: Ownership | Literal["exclusive", "borrowed", "external"] | None = None,
+    stop_on_cancel: bool = False,
     poll_interval_seconds: float | None = None,
     final_log_drain_seconds: float | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    selected_ownership = (
+        (Ownership.EXCLUSIVE if stop_on_cancel else Ownership.BORROWED)
+        if ownership is None
+        else Ownership(ownership)
+    )
+    if stop_on_cancel and selected_ownership is not Ownership.EXCLUSIVE:
+        raise ValueError("stop_on_cancel requires ownership='exclusive'")
     metadata = metadata or {}
     collisions = _SAGEMAKER_RESERVED_METADATA.intersection(metadata)
     if collisions:
@@ -52,7 +60,7 @@ def emit_sagemaker_processing_job(
             logical_key=logical_key or job_name,
             region=region,
             account_id=account_id,
-            ownership=Ownership.EXCLUSIVE,
+            ownership=selected_ownership,
             metadata={
                 "output_prefixes": output_prefixes or [],
                 "log_group": log_group,
@@ -68,6 +76,38 @@ def emit_sagemaker_processing_job(
         ),
     )
     return emit_resource(event, text=f"SageMaker Processing job: {job_name}")
+
+
+def emit_owned_sagemaker_processing_job(
+    job_name: str,
+    *,
+    region: str | None = None,
+    account_id: str | None = None,
+    logical_key: str | None = None,
+    output_prefixes: list[str] | None = None,
+    log_group: str = "/aws/sagemaker/ProcessingJobs",
+    blocking: bool = True,
+    stop_on_cancel: bool = True,
+    poll_interval_seconds: float | None = None,
+    final_log_drain_seconds: float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Emit a SageMaker job that this run created and may stop."""
+
+    return emit_sagemaker_processing_job(
+        job_name,
+        region=region,
+        account_id=account_id,
+        logical_key=logical_key,
+        output_prefixes=output_prefixes,
+        log_group=log_group,
+        blocking=blocking,
+        ownership=Ownership.EXCLUSIVE,
+        stop_on_cancel=stop_on_cancel,
+        poll_interval_seconds=poll_interval_seconds,
+        final_log_drain_seconds=final_log_drain_seconds,
+        metadata=metadata,
+    )
 
 
 def emit_s3_prefix(

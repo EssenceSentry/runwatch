@@ -258,11 +258,16 @@ class ResourceManager:
         error: Exception,
         consecutive_errors: int,
     ) -> None:
-        self.store.set_resource_status(
-            internal_id,
-            ResourceStatus.MONITOR_ERROR,
-            message=f"{type(error).__name__}: {error}",
+        current = self.store.get_resource(internal_id)
+        stop_intent_preserved = bool(
+            current and current["status"] == ResourceStatus.STOPPING.value
         )
+        if not stop_intent_preserved:
+            self.store.set_resource_status(
+                internal_id,
+                ResourceStatus.MONITOR_ERROR,
+                message=f"{type(error).__name__}: {error}",
+            )
         await self.bus.publish(
             "resource.monitor_error",
             {
@@ -270,6 +275,7 @@ class ResourceManager:
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "consecutive_errors": consecutive_errors,
+                "stop_intent_preserved": stop_intent_preserved,
             },
         )
 
@@ -286,6 +292,9 @@ class ResourceManager:
         if not lifecycle.get("blocking", False) or limit is None:
             return False
         if consecutive_errors < int(limit):
+            return False
+        current = self.store.get_resource(internal_id)
+        if current and current["status"] == ResourceStatus.STOPPING.value:
             return False
         message = (
             f"Resource monitoring failed {consecutive_errors} consecutive times; "
@@ -405,6 +414,19 @@ class ResourceManager:
             committed_cursor = self.store.resource_cursor(internal_id)
             candidate_cursor = copy.deepcopy(committed_cursor)
             observation = await adapter.inspect(resource, candidate_cursor)
+            latest = self.store.get_resource(internal_id)
+            if (
+                latest is not None
+                and latest["status"] == ResourceStatus.STOPPING.value
+                and not observation.terminal
+            ):
+                # A provider inspection can begin before a local stop request is
+                # persisted and complete afterwards.  Keep the durable local intent
+                # authoritative until the provider reaches a terminal state or the
+                # stop path explicitly restores a retryable status.
+                observation = observation.model_copy(
+                    update={"status": ResourceStatus.STOPPING}
+                )
             stop_disposition = terminal_disposition or self._stop_dispositions.get(
                 internal_id
             )

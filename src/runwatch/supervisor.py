@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import nbformat
 
+from ._fs import atomic_write_bytes, ensure_private_directory
 from .events import EventBus
 from .models import (
     SCHEMA_VERSION,
@@ -65,7 +66,7 @@ class RunSupervisor:
         self.input_snapshot_path = self.run_dir / "input.ipynb"
         self.partial_output_path = self.run_dir / "executed.partial.ipynb"
         self._validate_output_path_ownership()
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.run_dir)
 
         if not reopen:
             original = nbformat.read(self.notebook_path, as_version=4)
@@ -78,8 +79,14 @@ class RunSupervisor:
         self.store = RunStore(
             self.run_dir / "runwatch.sqlite3",
             max_observations_per_resource=config.storage.max_observations_per_resource,
+            max_observation_bytes_per_resource=(
+                config.storage.max_observation_bytes_per_resource
+            ),
             max_log_lines_per_resource=config.storage.max_log_lines_per_resource,
+            max_log_bytes_per_resource=config.storage.max_log_bytes_per_resource,
             max_events_per_run=config.storage.max_events_per_run,
+            max_event_bytes_per_run=config.storage.max_event_bytes_per_run,
+            max_resource_payload_bytes=config.storage.max_resource_payload_bytes,
         )
         if not reopen:
             self.store.initialize_run(
@@ -126,6 +133,8 @@ class RunSupervisor:
         self._runner_task: asyncio.Task[RunStatus] | None = None
         self._action_task: asyncio.Task[None] | None = None
         self._finalized = False
+        self._quiesced = False
+        self._quiesce_error: BaseException | None = None
         self._closed = False
         self._reopen = reopen
         self._bootstrap_action_id = bootstrap_action_id
@@ -194,7 +203,6 @@ class RunSupervisor:
 
     def _write_manifest(self) -> None:
         path = self.run_dir / "run-manifest.json"
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         payload = json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -209,11 +217,7 @@ class RunSupervisor:
             },
             indent=2,
         )
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        atomic_write_bytes(path, payload.encode("utf-8"), preserve_mode=False)
 
     async def start(self) -> None:
         if self._closed:
@@ -351,21 +355,34 @@ class RunSupervisor:
             self._finalized = True
         return status
 
+    async def quiesce(self) -> None:
+        """Stop event producers while leaving notifications and storage available."""
+
+        if self._quiesced:
+            if self._quiesce_error is not None:
+                raise self._quiesce_error
+            return
+        self._quiesced = True
+        runtime_error = await self._capture_async_cleanup(self._stop_runtime_tasks)
+        resource_error = await self._capture_async_cleanup(self.resources.shutdown)
+        try:
+            self._raise_cleanup_errors([runtime_error, resource_error])
+        except BaseException as error:
+            self._quiesce_error = error
+            raise
+
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        runtime_error = await self._capture_async_cleanup(self._stop_runtime_tasks)
-        service_errors = await asyncio.gather(
-            self._capture_async_cleanup(self.notifications.close),
-            self._capture_async_cleanup(self.resources.shutdown),
-        )
+        quiesce_error = await self._capture_async_cleanup(self.quiesce)
+        notification_error = await self._capture_async_cleanup(self.notifications.close)
         controller_error = self._capture_sync_cleanup(
             self._clear_controller_registration
         )
         store_error = self._capture_sync_cleanup(self.store.close)
         self._raise_cleanup_errors(
-            [runtime_error, *service_errors, controller_error, store_error]
+            [quiesce_error, notification_error, controller_error, store_error]
         )
 
     async def _stop_runtime_tasks(self) -> None:
@@ -379,6 +396,7 @@ class RunSupervisor:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.runner.shutdown()
         if runner_was_running:
             await self._pause_after_process_stop()
 

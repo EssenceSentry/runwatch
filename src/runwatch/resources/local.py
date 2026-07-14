@@ -6,6 +6,7 @@ import contextlib
 import math
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -61,6 +62,22 @@ def _line_reset_reason(
         return "rotation"
     if stat.st_size < offset:
         return "truncation"
+    prior_size = cursor.get("observed_size")
+    prior_mtime_ns = cursor.get("modified_time_ns")
+    current_mtime_ns = int(
+        getattr(stat, "st_mtime_ns", round(stat.st_mtime * 1_000_000_000))
+    )
+    if (
+        offset
+        and isinstance(prior_size, int)
+        and isinstance(prior_mtime_ns, int)
+        and current_mtime_ns != prior_mtime_ns
+        and stat.st_size <= prior_size
+    ):
+        # A content write that did not grow the file can occur anywhere before
+        # the cursor, not only in the small trailing fingerprint below.  Treat
+        # the metadata change conservatively as a rewrite and recount.
+        return "rewrite"
     if not offset or not cursor.get("fingerprint_b64"):
         return None
     start = max(0, offset - 64)
@@ -99,6 +116,10 @@ def _read_line_chunk(path: Path, cursor: dict[str, Any]) -> _LineFileRead:
         cursor["fingerprint_b64"] = base64.b64encode(
             handle.read(cursor["offset"] - fingerprint_start)
         ).decode("ascii")
+        cursor["observed_size"] = stat.st_size
+        cursor["modified_time_ns"] = int(
+            getattr(stat, "st_mtime_ns", round(stat.st_mtime * 1_000_000_000))
+        )
     return _LineFileRead(stat=stat, chunk=chunk, reset_reason=reset_reason)
 
 
@@ -248,6 +269,24 @@ def _settlement_metric(
     return {"settled_for_seconds": round(settled_for, 2)}
 
 
+def _aggregate_file_stats(paths: Iterable[Path]) -> tuple[int, int, float | None]:
+    count = 0
+    total_bytes = 0
+    latest: float | None = None
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            stat = path.stat()
+        except OSError:
+            # Files may be atomically renamed or removed while a glob is read.
+            continue
+        count += 1
+        total_bytes += stat.st_size
+        latest = stat.st_mtime if latest is None else max(latest, stat.st_mtime)
+    return count, total_bytes, latest
+
+
 class SystemMetricsAdapter(ResourceAdapter):
     provider = "local"
     resource_type = "system_metrics"
@@ -356,6 +395,8 @@ class SystemMetricsAdapter(ResourceAdapter):
 
 
 class FileCountAdapter(ResourceAdapter):
+    """Stream file metadata into count, byte-size, and newest-mtime aggregates."""
+
     provider = "local"
     resource_type = "file_count"
 
@@ -432,17 +473,7 @@ class FileCountAdapter(ResourceAdapter):
         if not root.is_dir():
             raise ResourceOperationError(f"File-count path is not a directory: {root}")
         iterator = root.rglob(pattern) if recursive else root.glob(pattern)
-        stats: list[os.stat_result] = []
-        for path in iterator:
-            try:
-                if path.is_file():
-                    stats.append(path.stat())
-            except OSError:
-                # Files may be atomically renamed or removed while a glob is read.
-                continue
-        count = len(stats)
-        total_bytes = sum(stat.st_size for stat in stats)
-        latest = max((stat.st_mtime for stat in stats), default=None)
+        count, total_bytes, latest = _aggregate_file_stats(iterator)
         marker = metadata.get("completion_marker")
         marker_found = bool(marker and (root / str(marker)).exists())
         expected = metadata.get("expected_count")

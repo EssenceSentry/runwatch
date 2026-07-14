@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import nbformat
 import pytest
 from typer.testing import CliRunner
@@ -52,10 +53,13 @@ def test_lock_token_default_directory_and_server_overrides(
     run_dir.mkdir()
     lock = cli.RunLock(run_dir)
     lock.acquire()
+    assert run_dir.stat().st_mode & 0o777 == 0o700
     lock_record = json.loads(lock.path.read_text(encoding="utf-8"))
     assert lock_record["pid"] == os.getpid()
     assert lock_record["started_at"] > 0
     assert lock_record["controller_token"]
+    assert lock_record["hostname"]
+    assert lock_record["boot_id"]
     with pytest.raises(RuntimeError, match="already owns"):
         cli.RunLock(run_dir).acquire()
     lock.release()
@@ -171,6 +175,94 @@ def test_run_lock_owns_published_lock_if_temporary_cleanup_fails(
         cli.RunLock(tmp_path).acquire()
     lock.release()
     assert not lock.path.exists()
+
+
+def test_run_lock_recovers_legacy_and_local_stale_records_but_fences_foreign_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(cli, "_machine_identity", lambda: ("local-host", "boot-a"))
+    monkeypatch.setattr(cli, "process_is_alive", lambda *args: False)
+
+    legacy = {
+        "pid": 111,
+        "started_at": 1.0,
+        "controller_token": "legacy",
+    }
+    (run_dir / "runwatch.lock").write_text(json.dumps(legacy), encoding="utf-8")
+    legacy_owner = cli.RunLock(run_dir)
+    legacy_owner.acquire()
+    legacy_owner.release()
+
+    local = {
+        **legacy,
+        "controller_token": "local",
+        "hostname": "local-host",
+        "boot_id": "boot-a",
+    }
+    (run_dir / "runwatch.lock").write_text(json.dumps(local), encoding="utf-8")
+    local_owner = cli.RunLock(run_dir)
+    local_owner.acquire()
+    local_owner.release()
+
+    previous_boot = {**local, "controller_token": "previous-boot", "boot_id": "boot-z"}
+    (run_dir / "runwatch.lock").write_text(json.dumps(previous_boot), encoding="utf-8")
+    monkeypatch.setattr(cli, "process_is_alive", lambda *args: True)
+    rebooted_owner = cli.RunLock(run_dir)
+    rebooted_owner.acquire()
+    rebooted_owner.release()
+
+    foreign = {
+        **local,
+        "controller_token": "foreign",
+        "hostname": "remote-host",
+    }
+    (run_dir / "runwatch.lock").write_text(json.dumps(foreign), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="host remote-host already owns"):
+        cli.RunLock(run_dir).acquire()
+    assert (
+        json.loads((run_dir / "runwatch.lock").read_text(encoding="utf-8"))[
+            "controller_token"
+        ]
+        == "foreign"
+    )
+
+
+def test_cleanup_guard_fences_successor_after_run_directory_is_deleted(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    owner = cli.RunLock(run_dir)
+    owner.acquire()
+    owner.begin_cleanup()
+    cli.shutil.rmtree(run_dir)
+
+    successor = cli.RunLock(run_dir)
+    with pytest.raises(RuntimeError, match="while it cleans"):
+        successor.acquire()
+    assert not run_dir.exists()
+
+    owner.release()
+    successor.acquire()
+    assert successor.held
+    successor.release()
+
+
+def test_cleanup_helper_refuses_an_active_unfenced_owner(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
+    (run_dir / "runwatch.sqlite3").write_bytes(b"state")
+    owner = cli.RunLock(run_dir)
+    owner.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="actively owned"):
+            cli._cleanup_successful_run(run_dir, tmp_path)
+        assert run_dir.is_dir()
+    finally:
+        owner.release()
 
 
 @pytest.mark.asyncio
@@ -346,6 +438,9 @@ async def test_serve_releases_lock_when_startup_fails(
         async def close(self) -> None:
             self.closed = True
 
+        async def quiesce(self) -> None:
+            return None
+
     supervisor = FakeSupervisor()
     monkeypatch.setattr(
         cli,
@@ -401,6 +496,9 @@ async def test_serve_writes_back_and_cleans_successful_default_run(
                 "show_qr": False,
                 "linger_seconds": 0,
             },
+            "notifications": {
+                "webhook_urls": ["https://hooks.example/terminal"],
+            },
         }
     )
     supervisor = RunSupervisor(
@@ -409,6 +507,16 @@ async def test_serve_writes_back_and_cleans_successful_default_run(
         working_dir=tmp_path,
         run_dir=run_dir,
         config=config,
+    )
+    requests: list[httpx.Request] = []
+
+    def notification_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    await supervisor.notifications._client.aclose()
+    supervisor.notifications._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(notification_handler)
     )
     server_options: dict[str, object] = {}
 
@@ -425,8 +533,219 @@ async def test_serve_writes_back_and_cleans_successful_default_run(
     updated = nbformat.read(notebook, as_version=4)
     assert updated.cells[0].outputs[0].text.strip() == "published"
     assert server_options["lifespan"] == "off"
+    assert len(requests) == 1
     assert not run_dir.exists()
     assert not (tmp_path / ".runwatch").exists()
+
+
+@pytest.mark.asyncio
+async def test_success_cleanup_retains_state_when_terminal_notification_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class FakeServer:
+        def __init__(self, config: object) -> None:
+            self.started = False
+            self.should_exit = False
+            self.install_signal_handlers: object | None = None
+
+        async def serve(self) -> None:
+            self.started = True
+            while not self.should_exit:
+                await asyncio.sleep(0.001)
+
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook)
+    run_dir = tmp_path / ".runwatch" / "runs" / "retained-run"
+    config = RunwatchConfig.model_validate(
+        {
+            "server": {
+                "open_browser": False,
+                "show_qr": False,
+                "linger_seconds": 0,
+            },
+            "notifications": {
+                "webhook_urls": ["https://slow.example/terminal"],
+                "terminal_drain_timeout_seconds": 0.01,
+            },
+        }
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=run_dir / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        config=config,
+    )
+    delivery_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        delivery_started.set()
+        await never_release.wait()
+        return httpx.Response(204)
+
+    await supervisor.notifications._client.aclose()
+    supervisor.notifications._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_handler)
+    )
+
+    async def finish_without_kernel(active: RunSupervisor, *, start_run: bool) -> int:
+        assert start_run
+        await active.notifications.start()
+        active.store.update_run_status(active.run_id, RunStatus.SUCCEEDED, ended=True)
+        await active.bus.publish("run.succeeded", {"kernel_epoch": 0})
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_and_linger", finish_without_kernel)
+    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+    assert await cli._serve(supervisor, start_run=True) == 0
+
+    output = capsys.readouterr().out
+    assert "Retained successful Runwatch state" in output
+    assert "delivery attempt(s) remain pending" in output
+    assert f"runwatch open {run_dir}" in output
+    assert run_dir.is_dir()
+    manifest = RunSupervisor.read_manifest(run_dir)
+    reopened = RunStore(run_dir / "runwatch.sqlite3")
+    try:
+        state = reopened.notification_outbox_state(manifest["run_id"])
+        assert state["nonterminal_intents"] == 1
+        assert state["pending_deliveries"] == 1
+        retained = [
+            event
+            for event in reopened.recent_events(manifest["run_id"], limit=1_000)
+            if event["type"] == "run.cleanup_retained"
+        ]
+        assert retained[-1]["payload"]["recovery_command"] == (
+            f"runwatch open {run_dir}"
+        )
+    finally:
+        reopened.close()
+
+    recovery = RunSupervisor.reopen(run_dir)
+    recovery.config.notifications.terminal_drain_timeout_seconds = 1.0
+    requests: list[httpx.Request] = []
+
+    def recovery_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    await recovery.notifications._client.aclose()
+    recovery.notifications._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(recovery_handler)
+    )
+    await recovery.notifications.start()
+    recovery_lock = cli.RunLock(run_dir, controller_token=recovery.controller_token)
+    recovery_lock.acquire()
+
+    await cli._finish_serve(recovery, recovery_lock)
+
+    assert len(requests) == 1
+    assert not run_dir.exists()
+    assert not (tmp_path / ".runwatch").exists()
+
+
+@pytest.mark.asyncio
+async def test_open_preserves_successful_keep_run_state(tmp_path: Path) -> None:
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook)
+    run_dir = tmp_path / ".runwatch" / "runs" / "kept-run"
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=run_dir / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        config=RunwatchConfig(),
+        cleanup_on_success=False,
+    )
+    supervisor.store.update_run_status(
+        supervisor.run_id, RunStatus.SUCCEEDED, ended=True
+    )
+    await supervisor.close()
+
+    recovery = RunSupervisor.reopen(run_dir)
+    recovery_lock = cli.RunLock(run_dir, controller_token=recovery.controller_token)
+    recovery_lock.acquire()
+
+    await cli._finish_serve(recovery, recovery_lock)
+
+    assert run_dir.is_dir()
+    assert RunSupervisor.read_manifest(run_dir)["cleanup_on_success"] is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_quiesces_producers_before_terminal_notification_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook)
+    run_dir = tmp_path / ".runwatch" / "runs" / "late-event-run"
+    config = RunwatchConfig.model_validate(
+        {
+            "notifications": {
+                "webhook_urls": ["https://hooks.example/terminal"],
+                "terminal_drain_timeout_seconds": 1.0,
+            }
+        }
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=run_dir / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        config=config,
+    )
+    requests: list[httpx.Request] = []
+
+    def notification_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    await supervisor.notifications._client.aclose()
+    supervisor.notifications._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(notification_handler)
+    )
+    await supervisor.notifications.start()
+    supervisor.store.update_run_status(
+        supervisor.run_id, RunStatus.SUCCEEDED, ended=True
+    )
+    await supervisor.bus.publish("run.succeeded", {"kernel_epoch": 0})
+    order: list[str] = []
+    original_shutdown = supervisor.resources.shutdown
+
+    async def shutdown_with_late_event() -> None:
+        order.append("producer")
+        await supervisor.bus.publish(
+            "cell.failed",
+            {
+                "kernel_epoch": 0,
+                "cell_index": 0,
+                "attempt": 1,
+                "error_name": "ValueError",
+                "error_value": "late failure",
+            },
+        )
+        await original_shutdown()
+
+    monkeypatch.setattr(supervisor.resources, "shutdown", shutdown_with_late_event)
+    original_drain = supervisor.notifications.drain
+
+    async def recorded_drain(timeout_seconds: float):
+        order.append("drain")
+        return await original_drain(timeout_seconds)
+
+    monkeypatch.setattr(supervisor.notifications, "drain", recorded_drain)
+    lock = cli.RunLock(run_dir, controller_token=supervisor.controller_token)
+    lock.acquire()
+
+    await cli._finish_serve(supervisor, lock)
+
+    assert order == ["producer", "drain"]
+    assert len(requests) == 2
+    assert not run_dir.exists()
 
 
 def test_wait_action_completes_and_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -540,7 +859,8 @@ def test_execute_keep_run_persists_cleanup_policy(
         run_lock: cli.RunLock | None = None,
     ) -> int:
         assert start_run
-        assert run_lock is None
+        assert run_lock is not None and run_lock.held
+        assert run_lock.controller_token == supervisor.controller_token
         assert supervisor.cleanup_on_success is False
         await supervisor.close()
         return 0
@@ -561,6 +881,66 @@ def test_execute_keep_run_persists_cleanup_policy(
 
     assert result.exit_code == 0
     assert RunSupervisor.read_manifest(run_dir)["cleanup_on_success"] is False
+
+
+def test_execute_does_not_initialize_an_explicit_directory_owned_by_another_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook)
+    run_dir = tmp_path / "contended-run"
+    owner = cli.RunLock(run_dir)
+    owner.acquire()
+    constructed = False
+
+    def unexpected_supervisor(*args, **kwargs):
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("RunSupervisor must not be constructed without the lock")
+
+    monkeypatch.setattr(cli, "RunSupervisor", unexpected_supervisor)
+    try:
+        result = runner.invoke(
+            cli.app,
+            ["execute", str(notebook), "--run-dir", str(run_dir)],
+        )
+    finally:
+        owner.release()
+
+    assert result.exit_code != 0
+    assert "already owns" in str(result.exception)
+    assert not constructed
+
+
+def test_open_does_not_reopen_state_owned_by_another_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = _supervisor(tmp_path / "existing")
+    run_dir = supervisor.run_dir
+    database = run_dir / "runwatch.sqlite3"
+    supervisor.store.close()
+    owner = cli.RunLock(run_dir)
+    owner.acquire()
+    run_dir.chmod(0o755)
+    database_before = database.read_bytes()
+    constructed = False
+
+    def unexpected_reopen(*args: object, **kwargs: object) -> RunSupervisor:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("RunSupervisor must not be reopened without the lock")
+
+    monkeypatch.setattr(cli.RunSupervisor, "reopen", unexpected_reopen)
+    try:
+        result = runner.invoke(cli.app, ["open", str(run_dir)])
+    finally:
+        owner.release()
+
+    assert result.exit_code != 0
+    assert "already owns" in str(result.exception)
+    assert not constructed
+    assert run_dir.stat().st_mode & 0o777 == 0o755
+    assert database.read_bytes() == database_before
 
 
 def test_execute_resume_restart_and_open_dispatch(

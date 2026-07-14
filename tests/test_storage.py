@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -53,6 +54,27 @@ def initialize(
     )
 
 
+def test_store_preserves_existing_parent_permissions_and_secures_database(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "project-directory"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+
+    store = RunStore(parent / "state.sqlite3")
+
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    store.close()
+
+    private_parent = tmp_path / "new-private-directory"
+    private_store = RunStore(private_parent / "state.sqlite3")
+
+    assert stat.S_IMODE(private_parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(private_store.path.stat().st_mode) == 0o600
+    private_store.close()
+
+
 def test_v2_store_persists_actions_cursors_and_bounded_observations(
     tmp_path: Path,
 ) -> None:
@@ -88,6 +110,84 @@ def test_v2_store_persists_actions_cursors_and_bounded_observations(
     assert snapshot["resources"][0]["cursor"] == {"offset": 4}
     assert snapshot["resources"][0]["observations"][0]["metrics"] == {"value": 2}
     assert snapshot["actions"][0]["result"] == {"ok": True}
+    store.close()
+
+
+def test_observation_history_projection_keeps_rich_current_metrics(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="metric")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.update_resource_observation(
+        "run",
+        internal_id,
+        ResourceObservation(
+            status=ResourceStatus.RUNNING,
+            metrics={"latest_value": 3.0, "series": [{"timestamp": "t", "value": 3.0}]},
+            history_metrics={"latest_value": 3.0},
+        ),
+    )
+
+    resource = store.get_resource(internal_id)
+    assert resource is not None
+    assert resource["metrics"]["series"] == [{"timestamp": "t", "value": 3.0}]
+    assert store.resource_observations(internal_id)[0]["metrics"] == {
+        "latest_value": 3.0
+    }
+    store.close()
+
+
+def test_snapshot_loads_all_resource_histories_with_one_query(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    for identifier in ("first", "second"):
+        internal_id, _ = store.register_resource(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(provider="fake", type="metric", id=identifier)
+            ),
+            cell_index=None,
+            attempt=None,
+            kernel_epoch=None,
+            supports_stop=False,
+        )
+        for value in range(5):
+            store.update_resource_observation(
+                "run",
+                internal_id,
+                ResourceObservation(
+                    status=ResourceStatus.RUNNING, metrics={"value": value}
+                ),
+            )
+
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+    snapshot = store.snapshot("run", chart_points=3)
+    store._connection.set_trace_callback(None)  # noqa: SLF001
+
+    history_queries = [
+        statement
+        for statement in statements
+        if "FROM resource_observations" in statement
+    ]
+    assert len(history_queries) == 1
+    assert [len(resource["observations"]) for resource in snapshot["resources"]] == [
+        3,
+        3,
+    ]
+    for resource in snapshot["resources"]:
+        assert resource["observations"][0]["metrics"] == {"value": 0}
+        assert resource["observations"][-1]["metrics"] == {"value": 4}
     store.close()
 
 
@@ -341,6 +441,77 @@ def test_events_are_bounded_and_replayable(tmp_path: Path) -> None:
         4,
         5,
     ]
+    store.close()
+
+
+def test_histories_and_log_tail_are_bounded_by_encoded_bytes(tmp_path: Path) -> None:
+    store = RunStore(
+        tmp_path / "state.sqlite3",
+        max_observations_per_resource=100,
+        max_observation_bytes_per_resource=90,
+        max_log_lines_per_resource=100,
+        max_log_bytes_per_resource=10,
+        max_events_per_run=100,
+        max_event_bytes_per_run=90,
+    )
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="bytes")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    for value in range(5):
+        store.update_resource_observation(
+            "run",
+            internal_id,
+            ResourceObservation(
+                status=ResourceStatus.RUNNING,
+                metrics={"value": value, "blob": "x" * 40},
+                log_lines=[f"line-{value}-long"],
+            ),
+        )
+        store.append_event("run", "probe", {"value": value, "blob": "x" * 40})
+
+    observations = store.resource_observations(internal_id, limit=100)
+    events = store.recent_events("run", limit=100)
+    resource = store.get_resource(internal_id)
+    assert observations[-1]["metrics"]["value"] == 4
+    assert events[-1]["payload"]["value"] == 4
+    assert len(observations) < 5
+    assert len(events) < 5
+    assert resource is not None
+    assert sum(len(line.encode("utf-8")) for line in resource["log_tail"]) <= 10
+    assert resource["log_tail"] == ["ine-4-long"]
+    store.close()
+
+
+def test_resource_payload_byte_limit_rejects_oversized_metadata(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_resource_payload_bytes=256)
+    initialize(store, tmp_path)
+    with pytest.raises(ValueError, match="max_resource_payload_bytes"):
+        store.register_resource(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(
+                    provider="fake",
+                    type="metric",
+                    id="oversized",
+                    metadata={"blob": "x" * 1_000},
+                )
+            ),
+            cell_index=None,
+            attempt=None,
+            kernel_epoch=None,
+            supports_stop=False,
+        )
+    assert store.list_resources("run") == []
     store.close()
 
 

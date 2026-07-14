@@ -27,7 +27,7 @@ def test_init_config_is_commented_and_round_trips(tmp_path: Path) -> None:
 
 
 def test_config_expands_environment_variables(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("RUNWATCH_TEST_TOPIC", "nightly-run")
+    monkeypatch.setenv("RUNWATCH_TEST_TOPIC", "nightly$$run")
     path = tmp_path / "runwatch.yaml"
     path.write_text(
         """
@@ -39,7 +39,68 @@ notifications:
         encoding="utf-8",
     )
     config = load_config(path)
-    assert config.notifications.ntfy_topic == "nightly-run"
+    assert config.notifications.ntfy_topic == "nightly$$run"
+
+
+def test_config_rejects_unset_environment_variables(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("RUNWATCH_MISSING_BASE_URL", raising=False)
+    monkeypatch.delenv("RUNWATCH_MISSING_TOPIC", raising=False)
+    path = tmp_path / "runwatch.yaml"
+    path.write_text(
+        """
+notifications:
+  ntfy_base_url: ${RUNWATCH_MISSING_BASE_URL}
+  ntfy_topic: $RUNWATCH_MISSING_TOPIC
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "unset environment variable.*RUNWATCH_MISSING_BASE_URL, "
+            "RUNWATCH_MISSING_TOPIC"
+        ),
+    ):
+        load_config(path)
+
+
+def test_config_ignores_comment_placeholders_and_supports_literal_dollars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RUNWATCH_COMMENT_ONLY", raising=False)
+    monkeypatch.delenv("RUNWATCH_LITERAL_TOPIC", raising=False)
+    path = tmp_path / "runwatch.yaml"
+    path.write_text(
+        """
+# Optional example: ${RUNWATCH_COMMENT_ONLY}
+notifications:
+  ntfy_base_url: https://ntfy.example
+  ntfy_topic: $$RUNWATCH_LITERAL_TOPIC
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.notifications.ntfy_topic == "$RUNWATCH_LITERAL_TOPIC"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ntfy_base_url", "ntfy.example"),
+        ("ntfy_base_url", "file:///tmp/ntfy"),
+        ("webhook_urls", ["ftp://example.test/hook"]),
+    ],
+)
+def test_config_rejects_non_http_notification_destinations(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=r"absolute HTTP\(S\) URLs"):
+        RunwatchConfig.model_validate({"notifications": {field: value}})
 
 
 def test_config_rejects_nonterminal_blocking_resource(tmp_path: Path) -> None:

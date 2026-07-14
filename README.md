@@ -31,15 +31,18 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
   per-destination retry outbox. Delivery is at least once; retries carry stable
   `Idempotency-Key` and `X-Runwatch-Intent-ID` headers so receivers can deduplicate a
   request accepted immediately before a Runwatch crash.
-- Automatic removal of successful run state after the dashboard closes, with
-  `--keep-run` available for retained provenance.
+- Notification-aware removal of successful run state after the dashboard closes, with
+  incomplete outboxes retained for `runwatch open` recovery and `--keep-run` available
+  for retained provenance.
 
 Runwatch uses state schema version 2 and intentionally does not migrate 0.1 run
 directories.
 
 ## Installation
 
-Python 3.10 or newer is required.
+Python 3.10 or newer is required. Runwatch supports local POSIX filesystems on Linux
+and macOS; those are the platforms exercised in CI. Windows and shared/network
+filesystems are not currently supported execution targets.
 
 ```bash
 python -m venv .venv
@@ -79,10 +82,16 @@ emitted dynamically by cells cannot be predicted during preflight.
 Runwatch prints the run directory, editable notebook, pairing URL, and terminal QR code.
 By default the dashboard remains available for 90 seconds after the run reaches a
 terminal state, then closes automatically. If the run succeeded, Runwatch removes that
-run directory and removes the empty `.runwatch/runs` and `.runwatch` parents. Set
-`server.linger_seconds: 0` to close immediately, set it to `null` to keep the dashboard
-open until Ctrl+C, or use `--keep-run` to retain successful state after the dashboard
-closes.
+run directory and removes the empty `.runwatch/runs` and `.runwatch` parents. When
+notifications are configured, cleanup first waits up to
+`notifications.terminal_drain_timeout_seconds` for terminal event routing and delivery
+attempts. If the outbox is still nonterminal, the successful run is retained and the CLI
+prints a reason plus `runwatch open RUN_DIR`; opening it restarts notification delivery
+without rerunning the notebook. Once recovered delivery settles, closing that dashboard
+applies the persisted cleanup policy, so the successful state is removed unless the
+original execution used `--keep-run`. Set `server.linger_seconds: 0` to close
+immediately, set it to `null` to keep the dashboard open until Ctrl+C, or use
+`--keep-run` to retain successful state after the dashboard closes.
 
 For a no-AWS replay with live progress, local metrics, file monitoring, log tailing,
 and final notebook results, use the repository's
@@ -106,6 +115,12 @@ Every run contains:
 └── runwatch.sqlite3
 ```
 
+Each per-run directory is restricted to the current user (`0700`) and new run-state
+files are created with mode `0600`. Retained state is nevertheless sensitive: it can
+contain notebook source and output, tracebacks, local paths, resource identifiers and
+logs, notification destinations and payloads, actions, and the dashboard bearer token.
+The mode of the original notebook passed to `execute` is preserved during write-back.
+
 ## Failure and recovery
 
 After every settled cell attempt, Runwatch atomically writes the executed notebook
@@ -113,6 +128,20 @@ state back to the notebook passed to `execute`. This includes repaired source,
 execution counts, outputs, and tracebacks. If that notebook changes outside Runwatch,
 write-back stops rather than overwriting the external edit, and the run-owned partial
 checkpoint is retained.
+
+Rolling checkpoints serialize an immutable notebook generation on the event-loop
+thread before filesystem I/O. Requests that arrive during a write remain pending, and
+transient checkpoint failures are journaled and retried with bounded backoff until the
+worker recovers. Checkpoint and write-back publication use a temporary file, file
+`fsync`, atomic replacement, and parent-directory `fsync` where the local filesystem
+supports them.
+
+Original-notebook conflict detection is a best-effort portable compare-and-replace. It
+checks a content and metadata fingerprint again immediately before `os.replace`, which
+detects external saves during preparation and makes the remaining race very small. No
+portable filesystem primitive can make the final comparison and rename indivisible, so
+another writer in that last window can still be overwritten. Avoid editing the original
+notebook while Runwatch is executing; edit the run-owned `source.ipynb` for recovery.
 
 When a cell fails or reaches its configured timeout, Runwatch persists its outputs and
 traceback, pauses the notebook, and keeps the kernel and resource monitors alive. A
@@ -156,6 +185,13 @@ reopens the persisted run, restores resource monitors and cursors, starts a new 
 epoch, and replays from cell zero. A crash during recovery leaves an action that the
 next invocation can safely recover.
 
+Cancellation is bounded rather than relying on one cooperative interrupt. Runwatch
+persists `cancelling`, then advances through kernel interrupt, graceful shutdown,
+provisioner terminate, and provisioner kill using the four `notebook.cancel_*_grace_seconds`
+settings. Stage failures are journaled, repeated cancellation requests are idempotent,
+and an execution client that still does not return is detached so the run can settle as
+`cancelled` instead of hanging indefinitely.
+
 For an agent-oriented dossier:
 
 ```bash
@@ -174,7 +210,7 @@ created or selected. Runwatch injects the active run, cell, attempt, and kernel 
 from runwatch import aws
 
 sagemaker.create_processing_job(**request)
-aws.emit_sagemaker_processing_job(
+aws.emit_owned_sagemaker_processing_job(
     request["ProcessingJobName"],
     region="us-east-1",
     logical_key="feature-build",
@@ -182,8 +218,13 @@ aws.emit_sagemaker_processing_job(
 )
 ```
 
-SageMaker Processing is blocking and exclusively owned by default. It is the only
-initial resource type that supports provider stop.
+SageMaker Processing is blocking but borrowed and observation-only by default. Use
+`emit_owned_sagemaker_processing_job` only for a job the current run created and may
+stop; that explicit helper claims exclusive ownership and enables provider stop during
+run cancellation. Existing calls that explicitly pass `stop_on_cancel=True` continue
+to opt into exclusive ownership. Set `ownership="exclusive"` with
+`stop_on_cancel=False` when manual stop should be available without joining the
+cancellation cascade.
 
 ### S3 prefix
 
@@ -242,9 +283,13 @@ aws.emit_cloudwatch_logs(
 )
 ```
 
-CloudWatch metrics and logs are always nonblocking. Log stream discovery rotates across
-bounded pages when more streams exist than can be displayed at once. Terminal
-SageMaker jobs drain paginated logs until caught up or report an explicit truncation.
+CloudWatch metrics and logs are always nonblocking. Metric cards retain the full current
+lookback window, while observation history stores only new or revised timestamp samples
+and bounds its deduplication cursor to 1,440 entries. Log stream discovery rotates across
+bounded pages when more streams exist than can be displayed at once, shares each poll's
+line budget across busy streams, and prunes tokens after a complete discovery rotation.
+Terminal SageMaker jobs drain paginated logs until caught up or report an explicit
+truncation.
 
 ### Local system, files, and dashboards
 
@@ -276,9 +321,19 @@ local.emit_dashboard(
 ```
 
 CPU and memory use `psutil`. NVIDIA metrics use optional NVML support and degrade to an
-`nvidia_available=false` metric when unavailable. File and line monitors tolerate
-concurrent renames, detect replacement/truncation/rewrite, and keep partial-line memory
-bounded.
+`nvidia_available=false` metric when unavailable. File-count scans stream metadata into
+exact count, total-byte, and newest-modification-time aggregates without retaining one
+stat object per file. That settlement signature is an aggregate, not content identity;
+content edits that preserve all three values may not reset settlement. Line monitoring
+is optimized for append-only logs: it detects replacement, truncation, changes near the
+committed offset, and non-growing files whose mtime changes, while keeping partial-line
+memory bounded. An earlier in-place edit combined with later file growth can remain
+undetected if it does not touch the offset fingerprint. Conversely, a metadata-only mtime
+change on a non-growing file is conservatively treated as a rewrite and may replay the
+bounded log tail. `line_count` includes records terminated by LF or CRLF; a CR is counted
+once a following byte proves it is not the start of CRLF. A final unterminated fragment,
+including a trailing lone CR, is excluded until completed and is reported through
+`partial_line_pending`, `partial_line_buffered_bytes`, and `partial_line_truncated`.
 
 `emit_dashboard` registers an already-running local web application. Runwatch monitors
 its health and adds an **Open Training dashboard** action to the resource card. With
@@ -324,6 +379,15 @@ the notebook kernel and is not captured automatically.
 The dashboard shows notebook state, reported progress, outputs, tracebacks, resource
 metrics and charts, log tails, and the durable event journal.
 
+The browser API is an explicit presentation model rather than a dump of SQLite state.
+It allowlists display-safe run, cell, resource, metric, and event fields and omits
+notebook source, resolved configuration, notification endpoints, provider cursors and
+raw responses, controller tokens, and dedicated internal-path fields. Output,
+traceback, log, and chart payloads are bounded, but their user-generated text can still
+contain sensitive values. SSE carries only sequence, timestamp, and event type as an
+invalidation signal; the browser then refreshes the sanitized snapshot. Dashboard
+pages, snapshots, SSE, and authenticated redirects use `Cache-Control: no-store`.
+
 Registered localhost dashboards appear as normal resource cards. Their Open action is
 available only while the authenticated share is ready and uses the same pairing session
 as the Runwatch dashboard.
@@ -351,7 +415,9 @@ runwatch open RUN_DIR
 runwatch version
 ```
 
-`open` serves persisted state without starting notebook execution.
+`open` serves persisted state without starting notebook execution, retries durable
+notification delivery, and applies the run's persisted successful-cleanup policy when
+the dashboard closes.
 
 Runwatch validates resource lifecycle semantics at every entry point—not just in the
 convenience emitters. Metrics, logs, and system monitors are always nonblocking;

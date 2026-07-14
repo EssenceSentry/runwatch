@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from sysconfig import get_path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote, urlsplit
 
 from fastapi import (
@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     StreamingResponse,
 )
@@ -47,6 +48,175 @@ _REQUIRED_WEB_ARTIFACTS = (
 class StopRequest(BaseModel):
     confirmation: str
     expected_version: int
+
+
+class DashboardRun(BaseModel):
+    name: str
+    status: str
+    message: str | None = None
+    current_cell_index: int | None = None
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    ended_at: str | None = None
+
+
+class DashboardCell(BaseModel):
+    cell_index: int
+    cell_type: str
+    label: str | None = None
+    status: str
+    attempt: int
+    started_at: str | None = None
+    ended_at: str | None = None
+    elapsed_seconds: float | None = None
+    error_name: str | None = None
+    error_value: str | None = None
+    traceback: list[str]
+    output_tail: list[dict[str, Any]]
+
+
+class DashboardObservation(BaseModel):
+    timestamp: str
+    status: str
+    message: str | None = None
+    metrics: dict[str, Any]
+
+
+class DashboardLink(BaseModel):
+    status: str
+    href: str | None = None
+    label: str | None = None
+    message: str | None = None
+
+
+class DashboardResource(BaseModel):
+    internal_id: str
+    cell_index: int | None = None
+    attempt: int | None = None
+    provider: str
+    resource_type: str
+    external_id: str
+    region: str | None = None
+    ownership: str
+    lifecycle: dict[str, Any]
+    metadata: dict[str, Any]
+    supports_stop: bool
+    status: str
+    terminal: bool
+    monitor_closed: bool
+    disposition: str
+    version: int
+    message: str | None = None
+    metrics: dict[str, Any]
+    log_tail: list[str]
+    created_at: str
+    updated_at: str
+    observations: list[DashboardObservation]
+    link: DashboardLink | None = None
+
+
+class DashboardEvent(BaseModel):
+    seq: int
+    timestamp: str
+    type: str
+    payload: dict[str, Any]
+
+
+class DashboardCapabilities(BaseModel):
+    controller_live: bool
+
+
+class DashboardState(BaseModel):
+    schema_version: Literal[1] = 1
+    run: DashboardRun
+    cells: list[DashboardCell]
+    resources: list[DashboardResource]
+    events: list[DashboardEvent]
+    capabilities: DashboardCapabilities
+
+
+_RESOURCE_METRIC_FIELDS: dict[str, frozenset[str]] = {
+    "sagemaker_processing_job": frozenset(
+        {
+            "instance_count",
+            "processing_instance_count",
+            "cluster_instance_count",
+            "instance_type",
+            "processing_instance_type",
+            "cluster_instance_type",
+            "volume_size_gb",
+            "volume_size_in_gb",
+            "processing_volume_size_gb",
+            "start_time",
+            "creation_time",
+            "end_time",
+        }
+    ),
+    "file_count": frozenset(
+        {"file_count", "expected_count", "total_bytes", "latest_modified_at"}
+    ),
+    "line_count": frozenset(
+        {
+            "line_count",
+            "expected_lines",
+            "lines_per_second",
+            "bytes",
+            "modified_at",
+            "partial_line_pending",
+        }
+    ),
+    "s3_prefix": frozenset(
+        {
+            "object_count",
+            "expected_count",
+            "total_bytes",
+            "scan_in_progress",
+            "latest_object_time",
+            "bucket",
+            "prefix",
+        }
+    ),
+    "s3_manifest": frozenset({"completed", "total", "exists", "key"}),
+    "system_metrics": frozenset(
+        {
+            "host_cpu_percent",
+            "host_memory_percent",
+            "kernel_cpu_percent",
+            "kernel_memory_rss_bytes",
+            "disk_percent",
+            "gpu_0_utilization_percent",
+        }
+    ),
+    "cloudwatch_metric": frozenset(
+        {
+            "latest_value",
+            "latest_unit",
+            "latest_timestamp",
+            "statistic",
+            "metric_name",
+            "series",
+        }
+    ),
+    "cloudwatch_logs": frozenset({"stream_count"}),
+}
+_GENERIC_METRIC_FIELDS = frozenset(
+    {"completed", "total", "unit", "count", "rate", "throughput", "percent"}
+)
+_PROGRESS_METRIC_FIELDS = frozenset(
+    {
+        "source",
+        "position",
+        "progress_id",
+        "closed",
+        "rate",
+        "items_per_second",
+        "lines_per_second",
+        "rows_per_second",
+        "batches_per_second",
+        "throughput",
+    }
+)
 
 
 class DashboardAuth:
@@ -170,15 +340,240 @@ async def _dashboard(
     return response
 
 
-async def _state_snapshot(request: Request) -> dict[str, Any]:
-    return _supervisor(request).snapshot()
+def _bounded_text(value: Any, *, limit: int = 32_768) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _dashboard_output(output: dict[str, Any]) -> dict[str, Any]:
+    output_type = str(output.get("output_type", "output"))
+    if output_type == "error":
+        return {
+            "output_type": output_type,
+            "traceback": [
+                _bounded_text(line) for line in output.get("traceback", [])[-50:]
+            ],
+        }
+    text = output.get("text")
+    if text is None and isinstance(output.get("data"), dict):
+        text = output["data"].get("text/plain")
+    return {"output_type": output_type, "text": _bounded_text(text)}
+
+
+def _dashboard_cell_label(cell: dict[str, Any]) -> str | None:
+    label = cell.get("label")
+    if not isinstance(label, str):
+        return None
+    source = str(cell.get("source", ""))
+    first_source_line = next(
+        (line.strip() for line in source.splitlines() if line.strip()), ""
+    )
+    if cell.get("cell_type") == "code" and label == first_source_line[:120]:
+        return None
+    return label
+
+
+def _dashboard_cell(cell: dict[str, Any]) -> DashboardCell:
+    return DashboardCell(
+        cell_index=int(cell["cell_index"]),
+        cell_type=str(cell["cell_type"]),
+        label=_dashboard_cell_label(cell),
+        status=str(cell["status"]),
+        attempt=int(cell["attempt"]),
+        started_at=cell.get("started_at"),
+        ended_at=cell.get("ended_at"),
+        elapsed_seconds=cell.get("elapsed_seconds"),
+        error_name=cell.get("error_name"),
+        error_value=cell.get("error_value"),
+        traceback=[_bounded_text(line) for line in cell.get("traceback", [])[-50:]],
+        output_tail=[
+            _dashboard_output(output) for output in cell.get("output_tail", [])[-20:]
+        ],
+    )
+
+
+def _dashboard_metrics(resource_type: str, metrics: dict[str, Any]) -> dict[str, Any]:
+    allowed = _RESOURCE_METRIC_FIELDS.get(resource_type, _GENERIC_METRIC_FIELDS)
+    sanitized = {key: value for key, value in metrics.items() if key in allowed}
+    series = sanitized.get("series")
+    if isinstance(series, list):
+        points: list[dict[str, Any]] = []
+        for raw_point in cast(list[object], series)[-2_000:]:
+            point = _string_dict(raw_point)
+            if point:
+                points.append(
+                    {
+                        key: point[key]
+                        for key in ("timestamp", "value", "unit")
+                        if key in point
+                    }
+                )
+        sanitized["series"] = points
+    return sanitized
+
+
+def _dashboard_external_id(resource: dict[str, Any]) -> str:
+    external_id = str(resource.get("external_id", ""))
+    if resource.get("provider") != "local":
+        return external_id
+    resource_type = resource.get("resource_type")
+    if resource_type == "dashboard":
+        return str(resource.get("logical_key") or "dashboard")
+    if resource_type in {"file_count", "line_count"}:
+        return Path(external_id).name
+    return str(resource_type or "local")
+
+
+def _dashboard_metadata(resource: dict[str, Any]) -> dict[str, Any]:
+    metadata = _string_dict(resource.get("metadata"))
+    if not metadata:
+        return {}
+    allowed = (
+        {"name"}
+        if resource.get("resource_type") == "dashboard"
+        else {"instance_count", "instance_type", "volume_size_gb"}
+    )
+    return {key: value for key, value in metadata.items() if key in allowed}
+
+
+def _dashboard_resource(resource: dict[str, Any]) -> DashboardResource:
+    resource_type = str(resource["resource_type"])
+    observations = [
+        DashboardObservation(
+            timestamp=str(observation["timestamp"]),
+            status=str(observation["status"]),
+            message=observation.get("message"),
+            metrics=_dashboard_metrics(resource_type, observation.get("metrics", {})),
+        )
+        for observation in resource.get("observations", [])
+    ]
+    lifecycle = _string_dict(resource.get("lifecycle"))
+    link = _string_dict(resource.get("link"))
+    dashboard_link = (
+        DashboardLink(
+            status=str(link["status"]),
+            href=link.get("href"),
+            label=link.get("label"),
+            message=link.get("message"),
+        )
+        if "status" in link
+        else None
+    )
+    return DashboardResource(
+        internal_id=str(resource["internal_id"]),
+        cell_index=resource.get("cell_index"),
+        attempt=resource.get("attempt"),
+        provider=str(resource["provider"]),
+        resource_type=resource_type,
+        external_id=_dashboard_external_id(resource),
+        region=resource.get("region"),
+        ownership=str(resource["ownership"]),
+        lifecycle={"stop_on_cancel": bool(lifecycle.get("stop_on_cancel", False))},
+        metadata=_dashboard_metadata(resource),
+        supports_stop=bool(resource["supports_stop"]),
+        status=str(resource["status"]),
+        terminal=bool(resource["terminal"]),
+        monitor_closed=bool(resource["monitor_closed"]),
+        disposition=str(resource["disposition"]),
+        version=int(resource["version"]),
+        message=resource.get("message"),
+        metrics=_dashboard_metrics(resource_type, resource.get("metrics", {})),
+        log_tail=[_bounded_text(line) for line in resource.get("log_tail", [])[-35:]],
+        created_at=str(resource["created_at"]),
+        updated_at=str(resource["updated_at"]),
+        observations=observations,
+        link=dashboard_link,
+    )
+
+
+def _dashboard_event_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = _string_dict(event.get("payload"))
+    if not payload:
+        return {}
+    event_type = str(event.get("type", ""))
+    if event_type == "notebook.progress":
+        value = {
+            key: payload[key]
+            for key in (
+                "cell_index",
+                "attempt",
+                "completed",
+                "total",
+                "unit",
+                "message",
+            )
+            if key in payload
+        }
+        metrics = _string_dict(payload.get("metrics"))
+        if metrics:
+            value["metrics"] = {
+                key: metric
+                for key, metric in metrics.items()
+                if key in _PROGRESS_METRIC_FIELDS
+            }
+        return value
+    allowed = {"internal_id", "status", "message", "error"}
+    value = {key: payload[key] for key in allowed if key in payload}
+    for key in ("message", "error"):
+        if key in value:
+            value[key] = _bounded_text(value[key])
+    return value
+
+
+def _string_dict(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    mapping = cast(dict[object, object], value)
+    return {key: item for key, item in mapping.items() if isinstance(key, str)}
+
+
+def _dashboard_state(supervisor: RunSupervisor) -> DashboardState:
+    raw = supervisor.snapshot()
+    run = raw["run"]
+    return DashboardState(
+        run=DashboardRun(
+            name=str(run["name"]),
+            status=str(run["status"]),
+            message=run.get("message"),
+            current_cell_index=run.get("current_cell_index"),
+            created_at=str(run["created_at"]),
+            updated_at=str(run["updated_at"]),
+            started_at=run.get("started_at"),
+            ended_at=run.get("ended_at"),
+        ),
+        cells=[_dashboard_cell(cell) for cell in raw["cells"]],
+        resources=[_dashboard_resource(resource) for resource in raw["resources"]],
+        events=[
+            DashboardEvent(
+                seq=int(event["seq"]),
+                timestamp=str(event["timestamp"]),
+                type=str(event["type"]),
+                payload=_dashboard_event_payload(event),
+            )
+            for event in raw["events"]
+        ],
+        capabilities=DashboardCapabilities(
+            controller_live=bool(raw["capabilities"]["controller_live"])
+        ),
+    )
+
+
+async def _state_snapshot(request: Request) -> JSONResponse:
+    state = _dashboard_state(_supervisor(request))
+    return JSONResponse(
+        state.model_dump(mode="json"), headers={"Cache-Control": "no-store"}
+    )
 
 
 async def _open_ntfy(request: Request) -> RedirectResponse:
     deep_link = _ntfy_deep_link(_supervisor(request).config.notifications)
     if deep_link is None:
         raise HTTPException(404, "ntfy notifications are not configured")
-    return RedirectResponse(deep_link, status_code=303)
+    return RedirectResponse(
+        deep_link, status_code=303, headers={"Cache-Control": "no-store"}
+    )
 
 
 async def _open_resource_dashboard(
@@ -200,7 +595,9 @@ async def _open_resource_dashboard(
         raise HTTPException(409, str(error)) from error
     if requires_token:
         target = with_token(target, _auth(request).token)
-    return RedirectResponse(target, status_code=303)
+    return RedirectResponse(
+        target, status_code=303, headers={"Cache-Control": "no-store"}
+    )
 
 
 def _event_cursor(request: Request, supervisor: RunSupervisor) -> tuple[int, bool]:
@@ -218,6 +615,14 @@ def _event_message(event: dict[str, Any]) -> str:
     sequence = event.get("seq")
     prefix = "" if sequence is None else f"id: {int(sequence)}\n"
     return f"{prefix}event: runwatch\ndata: {json.dumps(event)}\n\n"
+
+
+def _dashboard_event_signal(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: event[key]
+        for key in ("seq", "timestamp", "type")
+        if event.get(key) is not None
+    }
 
 
 def _events_after(
@@ -268,14 +673,14 @@ async def _event_stream(request: Request) -> AsyncGenerator[str, None]:
         if should_replay:
             for event in _events_after(supervisor, cursor):
                 cursor = int(event["seq"])
-                yield _event_message(event)
+                yield _event_message(_dashboard_event_signal(event))
         while not await request.is_disconnected():
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=15)
                 for delivered in _delivery_batch(supervisor, event, cursor):
                     if delivered.get("seq") is not None:
                         cursor = int(delivered["seq"])
-                    yield _event_message(delivered)
+                    yield _event_message(_dashboard_event_signal(delivered))
             except TimeoutError:
                 yield ": keepalive\n\n"
 
@@ -284,7 +689,7 @@ async def _stream_events(request: Request) -> StreamingResponse:
     return StreamingResponse(
         _event_stream(request),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
 
 

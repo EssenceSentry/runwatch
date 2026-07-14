@@ -28,7 +28,10 @@ Notebook cells emit resources through the namespaced API:
 ```python
 from runwatch import aws, emit_progress, local
 
-aws.emit_sagemaker_processing_job(job_name, logical_key="build")
+# Existing jobs are borrowed and observation-only by default.
+aws.emit_sagemaker_processing_job(existing_job_name, logical_key="observed-build")
+# Use the owned helper only immediately after this run creates the job.
+aws.emit_owned_sagemaker_processing_job(created_job_name, logical_key="owned-build")
 local.emit_system_metrics()
 local.emit_dashboard("http://127.0.0.1:8501", name="Training UI")
 emit_progress(1, total=3, unit="stages")

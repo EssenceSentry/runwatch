@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, cast
 
 import httpx
@@ -17,6 +18,17 @@ def _event_kernel_epoch(payload: dict[str, Any]) -> str:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("Notification event kernel_epoch must be nonnegative")
     return str(value)
+
+
+@dataclass(frozen=True)
+class NotificationDrainResult:
+    """Result of waiting for durable notification routing and delivery."""
+
+    complete: bool
+    nonterminal_intents: int = 0
+    nonterminal_deliveries: int = 0
+    routing_pending: bool = False
+    reason: str | None = None
 
 
 class NotificationManager:
@@ -39,6 +51,8 @@ class NotificationManager:
         self._delivery_task: asyncio.Task[None] | None = None
         self._delivery_wake = asyncio.Event()
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+        if self._destinations():
+            self.store.require_notification_event_routing(self.run_id)
 
     async def start(self) -> None:
         if self._delivery_task is not None:
@@ -59,19 +73,106 @@ class NotificationManager:
         self._delivery_wake.set()
 
     async def close(self) -> None:
-        tasks = (
+        tasks = [
             self._listener_task,
             self._periodic_task,
             self._delivery_task,
-        )
+        ]
         for task in tasks:
             if task and not task.done():
                 task.cancel()
-        await asyncio.gather(
-            *[task for task in tasks if task],
-            return_exceptions=True,
-        )
+        existing = [task for task in tasks if task]
+        results = await asyncio.gather(*existing, return_exceptions=True)
+        recovered = self.store.recover_notification_deliveries(self.run_id)
+        for task, result in zip(existing, results, strict=True):
+            if isinstance(result, BaseException) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                await self._publish_safely(
+                    "notification.shutdown_error",
+                    {
+                        "task": task.get_name(),
+                        "error": f"{type(result).__name__}: {result}",
+                    },
+                )
+        if recovered:
+            await self._publish_safely(
+                "notification.deliveries_recovered",
+                {
+                    "count": recovered,
+                    "reason": "Notification workers stopped before delivery completed",
+                },
+            )
         await self._client.aclose()
+
+    async def drain(self, timeout_seconds: float) -> NotificationDrainResult:
+        """Wait boundedly for persisted events and outbox deliveries to become terminal."""
+
+        if not self._destinations():
+            return NotificationDrainResult(complete=True)
+        if self._listener_task is None or self._delivery_task is None:
+            return NotificationDrainResult(
+                complete=False,
+                routing_pending=True,
+                reason="Notification workers are not running",
+            )
+        latest = self.store.recent_events(self.run_id, limit=1)
+        target_sequence = int(latest[-1]["seq"]) if latest else 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_seconds, 0.0)
+        while True:
+            routing_pending, state = self._drain_state(target_sequence)
+            if self._drain_is_complete(routing_pending, state):
+                return NotificationDrainResult(complete=True)
+            if loop.time() >= deadline:
+                return self._incomplete_drain_result(
+                    target_sequence, routing_pending, state
+                )
+            self._delivery_wake.set()
+            await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
+
+    def _drain_state(self, target_sequence: int) -> tuple[bool, dict[str, int]]:
+        cursor = self.store.notification_event_cursor(self.run_id)
+        return (
+            cursor < target_sequence,
+            self.store.notification_outbox_state(self.run_id),
+        )
+
+    @staticmethod
+    def _drain_is_complete(routing_pending: bool, state: dict[str, int]) -> bool:
+        return (
+            not routing_pending
+            and state["nonterminal_intents"] == 0
+            and state["nonterminal_deliveries"] == 0
+        )
+
+    @staticmethod
+    def _incomplete_drain_result(
+        target_sequence: int,
+        routing_pending: bool,
+        state: dict[str, int],
+    ) -> NotificationDrainResult:
+        reasons: list[str] = []
+        if routing_pending:
+            reasons.append(
+                f"notification routing has not consumed event {target_sequence}"
+            )
+        if state["nonterminal_deliveries"]:
+            reasons.append(
+                f"{state['nonterminal_deliveries']} delivery attempt(s) remain pending"
+            )
+        if state["nonterminal_intents"] and not state["nonterminal_deliveries"]:
+            reasons.append(
+                f"{state['nonterminal_intents']} notification intent(s) remain "
+                "nonterminal"
+            )
+        return NotificationDrainResult(
+            complete=False,
+            nonterminal_intents=state["nonterminal_intents"],
+            nonterminal_deliveries=state["nonterminal_deliveries"],
+            routing_pending=routing_pending,
+            reason="; ".join(reasons) or "notification drain did not complete",
+        )
 
     async def send(
         self,
@@ -120,11 +221,7 @@ class NotificationManager:
             claimed: list[dict[str, Any]] = []
             try:
                 claimed = self.store.claim_due_notification_deliveries(self.run_id)
-                if claimed:
-                    await asyncio.gather(
-                        *(self._attempt_delivery(item) for item in claimed),
-                        return_exceptions=True,
-                    )
+                await self._deliver_claimed(claimed)
                 await self._report_intent_transitions()
             except asyncio.CancelledError:
                 raise
@@ -139,6 +236,76 @@ class NotificationManager:
                 await asyncio.wait_for(self._delivery_wake.wait(), timeout=idle_seconds)
             except TimeoutError:
                 pass
+
+    async def _deliver_claimed(self, claimed: list[dict[str, Any]]) -> None:
+        if not claimed:
+            return
+        try:
+            results = await asyncio.gather(
+                *(self._attempt_delivery(item) for item in claimed),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            await self._recover_cancelled_deliveries()
+            raise
+        for delivery, result in zip(claimed, results, strict=True):
+            if isinstance(result, BaseException):
+                await self._recover_delivery_task_error(delivery, result)
+
+    async def _recover_cancelled_deliveries(self) -> None:
+        recovered = self.store.recover_notification_deliveries(self.run_id)
+        if not recovered:
+            return
+        await self._publish_safely(
+            "notification.deliveries_recovered",
+            {
+                "count": recovered,
+                "reason": (
+                    "Notification delivery worker stopped before delivery completed"
+                ),
+            },
+        )
+
+    async def _recover_delivery_task_error(
+        self, delivery: dict[str, Any], error: BaseException
+    ) -> None:
+        error_message = f"{type(error).__name__}: {error}"
+        attempt = int(delivery["attempt_count"])
+        retry_delay = min(
+            self.settings.retry_initial_seconds * (2 ** max(attempt - 1, 0)),
+            self.settings.retry_max_seconds,
+        )
+        try:
+            outcome = self.store.recover_claimed_notification_delivery(
+                str(delivery["delivery_id"]),
+                max_attempts=self.settings.max_delivery_attempts,
+                retry_delay_seconds=retry_delay,
+                error=error_message,
+            )
+        except Exception as recovery_error:
+            await self._publish_safely(
+                "notification.delivery_recovery_failed",
+                {
+                    "delivery_id": delivery["delivery_id"],
+                    "intent_id": delivery["intent_id"],
+                    "error": error_message,
+                    "recovery_error": (
+                        f"{type(recovery_error).__name__}: {recovery_error}"
+                    ),
+                },
+            )
+            return
+        await self._publish_safely(
+            "notification.delivery_recovered",
+            {
+                "delivery_id": delivery["delivery_id"],
+                "intent_id": delivery["intent_id"],
+                "error": error_message,
+                "outcome": outcome or "already_terminal",
+            },
+        )
+        if outcome == "pending":
+            self._delivery_wake.set()
 
     async def _attempt_delivery(self, delivery: dict[str, Any]) -> None:
         error_message: str | None = None

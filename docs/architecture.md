@@ -32,9 +32,31 @@ back to the user-owned notebook. A durable hash guard refuses publication when t
 notebook changed outside Runwatch, preserving both the external edit and the partial
 checkpoint.
 
+Rolling checkpoint requests use monotonic generations. The event-loop thread serializes
+an immutable notebook snapshot before a worker performs filesystem I/O, and a request
+that arrives during that write remains pending for the next generation. A transient
+rolling-checkpoint failure emits a durable diagnostic and retries with bounded backoff;
+recovery emits a matching diagnostic instead of silently losing the worker.
+
+Write-back conflict detection is intentionally described as best effort. Runwatch
+fingerprints the destination content and metadata, writes and synchronizes a replacement,
+then checks the fingerprint again immediately before atomic replacement. This catches
+observable concurrent saves but cannot eliminate the final comparison/rename window:
+portable local filesystems do not offer an atomic content-compare-and-replace primitive.
+Operators should edit the run-owned `source.ipynb`, not the original notebook, while a
+run is active.
+
 A cell execution timeout follows the same paused recovery path after Runwatch
 interrupts and synchronizes the kernel. If synchronization cannot be proven, the
 action requires a new kernel instead of offering an unsafe live resume.
+
+Run cancellation first persists `cancelling`, then escalates an active cell through
+kernel interrupt, graceful kernel shutdown, provisioner terminate, and provisioner kill.
+Each stage has a configurable grace period. Stage failures are events rather than an
+unbounded wait, repeated requests reuse the same cancellation work, and Runwatch can
+detach from a client await that remains stuck after process-level escalation. The cell
+is recorded as interrupted and normal cancellation still stops eligible owned resources
+before the run settles as `cancelled`.
 
 A live resume accepts edits only to the failed and future cells. Structural changes or
 edits to an already executed cell require restart. Restart reads the complete source
@@ -60,20 +82,45 @@ requested → executing → completed | rejected | failed
 ```
 
 Only one supervisor owns a run lock. The lock and run record bind a PID to its process
-start time and controller token so PID reuse cannot impersonate the old owner. Pending
-actions and resource-monitor cursors survive process restart.
+start time, host, boot identity, and controller token so PID reuse or a previous boot
+cannot impersonate the old owner. A lock from another host is never reclaimed as a
+local stale lock. Pending actions and resource-monitor cursors survive process restart.
 
 Notification intents and per-destination delivery attempts also live in SQLite. A slow
 or failing webhook cannot block another destination, failed deliveries use bounded
-exponential backoff, and an attempt interrupted by process shutdown is retried when the
-run is reopened.
+exponential backoff, and an attempt interrupted by process shutdown returns to a
+recoverable state. Worker failures are collected and journaled during close rather than
+being discarded.
 
 Successful run directories are temporary operational state. The default 90-second
-post-terminal linger keeps the final dashboard state observable before the supervisor
-and store close, the run lock is released, and the CLI removes the successful run
-directory. Empty Runwatch parent directories are removed as well. Paused, failed,
-cancelled, interrupted, write-back-conflicted, and explicitly retained runs remain
-available for inspection or recovery.
+post-terminal linger keeps the final dashboard state observable. Cleanup then waits a
+separate bounded interval for notification routing and every outbox item to reach a
+terminal result. A nonterminal outbox or drain error retains the successful run, emits
+`run.cleanup_retained`, and gives the operator `runwatch open RUN_DIR` to restart the
+workers without rerunning the notebook.
+
+When cleanup is eligible, the controller keeps its run lock and publishes a sibling
+cleanup fence before deleting the run directory. The sibling survives that deletion and
+prevents a successor from acquiring ownership until destructive cleanup is complete.
+Only then is the fence released and empty Runwatch parent directories removed. Paused,
+failed, cancelled, interrupted, write-back-conflicted, and explicitly retained runs
+remain available for inspection or recovery.
+
+## Persistence and filesystem model
+
+Per-run directories are mode `0700`; newly created run artifacts, the lock, manifest,
+token, and SQLite database are mode `0600`. Atomic notebook and manifest publication
+writes an exclusive temporary file, synchronizes its contents, replaces the destination,
+and synchronizes the parent directory where supported. Replacing the original notebook
+preserves its existing mode.
+
+SQLite uses WAL mode with `synchronous=NORMAL`. Together with atomic artifact writes,
+this is designed for ordinary process crashes on local POSIX filesystems. It is not a
+claim of strict durability across sudden host power loss, storage-controller failure,
+filesystem corruption, or broken `fsync` semantics. Runwatch currently supports local
+Linux and macOS filesystems, which are exercised in CI. Windows and shared/network
+filesystems are unsupported; the lock protocol deliberately refuses to infer that a
+foreign-host record is stale and is not a distributed lease.
 
 ## Resource protocol
 
@@ -82,11 +129,19 @@ provider/type identity, logical reconciliation key, ownership, lifecycle, and ty
 metadata. The runner supplies the cell attempt and kernel epoch.
 
 Adapters implement inspection and may optionally implement stop. Observations and
-cursors are persisted after each poll. Observation history is bounded per resource and
-evenly downsampled across the full retained history for mobile charts. The general event
-journal is also bounded; high-volume cell output uses coalesced transient refresh events
-instead of growing SQLite without limit. SSE reconnects replay retained events from the
-browser's last event ID.
+cursors are persisted after each poll. Observation history and resource log tails are
+bounded by both row count and encoded byte size; resource payloads also have an encoded
+byte ceiling. CloudWatch metric cards keep the full current lookback, while history
+persists only new or revised timestamp samples rather than duplicating the lookback on
+every poll. History is evenly downsampled across the retained range for mobile charts.
+The general event journal is likewise bounded by count and bytes; high-volume cell
+output uses coalesced transient refresh events instead of growing SQLite without limit.
+These byte settings are retention targets, not a hard cap on the SQLite file: the newest
+observation or event remains available even when that row alone exceeds its target, and
+core notebook state, durable actions, and the notification outbox are not discarded to
+enforce a total database size. Unrouted notification-source events are also protected
+until the durable notification cursor consumes them, so a routing backlog may
+temporarily exceed the event target rather than lose an at-least-once notification.
 
 Each adapter also declares whether it can safely block and validates conditional
 terminal metadata. The same validation runs for static configuration, public emitters,
@@ -109,6 +164,20 @@ and link-state check before redirecting the paired browser.
 Terminal SageMaker log collection follows CloudWatch pagination until tokens stabilize
 or the configured page/line bound is reached. A bounded drain is explicitly reported
 as truncated instead of silently presented as complete.
+
+## Dashboard boundary
+
+The durable snapshot is an internal recovery model. `/api/state` maps it into explicit
+dashboard response models and allowlists only presentation fields. Notebook source,
+resolved configuration, notification destinations, provider cursors and raw responses,
+controller credentials, and dedicated internal-path fields do not cross that boundary.
+Displayed cell output and tracebacks, resource logs, chart series, and event text are
+bounded but remain user-controlled content and can contain sensitive values.
+
+SSE is an invalidation channel, not a second persistence API. Initial and replayed
+events contain only sequence, timestamp, and type; the browser reloads the sanitized
+snapshot for details. The dashboard document, state API, SSE response, and authenticated
+redirects all set `Cache-Control: no-store`.
 
 ## Process recovery
 

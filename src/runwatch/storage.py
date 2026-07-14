@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Iterable
@@ -14,6 +15,7 @@ from uuid import uuid4
 import psutil
 from pydantic import BaseModel
 
+from ._fs import PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE
 from .models import (
     SCHEMA_VERSION,
     ActionKind,
@@ -41,6 +43,7 @@ class ResourceEventConflict(RuntimeError):
 
 
 _NOTIFICATION_EVENT_CURSOR_KEY = "_notification_event_cursor"
+_NOTIFICATION_ROUTING_REQUIRED_KEY = "_notification_routing_required"
 
 
 def _json_default(value: Any) -> Any:
@@ -86,14 +89,28 @@ class RunStore:
         path: Path,
         *,
         max_observations_per_resource: int = 10_000,
+        max_observation_bytes_per_resource: int = 8_388_608,
         max_log_lines_per_resource: int = 2_000,
+        max_log_bytes_per_resource: int = 2_097_152,
         max_events_per_run: int = 10_000,
+        max_event_bytes_per_run: int = 8_388_608,
+        max_resource_payload_bytes: int = 2_097_152,
     ) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.parent.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE)
+        except FileExistsError:
+            pass
+        else:
+            path.parent.chmod(PRIVATE_DIRECTORY_MODE)
+        self._reserve_private_database(path)
         self.path = path
         self.max_observations_per_resource = max_observations_per_resource
+        self.max_observation_bytes_per_resource = max_observation_bytes_per_resource
         self.max_log_lines_per_resource = max_log_lines_per_resource
+        self.max_log_bytes_per_resource = max_log_bytes_per_resource
         self.max_events_per_run = max_events_per_run
+        self.max_event_bytes_per_run = max_event_bytes_per_run
+        self.max_resource_payload_bytes = max_resource_payload_bytes
         self._connection = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
@@ -102,6 +119,16 @@ class RunStore:
             self._connection.execute("PRAGMA synchronous=NORMAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._initialize_or_validate_schema()
+
+    @staticmethod
+    def _reserve_private_database(path: Path) -> None:
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        try:
+            descriptor = os.open(path, flags, PRIVATE_FILE_MODE)
+        except FileExistsError:
+            path.chmod(PRIVATE_FILE_MODE)
+        else:
+            os.close(descriptor)
 
     def close(self) -> None:
         with self._lock:
@@ -718,6 +745,12 @@ class RunStore:
         kernel_epoch: int | None,
         supports_stop: bool,
     ) -> tuple[str, bool]:
+        self._validate_resource_payload_size(
+            {
+                "lifecycle": event.lifecycle.model_dump(mode="json"),
+                "metadata": event.resource.metadata,
+            }
+        )
         with self._lock:
             duplicate = self._connection.execute(
                 "SELECT * FROM resources WHERE run_id = ? AND event_id = ?",
@@ -959,6 +992,13 @@ class RunStore:
                 cursor_json = (
                     row["cursor_json"] if cursor is None else json_dumps(cursor)
                 )
+                self._validate_resource_payload_size(
+                    {
+                        "cursor": json_loads(cursor_json, {}),
+                        "metrics": observation.metrics,
+                        "raw": observation.raw,
+                    }
+                )
                 self._update_resource_from_observation(
                     internal_id,
                     observation,
@@ -989,7 +1029,33 @@ class RunStore:
     ) -> list[str]:
         log_tail = json_loads(row["log_tail_json"], [])
         log_tail.extend(observation.log_lines)
-        return log_tail[-self.max_log_lines_per_resource :]
+        return self._bounded_log_tail(log_tail)
+
+    def _bounded_log_tail(self, lines: list[str]) -> list[str]:
+        selected: list[str] = []
+        used = 0
+        for line in reversed(lines[-self.max_log_lines_per_resource :]):
+            encoded = line.encode("utf-8")
+            remaining = self.max_log_bytes_per_resource - used
+            if remaining <= 0:
+                break
+            if len(encoded) > remaining:
+                if not selected:
+                    selected.append(
+                        encoded[-remaining:].decode("utf-8", errors="replace")
+                    )
+                break
+            selected.append(line)
+            used += len(encoded)
+        return list(reversed(selected))
+
+    def _validate_resource_payload_size(self, value: Any) -> None:
+        size = len(json_dumps(value).encode("utf-8"))
+        if size > self.max_resource_payload_bytes:
+            raise ValueError(
+                "Resource payload exceeds storage.max_resource_payload_bytes "
+                f"({size} > {self.max_resource_payload_bytes})"
+            )
 
     def _update_resource_from_observation(
         self,
@@ -1051,6 +1117,11 @@ class RunStore:
         *,
         now: str,
     ) -> None:
+        history_metrics = (
+            observation.metrics
+            if observation.history_metrics is None
+            else observation.history_metrics
+        )
         self._connection.execute(
             """
             INSERT INTO resource_observations
@@ -1063,19 +1134,35 @@ class RunStore:
                 now,
                 observation.status.value,
                 observation.message,
-                json_dumps(observation.metrics),
+                json_dumps(history_metrics),
             ),
         )
 
     def _prune_resource_observations(self, internal_id: str) -> None:
         self._connection.execute(
             """
-            DELETE FROM resource_observations WHERE internal_id = ? AND seq NOT IN (
-                SELECT seq FROM resource_observations
-                WHERE internal_id = ? ORDER BY seq DESC LIMIT ?
+            DELETE FROM resource_observations
+            WHERE internal_id = ? AND seq NOT IN (
+                SELECT seq FROM (
+                    SELECT seq,
+                        ROW_NUMBER() OVER (ORDER BY seq DESC) AS row_number,
+                        SUM(
+                            LENGTH(CAST(metrics_json AS BLOB))
+                            + LENGTH(CAST(COALESCE(message, '') AS BLOB))
+                        ) OVER (ORDER BY seq DESC) AS cumulative_bytes
+                    FROM resource_observations WHERE internal_id = ?
+                )
+                WHERE row_number = 1 OR (
+                    row_number <= ? AND cumulative_bytes <= ?
+                )
             )
             """,
-            (internal_id, internal_id, self.max_observations_per_resource),
+            (
+                internal_id,
+                internal_id,
+                self.max_observations_per_resource,
+                self.max_observation_bytes_per_resource,
+            ),
         )
 
     def resource_observations(
@@ -1152,6 +1239,53 @@ class RunStore:
             }
             for row in rows
         ]
+
+    def downsampled_run_resource_observations(
+        self, run_id: str, max_points: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return bounded observation histories for every resource in one query."""
+
+        if max_points < 2:
+            raise ValueError("max_points must be at least 2")
+        sample_values = ", ".join(f"({point})" for point in range(max_points))
+        query = f"""
+            WITH sample(point) AS (VALUES {sample_values}),
+            ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY internal_id ORDER BY seq
+                    ) AS point_number,
+                    COUNT(*) OVER (PARTITION BY internal_id) AS point_count
+                FROM resource_observations
+                WHERE run_id = ?
+            ), selected AS (
+                SELECT * FROM ranked WHERE point_count <= ?
+                UNION ALL
+                SELECT ranked.* FROM ranked JOIN sample
+                    ON ranked.point_number = 1 + CAST(
+                        sample.point * (ranked.point_count - 1) / (? - 1)
+                        AS INTEGER
+                    )
+                WHERE ranked.point_count > ?
+            )
+            SELECT * FROM selected ORDER BY internal_id, seq
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                query, (run_id, max_points, max_points, max_points)
+            ).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["internal_id"]), []).append(
+                {
+                    "seq": int(row["seq"]),
+                    "timestamp": row["timestamp"],
+                    "status": row["status"],
+                    "message": row["message"],
+                    "metrics": json_loads(row["metrics_json"], {}),
+                }
+            )
+        return grouped
 
     def set_resource_status(
         self, internal_id: str, status: ResourceStatus, *, message: str | None = None
@@ -1424,16 +1558,7 @@ class RunStore:
                 "INSERT INTO events (run_id, timestamp, type, payload_json) VALUES (?, ?, ?, ?)",
                 (run_id, timestamp, event_type, json_dumps(payload)),
             )
-            self._connection.execute(
-                """
-                DELETE FROM events
-                WHERE run_id = ? AND seq <= COALESCE((
-                    SELECT seq FROM events WHERE run_id = ?
-                    ORDER BY seq DESC LIMIT 1 OFFSET ?
-                ), -1)
-                """,
-                (run_id, run_id, self.max_events_per_run),
-            )
+            self._prune_events(run_id)
             self._connection.commit()
         sequence = cursor.lastrowid
         if sequence is None:
@@ -1445,6 +1570,50 @@ class RunStore:
             "type": event_type,
             "payload": payload,
         }
+
+    def _prune_events(self, run_id: str) -> None:
+        protected_after = self._notification_pruning_cursor(run_id)
+        self._connection.execute(
+            """
+            DELETE FROM events
+            WHERE run_id = ?
+              AND (? IS NULL OR seq <= ?)
+              AND seq NOT IN (
+                SELECT seq FROM (
+                    SELECT seq,
+                        ROW_NUMBER() OVER (ORDER BY seq DESC) AS row_number,
+                        SUM(
+                            LENGTH(CAST(payload_json AS BLOB))
+                            + LENGTH(CAST(type AS BLOB))
+                        ) OVER (ORDER BY seq DESC) AS cumulative_bytes
+                    FROM events WHERE run_id = ?
+                )
+                WHERE row_number = 1 OR (
+                    row_number <= ? AND cumulative_bytes <= ?
+                )
+            )
+            """,
+            (
+                run_id,
+                protected_after,
+                protected_after,
+                run_id,
+                self.max_events_per_run,
+                self.max_event_bytes_per_run,
+            ),
+        )
+
+    def _notification_pruning_cursor(self, run_id: str) -> int | None:
+        row = self._connection.execute(
+            "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown run {run_id}")
+        metadata, cursor = self._notification_metadata(row)
+        required = metadata.get(_NOTIFICATION_ROUTING_REQUIRED_KEY, False)
+        if not isinstance(required, bool):
+            raise CorruptRunState("Notification routing requirement is invalid")
+        return cursor if required else None
 
     def recent_events(self, run_id: str, limit: int = 120) -> list[dict[str, Any]]:
         with self._lock:
@@ -1496,6 +1665,32 @@ class RunStore:
             raise KeyError(f"Unknown run {run_id}")
         _metadata, cursor = self._notification_metadata(row)
         return cursor
+
+    def require_notification_event_routing(self, run_id: str) -> bool:
+        """Protect unconsumed events from retention pruning for this run."""
+
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown run {run_id}")
+                metadata, _cursor = self._notification_metadata(row)
+                current = metadata.get(_NOTIFICATION_ROUTING_REQUIRED_KEY, False)
+                if not isinstance(current, bool):
+                    raise CorruptRunState("Notification routing requirement is invalid")
+                if current:
+                    self._connection.commit()
+                    return False
+                metadata[_NOTIFICATION_ROUTING_REQUIRED_KEY] = True
+                self._update_run_metadata(run_id, metadata)
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return True
 
     @staticmethod
     def _notification_metadata(
@@ -1557,6 +1752,7 @@ class RunStore:
                     return False
                 metadata[_NOTIFICATION_EVENT_CURSOR_KEY] = sequence
                 self._update_run_metadata(run_id, metadata)
+                self._prune_events(run_id)
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
@@ -1722,6 +1918,98 @@ class RunStore:
                 self._connection.rollback()
                 raise
         return int(updated.rowcount)
+
+    def recover_claimed_notification_delivery(
+        self,
+        delivery_id: str,
+        *,
+        max_attempts: int,
+        retry_delay_seconds: float,
+        error: str,
+    ) -> str | None:
+        """Recover one delivery whose worker failed after claiming it.
+
+        The attempt remains counted because the destination may already have accepted the
+        request. Stable idempotency headers make a bounded retry safe for destinations that
+        honor them. Once the configured attempt limit is reached, the claim is failed
+        terminally instead of remaining stuck in ``sending``.
+        """
+
+        now_value = utc_now()
+        now = now_value.isoformat()
+        with self._lock:
+            try:
+                delivery = self._connection.execute(
+                    "SELECT * FROM notification_deliveries WHERE delivery_id = ?",
+                    (delivery_id,),
+                ).fetchone()
+                if delivery is None:
+                    raise KeyError(f"Unknown notification delivery {delivery_id}")
+                if delivery["status"] != "sending":
+                    return None
+                intent_id = str(delivery["intent_id"])
+                if int(delivery["attempt_count"]) >= max_attempts:
+                    status = "failed"
+                    next_attempt = str(delivery["next_attempt_at"])
+                else:
+                    status = "pending"
+                    next_attempt = (
+                        now_value + timedelta(seconds=retry_delay_seconds)
+                    ).isoformat()
+                self._connection.execute(
+                    """
+                    UPDATE notification_deliveries
+                    SET status = ?, last_error = ?, next_attempt_at = ?, updated_at = ?
+                    WHERE delivery_id = ? AND status = 'sending'
+                    """,
+                    (status, error, next_attempt, now, delivery_id),
+                )
+                intent_status, completed_at = self._notification_intent_state(
+                    intent_id, now
+                )
+                self._connection.execute(
+                    """
+                    UPDATE notification_intents
+                    SET status = ?, completed_at = ?, updated_at = ?
+                    WHERE intent_id = ?
+                    """,
+                    (intent_status, completed_at, now, intent_id),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return status
+
+    def notification_outbox_state(self, run_id: str) -> dict[str, int]:
+        """Return bounded cleanup-relevant counts for a run's durable outbox."""
+
+        with self._lock:
+            intent = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM notification_intents
+                WHERE run_id = ? AND status IN ('pending', 'partial')
+                """,
+                (run_id,),
+            ).fetchone()
+            deliveries = self._connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) AS sending
+                FROM notification_deliveries
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        pending = int(deliveries["pending"] or 0) if deliveries is not None else 0
+        sending = int(deliveries["sending"] or 0) if deliveries is not None else 0
+        return {
+            "nonterminal_intents": int(intent["count"] if intent is not None else 0),
+            "nonterminal_deliveries": pending + sending,
+            "pending_deliveries": pending,
+            "sending_deliveries": sending,
+        }
 
     def claim_due_notification_deliveries(
         self, run_id: str, *, limit: int = 32
@@ -1941,9 +2229,12 @@ class RunStore:
                 "SELECT * FROM cells WHERE run_id = ? ORDER BY cell_index", (run_id,)
             ).fetchall()
         resources = self.list_resources(run_id)
+        observation_histories = self.downsampled_run_resource_observations(
+            run_id, chart_points
+        )
         for resource in resources:
-            resource["observations"] = self.downsampled_resource_observations(
-                resource["internal_id"], max_points=chart_points
+            resource["observations"] = observation_histories.get(
+                str(resource["internal_id"]), []
             )
         return {
             "schema_version": SCHEMA_VERSION,

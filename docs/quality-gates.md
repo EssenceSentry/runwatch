@@ -37,9 +37,11 @@ local/GitHub Pyright gate. VS Code is pinned to `.venv/bin/python` so third-part
 resolve from the same environment used by the gate.
 
 `.github/workflows/quality-gate.yml` mirrors the non-test local hooks as named jobs.
-`.github/workflows/tests.yml` runs the same pytest coverage command on every supported
-Python version. `scripts/check_quality_gate_parity.py` prevents the Ruff and Black
-target lists from drifting between local and remote gates.
+`.github/workflows/tests.yml` runs the same pytest coverage command on Ubuntu for every
+supported Python version and on macOS for Python 3.12. These jobs cover the supported
+local POSIX execution platforms; they do not imply Windows or shared-filesystem support.
+`scripts/check_quality_gate_parity.py` prevents the Ruff and Black target lists from
+drifting between local and remote gates.
 
 The cognitive-complexity ceiling is 15. Exceptions must be explicit in
 `scripts/complexity_allowlist.json`, include a reason and follow-up, and fail once

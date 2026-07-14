@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -252,6 +253,10 @@ class NotebookSettings(BaseModel):
     timeout_seconds: int | None = Field(default=None, gt=0)
     startup_timeout_seconds: int = Field(default=60, gt=0)
     checkpoint_interval_seconds: float = Field(default=2.0, gt=0)
+    cancel_interrupt_grace_seconds: float = Field(default=5.0, ge=0)
+    cancel_shutdown_grace_seconds: float = Field(default=5.0, ge=0)
+    cancel_terminate_grace_seconds: float = Field(default=3.0, ge=0)
+    cancel_kill_grace_seconds: float = Field(default=2.0, ge=0)
     capture_tqdm: bool = True
     tqdm_min_interval_seconds: float = Field(default=0.5, gt=0)
     wait_for_blocking_resources: bool = True
@@ -291,10 +296,37 @@ class NotificationSettings(BaseModel):
     ntfy_base_url: str | None = None
     ntfy_topic: str | None = None
     periodic_seconds: float | None = Field(default=None, gt=0)
+    terminal_drain_timeout_seconds: float = Field(default=30.0, ge=0)
     request_timeout_seconds: float = Field(default=15.0, gt=0)
     max_delivery_attempts: int = Field(default=4, ge=1, le=20)
     retry_initial_seconds: float = Field(default=1.0, gt=0)
     retry_max_seconds: float = Field(default=60.0, gt=0)
+
+    @field_validator("webhook_urls")
+    @classmethod
+    def valid_webhook_urls(cls, values: list[str]) -> list[str]:
+        return [
+            cls._validated_http_url(value, field="webhook_urls") for value in values
+        ]
+
+    @field_validator("ntfy_base_url")
+    @classmethod
+    def valid_ntfy_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return cls._validated_http_url(value, field="ntfy_base_url").rstrip("/")
+
+    @staticmethod
+    def _validated_http_url(value: str, *, field: str) -> str:
+        candidate = value.strip()
+        parts = urlsplit(candidate)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError(f"{field} entries must be absolute HTTP(S) URLs")
+        try:
+            parts.port
+        except ValueError as error:
+            raise ValueError(f"{field} contains an invalid port") from error
+        return candidate
 
     @model_validator(mode="after")
     def complete_ntfy_pair(self) -> NotificationSettings:
@@ -312,8 +344,12 @@ class StorageSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_observations_per_resource: int = Field(default=10_000, ge=100)
+    max_observation_bytes_per_resource: int = Field(default=8_388_608, ge=1_024)
     max_log_lines_per_resource: int = Field(default=2_000, ge=100)
+    max_log_bytes_per_resource: int = Field(default=2_097_152, ge=1_024)
     max_events_per_run: int = Field(default=10_000, ge=500)
+    max_event_bytes_per_run: int = Field(default=8_388_608, ge=1_024)
+    max_resource_payload_bytes: int = Field(default=2_097_152, ge=1_024)
     dashboard_chart_points: int = Field(default=300, ge=20, le=2_000)
 
 
@@ -338,6 +374,7 @@ class ResourceObservation(BaseModel):
     terminal: bool = False
     message: str | None = None
     metrics: JSONDict = Field(default_factory=dict)
+    history_metrics: JSONDict | None = None
     log_lines: list[str] = Field(default_factory=list)
     raw: JSONDict = Field(default_factory=dict)
 
@@ -345,6 +382,13 @@ class ResourceObservation(BaseModel):
     @classmethod
     def payloads_are_json(cls, value: JSONDict) -> JSONDict:
         _validate_json_value(value, path="resource observation")
+        return value
+
+    @field_validator("history_metrics")
+    @classmethod
+    def history_payload_is_json(cls, value: JSONDict | None) -> JSONDict | None:
+        if value is not None:
+            _validate_json_value(value, path="resource observation history")
         return value
 
 

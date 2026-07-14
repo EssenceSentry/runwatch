@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from botocore.exceptions import ClientError
 
@@ -178,19 +178,27 @@ async def _read_discovered_streams(
     line_limit: int,
 ) -> list[str]:
     tokens: dict[str, str] = cursor.setdefault("log_tokens", {})
+    if not streams or line_limit <= 0:
+        return []
+    offset = int(cursor.get("log_read_offset", 0)) % len(streams)
+    ordered = streams[offset:] + streams[:offset]
     remaining = line_limit
     lines: list[str] = []
-    for stream in streams:
+    attempted = 0
+    for index, stream in enumerate(ordered):
         if remaining <= 0:
             break
+        streams_left = len(ordered) - index
+        fair_limit = max(1, remaining // streams_left)
         previous = tokens.get(stream)
         page = await _read_log_page(
             logs,
             log_group=log_group,
             stream=stream,
-            limit=remaining,
+            limit=fair_limit,
             previous_token=previous,
         )
+        attempted += 1
         if page is None:
             tokens.pop(stream, None)
             continue
@@ -200,10 +208,45 @@ async def _read_discovered_streams(
         if previous and previous == next_token:
             continue
         new_lines = _format_log_lines(stream, page)
-        accepted = new_lines[:remaining]
+        accepted = new_lines[:fair_limit]
         lines.extend(accepted)
         remaining -= len(accepted)
+    cursor["log_read_offset"] = (offset + attempted) % len(streams)
     return lines
+
+
+def _prune_stale_log_tokens(
+    cursor: dict[str, Any],
+    discovery: LogStreamDiscovery,
+    *,
+    started_mid_cycle: bool,
+) -> None:
+    """Prune tokens only after one complete bounded discovery rotation."""
+
+    cycle_key = "log_streams_seen_in_cycle"
+    incomplete_key = "log_stream_cycle_incomplete"
+    prior: object = cursor.get(cycle_key)
+    seen: set[str] = set()
+    if isinstance(prior, list):
+        seen = {
+            str(name) for name in cast(list[object], prior) if isinstance(name, str)
+        }
+    if started_mid_cycle and not seen:
+        # A cursor written by an older Runwatch may resume halfway through a
+        # discovery cycle without the earlier stream names.  Defer pruning once
+        # rather than replaying those streams from the beginning.
+        cursor[incomplete_key] = True
+    seen.update(discovery.names)
+    if discovery.next_token:
+        cursor[cycle_key] = sorted(seen)
+        return
+    incomplete = bool(cursor.pop(incomplete_key, False))
+    tokens: object = cursor.get("log_tokens")
+    if isinstance(tokens, dict) and not incomplete:
+        typed_tokens = cast(dict[object, object], tokens)
+        for name in set(typed_tokens).difference(seen):
+            typed_tokens.pop(name, None)
+    cursor.pop(cycle_key, None)
 
 
 class CloudWatchLogsAdapter(ResourceAdapter):
@@ -244,6 +287,11 @@ class CloudWatchLogsAdapter(ResourceAdapter):
             streams=discovery.names,
             cursor=cursor,
             line_limit=self.aws_settings.max_log_lines_per_poll,
+        )
+        _prune_stale_log_tokens(
+            cursor,
+            discovery,
+            started_mid_cycle=started_mid_cycle,
         )
         rotating = discovery.truncated or started_mid_cycle
         return ResourceObservation(
