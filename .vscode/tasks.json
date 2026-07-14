@@ -2,6 +2,73 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "notebook: run active notebook",
+      "type": "process",
+      "dependsOn": "notebook: prepare workspace kernel",
+      "dependsOrder": "sequence",
+      "command": "${fileWorkspaceFolder}/.venv/bin/dotenv",
+      "args": [
+        "--file",
+        "${fileWorkspaceFolder}/.env",
+        "run",
+        "--",
+        "${workspaceFolder}/.venv/bin/runwatch",
+        "execute",
+        "${file}",
+        "--config",
+        "${workspaceFolder}/.vscode/runwatch.yaml",
+        "--working-dir",
+        "${fileWorkspaceFolder}",
+        "--share",
+        "lan"
+      ],
+      "options": {
+        "cwd": "${fileWorkspaceFolder}",
+        "env": {
+          "PATH": "${fileWorkspaceFolder}/.venv/bin:${env:PATH}",
+          "JUPYTER_PATH": "${fileWorkspaceFolder}/.venv/share/jupyter"
+        }
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "focus": false,
+        "panel": "dedicated",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "detail": "Execute the active saved notebook with Runwatch, LAN sharing, its workspace kernel, and ntfy settings loaded from that workspace's .env."
+    },
+    {
+      "label": "notebook: prepare workspace kernel",
+      "type": "process",
+      "command": "${fileWorkspaceFolder}/.venv/bin/python",
+      "args": [
+        "-m",
+        "ipykernel",
+        "install",
+        "--prefix",
+        "${fileWorkspaceFolder}/.venv",
+        "--name",
+        "runwatch-workspace",
+        "--display-name",
+        "Runwatch workspace (.venv)"
+      ],
+      "options": {
+        "cwd": "${fileWorkspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "clear": false,
+        "showReuseMessage": false
+      },
+      "hide": true,
+      "detail": "Refresh the active notebook workspace's Runwatch kernelspec with an absolute .venv Python path."
+    },
+    {
       "label": "check: all (pre-commit)",
       "type": "shell",
       "command": "uv",

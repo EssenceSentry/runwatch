@@ -163,6 +163,14 @@ def test_dashboard_exposes_authenticated_ntfy_app_handoff(tmp_path: Path) -> Non
     assert client.get("/notifications/ntfy/open").status_code == 401
     dashboard = client.get("/?token=secret-token")
     assert 'href="/notifications/ntfy/open"' in dashboard.text
+    assert 'aria-label="Open ntfy"' in dashboard.text
+    assert 'class="ntfy-logo"' in dashboard.text
+    assert 'class="ntfy-terminal-prompt"' in dashboard.text
+    assert 'class="ntfy-terminal-cursor"' in dashboard.text
+    assert "Open ntfy" in dashboard.text
+    styles = client.get("/static/runwatch/styles.css")
+    assert styles.status_code == 200
+    assert "background: #338574" in styles.text
     handoff = client.get("/notifications/ntfy/open", follow_redirects=False)
     assert handoff.status_code == 303
     assert handoff.headers["location"] == ("ntfy://ntfy.example/base/phone%20topic")
@@ -558,27 +566,78 @@ def test_sse_gap_recovery_is_ordered_and_deduplicates_queued_events(
 
 def test_stop_confirmation_lists_only_other_provider_stoppable_resources() -> None:
     script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
-    assert "r.internal_id!==id" in script
-    assert "r.status!=='stopping'" in script
-    assert "r.ownership==='exclusive'&&r.supports_stop" in script
+    assert "item.internal_id !== id" in script
+    assert "!item.monitor_closed" in script
+    assert "item.status !== 'stopping'" in script
+    assert "item.ownership === 'exclusive'" in script
+    assert "item.supports_stop" in script
     assert "other resource(s) eligible for provider stop" in script
 
 
 def test_dashboard_formats_metric_units_and_timestamps() -> None:
     script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
     assert "const fmtBytes" in script
-    assert "key === 'bytes' || key.endsWith('_bytes')" in script
-    assert "key.endsWith('_at') || key.endsWith('_timestamp')" in script
-    assert "fmtMetricValue(k,v)" in script
+    assert "const fmtTimestamp" in script
+    assert "fmtBytes(metrics.total_bytes)" in script
+    assert "relativeTime(metrics.latest_modified_at" in script
 
 
 def test_dashboard_renders_linked_dashboard_actions_without_public_targets() -> None:
     script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
-    assert "Open ${escapeHtml(link.label||'dashboard')}" in script
+    dashboard_renderer = script.split("function renderDashboardResource", 1)[1].split(
+        "function sagemakerBody", 1
+    )[0]
+    assert "Open ${escapeHtml(label)}" in dashboard_renderer
     assert 'href="${escapeHtml(link.href)}"' in script
-    assert "Preparing dashboard link" in script
+    assert "Preparing ${label}" in dashboard_renderer
+    assert "http_status" not in dashboard_renderer
+    assert "response_time_seconds" not in dashboard_renderer
+    assert "technicalDetails" not in dashboard_renderer
     assert "link.public_base" not in script
     assert "link.token" not in script
+
+
+def test_dashboard_prioritizes_user_signals_and_collapses_diagnostics() -> None:
+    runwatch_root = _WEB_ARTIFACTS / "runwatch"
+    template = (runwatch_root / "index.html").read_text(encoding="utf-8")
+    script = (runwatch_root / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="heartbeat"' in template
+    assert 'id="issue-count"' in template
+    assert 'id="remote-count"' in template
+    assert 'id="cell-highlights"' in template
+    assert '<details class="full-timeline panel surface">' in template
+    assert '<details class="developer-diagnostics panel surface">' in template
+    assert 'id="kernel-epoch"' not in template
+    assert "function meaningfulEvents" in script
+    assert "events.slice(-100)" in script
+
+
+def test_dashboard_scopes_tqdm_progress_and_prefers_the_outermost_bar() -> None:
+    script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
+
+    assert "function latestProgress(events, current)" in script
+    assert "payload.cell_index === current.cell_index" in script
+    assert "payload.attempt === current.attempt" in script
+    assert "latest.payload.metrics.position || 0" in script
+    assert "candidate.metrics?.progress_id === progressId" in script
+    assert "payload.metrics?.closed === true" in script
+
+
+def test_dashboard_uses_resource_specific_summaries_and_terminal_semantics() -> None:
+    script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
+
+    assert "function sagemakerBody" in script
+    assert "metrics.instance_count" in script
+    assert "metrics.instance_type" in script
+    assert "metrics.volume_size_gb" in script
+    assert "function fileCountBody" in script
+    assert "function lineCountBody" in script
+    assert "function systemBody" in script
+    assert "function resourcePriority" in script
+    assert "resource.monitor_closed" in script
+    assert "RUN_TERMINAL.has(run.status)" in script
+    assert "primitiveMetrics" not in script
 
 
 def test_runwatch_web_artifact_is_unbranded_and_uses_shared_components() -> None:

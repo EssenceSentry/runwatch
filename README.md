@@ -11,6 +11,8 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
 ## Highlights
 
 - Cell-by-cell `nbclient` execution with a live kernel.
+- Atomic write-back of settled cell sources, execution counts, and outputs to the
+  notebook passed to `runwatch execute`.
 - Failure pause that preserves kernel state while monitoring continues.
 - Manual recovery after kernel death or a stopped Runwatch process.
 - Immutable input, editable source, rolling partial output, and final executed notebook.
@@ -29,6 +31,8 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
   per-destination retry outbox. Delivery is at least once; retries carry stable
   `Idempotency-Key` and `X-Runwatch-Intent-ID` headers so receivers can deduplicate a
   request accepted immediately before a Runwatch crash.
+- Automatic removal of successful run state after the dashboard closes, with
+  `--keep-run` available for retained provenance.
 
 Runwatch uses state schema version 2 and intentionally does not migrate 0.1 run
 directories.
@@ -73,7 +77,12 @@ conditions without starting a kernel, dashboard, or provider resource. Resources
 emitted dynamically by cells cannot be predicted during preflight.
 
 Runwatch prints the run directory, editable notebook, pairing URL, and terminal QR code.
-By default the dashboard remains available until the Runwatch process is stopped.
+By default the dashboard remains available for 90 seconds after the run reaches a
+terminal state, then closes automatically. If the run succeeded, Runwatch removes that
+run directory and removes the empty `.runwatch/runs` and `.runwatch` parents. Set
+`server.linger_seconds: 0` to close immediately, set it to `null` to keep the dashboard
+open until Ctrl+C, or use `--keep-run` to retain successful state after the dashboard
+closes.
 
 For a no-AWS replay with live progress, local metrics, file monitoring, log tailing,
 and final notebook results, use the repository's
@@ -92,11 +101,18 @@ Every run contains:
 ├── source.ipynb              # agent/human editable nbformat document
 ├── executed.partial.ipynb    # runner-owned rolling checkpoint
 ├── executed.ipynb            # final executed notebook
+├── writeback-state.json      # conflict guard for the user-owned notebook
 ├── run-manifest.json
 └── runwatch.sqlite3
 ```
 
 ## Failure and recovery
+
+After every settled cell attempt, Runwatch atomically writes the executed notebook
+state back to the notebook passed to `execute`. This includes repaired source,
+execution counts, outputs, and tracebacks. If that notebook changes outside Runwatch,
+write-back stops rather than overwriting the external edit, and the run-owned partial
+checkpoint is retained.
 
 When a cell fails or reaches its configured timeout, Runwatch persists its outputs and
 traceback, pauses the notebook, and keeps the kernel and resource monitors alive. A
@@ -284,6 +300,24 @@ from runwatch import emit_progress
 
 emit_progress(180, total=400, unit="partitions", message="Building features")
 ```
+
+Python kernels also mirror `tqdm`, `tqdm.auto`, and `tqdm.notebook` bars into the
+same dashboard progress area without notebook changes:
+
+```python
+from tqdm.auto import tqdm
+
+for item in tqdm(items, desc="Building features", unit="items"):
+    process(item)
+```
+
+Runwatch preserves tqdm's normal notebook output and emits structured updates at most
+twice per second by default. Updates reuse one hidden notebook display per bar, so a
+long loop does not append an output for every refresh. The dashboard scopes progress
+to the current cell and prefers the outermost bar when bars are nested. Set
+`notebook.capture_tqdm: false` to disable automatic capture, or adjust
+`notebook.tqdm_min_interval_seconds`. Progress created in a separate process is outside
+the notebook kernel and is not captured automatically.
 
 ## Dashboard and remote stop
 

@@ -34,6 +34,9 @@ local.emit_dashboard("http://127.0.0.1:8501", name="Training UI")
 emit_progress(1, total=3, unit="stages")
 ```
 
+Python notebook runs also capture existing `tqdm`, `tqdm.auto`, and `tqdm.notebook`
+progress bars automatically; no Runwatch-specific loop wrapper is required.
+
 See the repository `README.md` for the operational workflow and
 complete emitter examples.
 

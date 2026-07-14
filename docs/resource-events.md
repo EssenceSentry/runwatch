@@ -93,6 +93,13 @@ the event. Notebook code cannot supply those execution fields.
 Completed values must be nonnegative, totals must be positive, and completed must not
 exceed total.
 
+Python kernels automatically translate standard, auto, async, and notebook tqdm bars
+to this event shape when `notebook.capture_tqdm` is enabled. Tqdm metadata is carried in
+`metrics` as `source`, `progress_id`, `position`, `rate`, `elapsed_seconds`, and
+`closed`. Runwatch applies `notebook.tqdm_min_interval_seconds` in addition to tqdm's
+own display throttling and always emits initial and terminal states. Display IDs keep
+the executed notebook bounded to one structured output per bar.
+
 ## S3 progress manifest
 
 The S3 manifest adapter reads a separate versioned JSON object:

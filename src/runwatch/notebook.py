@@ -17,6 +17,7 @@ from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
 from nbformat import NotebookNode
 
+from ._tqdm import tqdm_bootstrap_code
 from .emit import EVENT_MIME_TYPE, FALLBACK_PREFIX, RESOURCE_MIME_TYPE
 from .events import EventBus
 from .models import (
@@ -34,6 +35,7 @@ from .storage import RunStore, source_hash
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _OUTPUT_PERSIST_INTERVAL_SECONDS = 0.25
 _TIMEOUT_RECOVERY_MAX_SECONDS = 10.0
+_WRITEBACK_STATE_FILENAME = "writeback-state.json"
 
 
 def _strip_ansi(value: str) -> str:
@@ -195,6 +197,28 @@ class MonitoredNotebookClient(NotebookClient):
         output = super().process_message(msg, cell, cell_index)
         if output is not None:
             self.output_callback(output, cell_index, self.current_attempt)
+        elif msg.get("msg_type") == "update_display_data":
+            content = cast(dict[str, Any], msg.get("content", {}))
+            data = content.get("data")
+            data_payload = cast(dict[str, Any], data) if isinstance(data, dict) else {}
+            if data_payload and any(
+                isinstance(data_payload.get(mime_type), dict)
+                for mime_type in (RESOURCE_MIME_TYPE, EVENT_MIME_TYPE)
+            ):
+                metadata = content.get("metadata", {})
+                metadata_payload = (
+                    cast(dict[str, Any], metadata) if isinstance(metadata, dict) else {}
+                )
+                updated_output = nbformat.v4.new_output(
+                    output_type="display_data",
+                    data=data_payload,
+                    metadata=metadata_payload,
+                )
+                self.output_callback(
+                    updated_output,
+                    cell_index,
+                    self.current_attempt,
+                )
         return output
 
 
@@ -203,6 +227,7 @@ class NotebookRunner:
         self,
         *,
         run_id: str,
+        notebook_path: Path,
         source_path: Path,
         output_path: Path,
         run_dir: Path,
@@ -215,6 +240,7 @@ class NotebookRunner:
         initial_from_cell: int = 0,
     ) -> None:
         self.run_id = run_id
+        self.notebook_path = notebook_path
         self.source_path = source_path
         self.output_path = output_path
         self.run_dir = run_dir
@@ -248,6 +274,8 @@ class NotebookRunner:
         self._initial_from_cell = initial_from_cell
         self._resume_existing = not initialize_cells
         self.partial_output_path = run_dir / "executed.partial.ipynb"
+        self.writeback_state_path = run_dir / _WRITEBACK_STATE_FILENAME
+        self._expected_notebook_hash = self._load_writeback_hash()
         if initialize_cells:
             self.store.initialize_cells(run_id, _cell_records(self.notebook))
 
@@ -356,6 +384,7 @@ class NotebookRunner:
         blocking_status = await self._wait_for_blocking_resources()
         if blocking_status is not None:
             return blocking_status
+        await self._checkpoint(force=True, writeback=True)
         return await self._finish_succeeded()
 
     async def _run_kernel_epochs(self) -> None:
@@ -395,6 +424,7 @@ class NotebookRunner:
         assert self.client is not None
         async with self.client.async_setup_kernel(cwd=str(self.working_dir)):
             self._record_kernel_identity()
+            await self._install_tqdm_instrumentation()
             self.store.update_run_status(
                 self.run_id,
                 RunStatus.RUNNING,
@@ -414,6 +444,54 @@ class NotebookRunner:
                     "notebook.kernel_stopped",
                     {**self._kernel_identity(), "kernel_epoch": self.kernel_epoch},
                 )
+
+    async def _install_tqdm_instrumentation(self) -> None:
+        if not self.settings.capture_tqdm or not self._uses_python_kernel():
+            return
+        assert self.client is not None
+        assert self.client.kc is not None
+        try:
+            execution = cast(Any, self.client.kc).execute_interactive(
+                tqdm_bootstrap_code(self.settings.tqdm_min_interval_seconds),
+                silent=True,
+                store_history=False,
+                allow_stdin=False,
+                stop_on_error=False,
+                timeout=float(self.settings.startup_timeout_seconds),
+                output_hook=self._ignore_kernel_message,
+            )
+            reply = await execution if inspect.isawaitable(execution) else execution
+            content = cast(dict[str, Any], reply.get("content", {}))
+            if content.get("status") != "ok":
+                raise RuntimeError(
+                    str(content.get("evalue") or "kernel rejected instrumentation")
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            try:
+                await self.bus.publish(
+                    "notebook.tqdm_instrumentation_failed",
+                    {
+                        "kernel_epoch": self.kernel_epoch,
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                )
+            except Exception:
+                return
+
+    def _uses_python_kernel(self) -> bool:
+        metadata = cast(dict[str, Any], self.notebook.get("metadata", {}))
+        kernelspec_value = metadata.get("kernelspec")
+        if not isinstance(kernelspec_value, dict):
+            return True
+        kernelspec = cast(dict[str, Any], kernelspec_value)
+        language = kernelspec.get("language")
+        return language is None or str(language).lower().startswith("python")
+
+    @staticmethod
+    def _ignore_kernel_message(_message: dict[str, Any]) -> None:
+        return
 
     async def _execute_cells(self, start_index: int) -> str:
         index = start_index
@@ -576,7 +654,7 @@ class NotebookRunner:
                         "elapsed_seconds": elapsed,
                     },
                 )
-                self._request_checkpoint()
+                await self._checkpoint(force=True, writeback=True)
                 return "next"
             except (CellExecutionError, CellTimeoutError, DeadKernelError) as error:
                 timeout_synchronized = True
@@ -619,7 +697,7 @@ class NotebookRunner:
                     failed_attempt=attempt,
                 )
                 self._paused.set()
-                await self._checkpoint(force=True)
+                await self._checkpoint(force=True, writeback=True)
                 await self.bus.publish(
                     "cell.failed",
                     {
@@ -780,10 +858,12 @@ class NotebookRunner:
         return notebook
 
     def _on_output(self, output: NotebookNode, cell_index: int, attempt: int) -> None:
-        summary = summarize_output(output)
-        self._buffer_cell_output(cell_index, summary)
-        self._schedule_output_flush(cell_index, attempt)
-        for mime_type, payload in self._structured_payloads(output):
+        structured_payloads = self._structured_payloads(output)
+        if not self._is_hidden_structured_output(output):
+            summary = summarize_output(output)
+            self._buffer_cell_output(cell_index, summary)
+            self._schedule_output_flush(cell_index, attempt)
+        for mime_type, payload in structured_payloads:
             if mime_type == RESOURCE_MIME_TYPE:
                 try:
                     event = ResourceEvent.model_validate(payload)
@@ -832,6 +912,13 @@ class NotebookRunner:
                         )
                     )
         self._request_checkpoint()
+
+    @staticmethod
+    def _is_hidden_structured_output(output: NotebookNode) -> bool:
+        if output.get("output_type") not in {"display_data", "execute_result"}:
+            return False
+        data = cast(dict[str, Any], output.get("data", {}))
+        return bool(data) and set(data).issubset({RESOURCE_MIME_TYPE, EVENT_MIME_TYPE})
 
     def _buffer_cell_output(self, cell_index: int, summary: dict[str, Any]) -> None:
         previous = self._pending_cell_outputs.get(cell_index)
@@ -1026,14 +1113,79 @@ class NotebookRunner:
             await asyncio.sleep(self.settings.checkpoint_interval_seconds)
             await self._checkpoint(force=True)
 
-    async def _checkpoint(self, *, force: bool) -> None:
+    async def _checkpoint(self, *, force: bool, writeback: bool = False) -> None:
         if not force and not self._checkpoint_event.is_set():
             return
         async with self._checkpoint_lock:
             await asyncio.to_thread(
                 self._write_notebook_atomic, self.notebook, self.partial_output_path
             )
+            if writeback:
+                await asyncio.to_thread(self._write_back_notebook)
             self._checkpoint_event.clear()
+
+    def _load_writeback_hash(self) -> str:
+        if not self.writeback_state_path.exists():
+            digest = source_hash(self.notebook_path)
+            self._write_writeback_state(digest)
+            return digest
+        try:
+            payload = json.loads(self.writeback_state_path.read_text(encoding="utf-8"))
+            path = Path(str(payload["notebook_path"])).resolve()
+            digest = str(payload["sha256"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"Invalid Runwatch write-back state: {self.writeback_state_path}"
+            ) from error
+        if path != self.notebook_path:
+            raise RuntimeError(
+                "Runwatch write-back state targets a different notebook: "
+                f"{path} != {self.notebook_path}"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(f"Invalid notebook hash in {self.writeback_state_path}")
+        return digest
+
+    def _write_back_notebook(self) -> None:
+        try:
+            current_hash = source_hash(self.notebook_path)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"Original notebook disappeared during execution: {self.notebook_path}"
+            ) from error
+        if current_hash != self._expected_notebook_hash:
+            checkpoint_hash = source_hash(self.partial_output_path)
+            if current_hash == checkpoint_hash:
+                self._record_writeback_hash(current_hash)
+                return
+            raise RuntimeError(
+                "Original notebook changed outside Runwatch during execution; "
+                f"refusing to overwrite {self.notebook_path}. The executed state "
+                f"is preserved at {self.partial_output_path}."
+            )
+        write_notebook_atomic(self.notebook, self.notebook_path)
+        self._record_writeback_hash(source_hash(self.notebook_path))
+
+    def _record_writeback_hash(self, digest: str) -> None:
+        self._write_writeback_state(digest)
+        self._expected_notebook_hash = digest
+
+    def _write_writeback_state(self, digest: str) -> None:
+        payload = json.dumps(
+            {
+                "notebook_path": str(self.notebook_path),
+                "sha256": digest,
+            },
+            indent=2,
+        )
+        temporary = self.writeback_state_path.with_name(
+            f".{self.writeback_state_path.name}.{uuid4().hex}.tmp"
+        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.writeback_state_path)
 
     @staticmethod
     def _write_notebook_atomic(notebook: NotebookNode, path: Path) -> None:

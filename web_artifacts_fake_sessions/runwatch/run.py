@@ -129,14 +129,18 @@ def main() -> int:
     runtime_root = SESSION_ROOT / ".runtime"
     working_dir = runtime_root / "workspace"
     runs_root = runtime_root / "runs"
-    linked_dashboard_root = working_dir / ".runwatch" / "linked-dashboard"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    replay_id = uuid4().hex
+    linked_dashboard_root = (
+        working_dir / ".runwatch" / "linked-dashboard" / replay_id[:8]
+    )
     working_dir.mkdir(parents=True, exist_ok=True)
     runs_root.mkdir(parents=True, exist_ok=True)
     linked_dashboard_root.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(LINKED_DASHBOARD_PATH, linked_dashboard_root / "index.html")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    replay_id = uuid4().hex
+    replay_notebook_path = runtime_root / f"session-{replay_id[:8]}.ipynb"
+    shutil.copyfile(NOTEBOOK_PATH, replay_notebook_path)
     run_dir = runs_root / f"{timestamp}-{replay_id[:8]}"
     base_command = [
         uv,
@@ -187,7 +191,7 @@ def main() -> int:
                 [
                     *base_command,
                     "validate",
-                    str(NOTEBOOK_PATH),
+                    str(replay_notebook_path),
                     "--config",
                     str(CONFIG_PATH),
                     "--working-dir",
@@ -202,7 +206,7 @@ def main() -> int:
         command = [
             *base_command,
             "execute",
-            str(NOTEBOOK_PATH),
+            str(replay_notebook_path),
             "--config",
             str(CONFIG_PATH),
             "--working-dir",
@@ -236,6 +240,8 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             linked_dashboard.kill()
             linked_dashboard.wait()
+        replay_notebook_path.unlink(missing_ok=True)
+        shutil.rmtree(linked_dashboard_root, ignore_errors=True)
 
 
 def available_port() -> int:

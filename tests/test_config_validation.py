@@ -17,8 +17,13 @@ def test_init_config_is_commented_and_round_trips(tmp_path: Path) -> None:
     dump_default_config(path)
     text = path.read_text(encoding="utf-8")
     assert "# Per-cell execution timeout" in text
+    assert "# Automatically mirror tqdm progress" in text
     assert "# Generic endpoints receive" in text
-    assert load_config(path) == RunwatchConfig()
+    config = load_config(path)
+    assert config == RunwatchConfig()
+    assert config.notebook.capture_tqdm is True
+    assert config.notebook.tqdm_min_interval_seconds == 0.5
+    assert config.server.linger_seconds == 90
 
 
 def test_config_expands_environment_variables(tmp_path: Path, monkeypatch) -> None:
@@ -94,6 +99,11 @@ def test_config_defaults_and_rejects_non_mapping(tmp_path: Path) -> None:
     path.write_text("- not\n- a\n- mapping\n", encoding="utf-8")
     with pytest.raises(ValueError, match="must be a mapping"):
         load_config(path)
+
+
+def test_config_rejects_nonpositive_tqdm_interval() -> None:
+    with pytest.raises(ValueError, match="tqdm_min_interval_seconds"):
+        RunwatchConfig.model_validate({"notebook": {"tqdm_min_interval_seconds": 0}})
 
 
 def test_preflight_collects_notebook_workdir_kernel_resource_and_lan_issues(

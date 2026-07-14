@@ -79,6 +79,74 @@ async def test_failed_cell_can_be_edited_with_nbformat_and_resumed(
     assert supervisor.store.get_action(action_id)["status"] == "completed"  # type: ignore[index]
     executed = nbformat.read(supervisor.output_path, as_version=4)
     assert executed.cells[2].outputs[0].text.strip() == "18"
+    updated = nbformat.read(notebook_path, as_version=4)
+    assert updated.cells[1].source == "y = x + 4"
+    assert updated.cells[2].outputs[0].text.strip() == "18"
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_settled_cell_outputs_are_written_back_before_recovery(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "failure.ipynb"
+    write_notebook(
+        notebook_path,
+        ["print('first')", "raise RuntimeError('stop')"],
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+    await supervisor.start()
+    await asyncio.wait_for(supervisor.runner.wait_until_paused(), timeout=20)
+
+    deadline = asyncio.get_running_loop().time() + 5
+    updated = nbformat.read(notebook_path, as_version=4)
+    while not updated.cells[1].outputs:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Failed-cell output was not written back")
+        await asyncio.sleep(0.05)
+        updated = nbformat.read(notebook_path, as_version=4)
+
+    assert updated.cells[0].outputs[0].text.strip() == "first"
+    assert updated.cells[1].outputs[-1].output_type == "error"
+    assert updated.cells[1].outputs[-1].ename == "RuntimeError"
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_external_notebook_edit_prevents_writeback_and_retains_checkpoint(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "input.ipynb"
+    write_notebook(notebook_path, ["print('runwatch source')"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+    externally_edited = nbformat.read(notebook_path, as_version=4)
+    externally_edited.cells[0].source = "print('external edit')"
+    nbformat.write(externally_edited, notebook_path)
+
+    await supervisor.start()
+    status = await asyncio.wait_for(supervisor.wait(), timeout=20)
+
+    assert status.value == "failed"
+    assert (
+        "refusing to overwrite"
+        in supervisor.store.get_run(supervisor.run_id)["message"]
+    )
+    unchanged = nbformat.read(notebook_path, as_version=4)
+    assert unchanged.cells[0].source == "print('external edit')"
+    checkpoint = nbformat.read(supervisor.partial_output_path, as_version=4)
+    assert checkpoint.cells[0].outputs[0].text.strip() == "runwatch source"
     await supervisor.close()
 
 

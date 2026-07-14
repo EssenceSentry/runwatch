@@ -13,12 +13,16 @@ class FakeSageMaker:
     def __init__(self) -> None:
         self.status = "InProgress"
         self.stop_calls = 0
+        self.processing_resources: Any = None
 
     def describe_processing_job(self, *, ProcessingJobName: str) -> dict[str, Any]:
-        return {
+        description = {
             "ProcessingJobStatus": self.status,
             "ProcessingJobArn": f"arn:aws:sagemaker:::processing-job/{ProcessingJobName}",
         }
+        if self.processing_resources is not None:
+            description["ProcessingResources"] = self.processing_resources
+        return description
 
     def stop_processing_job(self, *, ProcessingJobName: str) -> dict[str, Any]:
         self.stop_calls += 1
@@ -69,6 +73,83 @@ async def test_sagemaker_inspect_logs_and_idempotent_stop(tmp_path: Path) -> Non
     terminal = await adapter.inspect(resource, cursor)
     assert terminal.status is ResourceStatus.STOPPED
     assert fake.sagemaker.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sagemaker_inspect_reports_processing_cluster_scale(
+    tmp_path: Path,
+) -> None:
+    fake = FakeAws()
+    fake.sagemaker.processing_resources = {
+        "ClusterConfig": {
+            "InstanceCount": 4,
+            "InstanceType": "ml.m5.4xlarge",
+            "VolumeSizeInGB": 200,
+        }
+    }
+    adapter = SageMakerProcessingAdapter(
+        aws=fake,  # type: ignore[arg-type]
+        aws_settings=AwsSettings(),
+        working_dir=tmp_path,
+    )
+
+    observation = await adapter.inspect(
+        {
+            "external_id": "job-1",
+            "region": "us-east-1",
+            "metadata": {},
+            "lifecycle": {"retain_logs": False},
+        },
+        {},
+    )
+
+    assert observation.metrics["instance_count"] == 4
+    assert observation.metrics["instance_type"] == "ml.m5.4xlarge"
+    assert observation.metrics["volume_size_gb"] == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("processing_resources", "expected_metrics"),
+    [
+        (None, {}),
+        ({}, {}),
+        ({"ClusterConfig": None}, {}),
+        (
+            {"ClusterConfig": {"InstanceType": "ml.c5.xlarge"}},
+            {"instance_type": "ml.c5.xlarge"},
+        ),
+    ],
+)
+async def test_sagemaker_inspect_tolerates_missing_or_partial_cluster_config(
+    tmp_path: Path,
+    processing_resources: Any,
+    expected_metrics: dict[str, Any],
+) -> None:
+    fake = FakeAws()
+    fake.sagemaker.processing_resources = processing_resources
+    adapter = SageMakerProcessingAdapter(
+        aws=fake,  # type: ignore[arg-type]
+        aws_settings=AwsSettings(),
+        working_dir=tmp_path,
+    )
+
+    observation = await adapter.inspect(
+        {
+            "external_id": "job-1",
+            "metadata": {},
+            "lifecycle": {"retain_logs": False},
+        },
+        {},
+    )
+
+    scale_names = {"instance_count", "instance_type", "volume_size_gb"}
+    actual_metrics = {
+        name: observation.metrics[name]
+        for name in scale_names
+        if name in observation.metrics
+    }
+    assert actual_metrics == expected_metrics
 
 
 @pytest.mark.asyncio

@@ -52,3 +52,22 @@ def test_fake_session_registers_dependency_free_linked_results_dashboard() -> No
     assert "RUNWATCH_SIMULATION_DASHBOARD_URL" in source
     assert "import pandas" not in source
     assert (session_root / "linked_dashboard.html").is_file()
+
+
+def test_fake_session_executes_a_runtime_notebook_copy() -> None:
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "web_artifacts_fake_sessions"
+        / "runwatch"
+        / "run.py"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'replay_notebook_path = runtime_root / f"session-{replay_id[:8]}.ipynb"'
+        in launcher
+    )
+    assert "shutil.copyfile(NOTEBOOK_PATH, replay_notebook_path)" in launcher
+    assert launcher.count("str(replay_notebook_path)") == 2
+    assert "replay_notebook_path.unlink(missing_ok=True)" in launcher
+    assert '"linked-dashboard" / replay_id[:8]' in launcher
+    assert "shutil.rmtree(linked_dashboard_root, ignore_errors=True)" in launcher

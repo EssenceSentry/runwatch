@@ -92,6 +92,34 @@ def test_lock_token_default_directory_and_server_overrides(
     assert config.server.show_qr is False
 
 
+def test_success_cleanup_removes_empty_runwatch_parents(tmp_path: Path) -> None:
+    run_dir = tmp_path / ".runwatch" / "runs" / "successful-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
+    (run_dir / "runwatch.sqlite3").write_bytes(b"state")
+
+    cli._cleanup_successful_run(run_dir, tmp_path)
+
+    assert not run_dir.exists()
+    assert not (tmp_path / ".runwatch").exists()
+
+
+def test_success_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
+    runs_dir = tmp_path / ".runwatch" / "runs"
+    run_dir = runs_dir / "successful-run"
+    retained = runs_dir / "failed-run"
+    run_dir.mkdir(parents=True)
+    retained.mkdir()
+    (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
+    (run_dir / "runwatch.sqlite3").write_bytes(b"state")
+
+    cli._cleanup_successful_run(run_dir, tmp_path)
+
+    assert not run_dir.exists()
+    assert retained.is_dir()
+    assert runs_dir.is_dir()
+
+
 def test_run_lock_is_atomically_published_and_release_is_token_fenced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -211,6 +239,7 @@ async def test_announce_and_run_status_exit_codes(
     class FakeSupervisor:
         def __init__(self, status: RunStatus) -> None:
             self.status = status
+            self.notebook_path = tmp_path / "input.ipynb"
             self.output_path = tmp_path / "out.ipynb"
             self.config = RunwatchConfig.model_validate(
                 {"server": {"linger_seconds": 0}}
@@ -228,6 +257,79 @@ async def test_announce_and_run_status_exit_codes(
     assert await cli._run_and_linger(cast(RunSupervisor, success), start_run=True) == 0
     assert await cli._run_and_linger(cast(RunSupervisor, failed), start_run=True) == 1
     assert success.started and failed.started
+
+
+@pytest.mark.asyncio
+async def test_run_and_linger_uses_default_observation_grace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    slept: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    class FakeSupervisor:
+        notebook_path = tmp_path / "input.ipynb"
+        output_path = tmp_path / "out.ipynb"
+        config = RunwatchConfig()
+
+        async def start(self) -> None:
+            return None
+
+        async def wait(self) -> RunStatus:
+            return RunStatus.SUCCEEDED
+
+    monkeypatch.setattr(cli.asyncio, "sleep", record_sleep)
+
+    result = await cli._run_and_linger(
+        cast(RunSupervisor, FakeSupervisor()), start_run=True
+    )
+
+    assert result == 0
+    assert slept == [90.0]
+    assert (
+        "Dashboard remains available for 90 seconds before closing."
+        in capsys.readouterr().out
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_and_linger_allows_explicit_indefinite_linger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    waited: list[bool] = []
+
+    class ReturningEvent:
+        async def wait(self) -> None:
+            waited.append(True)
+
+    class FakeSupervisor:
+        notebook_path = tmp_path / "input.ipynb"
+        output_path = tmp_path / "out.ipynb"
+        config = RunwatchConfig.model_validate({"server": {"linger_seconds": None}})
+
+        async def start(self) -> None:
+            return None
+
+        async def wait(self) -> RunStatus:
+            return RunStatus.SUCCEEDED
+
+    monkeypatch.setattr(cli.asyncio, "Event", ReturningEvent)
+
+    result = await cli._run_and_linger(
+        cast(RunSupervisor, FakeSupervisor()), start_run=True
+    )
+
+    assert result == 0
+    assert waited == [True]
+    assert (
+        "Dashboard remains available; press Ctrl+C to close it."
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.asyncio
@@ -267,6 +369,64 @@ async def test_serve_releases_lock_when_startup_fails(
     assert supervisor.closed
     assert not held_lock.held
     assert not held_lock.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_serve_writes_back_and_cleans_successful_default_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeServer:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self.started = False
+            self.should_exit = False
+            self.install_signal_handlers: object | None = None
+
+        async def serve(self) -> None:
+            self.started = True
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook, "print('published')")
+    run_dir = tmp_path / ".runwatch" / "runs" / "successful-run"
+    config = RunwatchConfig.model_validate(
+        {
+            "notebook": {
+                "kernel_name": "python3",
+                "wait_for_blocking_resources": False,
+            },
+            "server": {
+                "open_browser": False,
+                "show_qr": False,
+                "linger_seconds": 0,
+            },
+        }
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=run_dir / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        config=config,
+    )
+    server_options: dict[str, object] = {}
+
+    def fake_server_config(*args: object, **kwargs: object) -> object:
+        server_options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli.uvicorn, "Config", fake_server_config)
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+
+    assert await cli._serve(supervisor, start_run=True) == 0
+
+    updated = nbformat.read(notebook, as_version=4)
+    assert updated.cells[0].outputs[0].text.strip() == "published"
+    assert server_options["lifespan"] == "off"
+    assert not run_dir.exists()
+    assert not (tmp_path / ".runwatch").exists()
 
 
 def test_wait_action_completes_and_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -364,6 +524,43 @@ def test_execute_rejects_output_that_aliases_input_before_writing(
     assert "would overwrite" in str(result.exception)
     assert notebook.read_bytes() == original
     assert not run_dir.exists()
+
+
+def test_execute_keep_run_persists_cleanup_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notebook = tmp_path / "input.ipynb"
+    run_dir = tmp_path / "kept-run"
+    _notebook(notebook)
+
+    async def fake_serve(
+        supervisor: RunSupervisor,
+        *,
+        start_run: bool,
+        run_lock: cli.RunLock | None = None,
+    ) -> int:
+        assert start_run
+        assert run_lock is None
+        assert supervisor.cleanup_on_success is False
+        await supervisor.close()
+        return 0
+
+    monkeypatch.setattr(cli, "_serve", fake_serve)
+    result = runner.invoke(
+        cli.app,
+        [
+            "execute",
+            str(notebook),
+            "--run-dir",
+            str(run_dir),
+            "--keep-run",
+            "--no-browser",
+            "--no-qr",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert RunSupervisor.read_manifest(run_dir)["cleanup_on_success"] is False
 
 
 def test_execute_resume_restart_and_open_dispatch(

@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import time
 import webbrowser
 from datetime import datetime, timezone
@@ -198,6 +199,25 @@ def _default_run_dir(working_dir: Path, notebook: Path) -> Path:
     )
 
 
+def _cleanup_successful_run(run_dir: Path, working_dir: Path) -> None:
+    run_dir = run_dir.resolve()
+    required = (run_dir / "run-manifest.json", run_dir / "runwatch.sqlite3")
+    if not run_dir.exists():
+        return
+    if not all(path.is_file() for path in required):
+        raise RuntimeError(
+            f"Refusing to remove unrecognized Runwatch directory {run_dir}"
+        )
+    shutil.rmtree(run_dir)
+
+    runs_root = (working_dir.resolve() / ".runwatch" / "runs").resolve()
+    if run_dir.parent != runs_root:
+        return
+    for path in (runs_root, runs_root.parent):
+        with contextlib.suppress(OSError):
+            path.rmdir()
+
+
 def _override_server(
     config: RunwatchConfig,
     *,
@@ -288,11 +308,16 @@ async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
     status = await supervisor.wait()
     typer.echo(f"\nRun finished with status: {status.value}")
     typer.echo(f"Executed notebook: {supervisor.output_path}")
+    if status is RunStatus.SUCCEEDED:
+        typer.echo(f"Updated notebook: {supervisor.notebook_path}")
     linger = supervisor.config.server.linger_seconds
     if linger is None:
         typer.echo("Dashboard remains available; press Ctrl+C to close it.")
         await asyncio.Event().wait()
     elif linger > 0:
+        typer.echo(
+            f"Dashboard remains available for {linger:g} seconds before closing."
+        )
         await asyncio.sleep(linger)
     return 0 if status is RunStatus.SUCCEEDED else 1
 
@@ -331,6 +356,7 @@ async def _serve(
                 port=config.server.port,
                 log_level="warning",
                 access_log=False,
+                lifespan="off",
             )
         )
         server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
@@ -348,10 +374,19 @@ async def _serve(
             server.should_exit = True
         if server_task is not None:
             await asyncio.gather(server_task, return_exceptions=True)
+        cleanup_successful_run = False
+        if start_run and getattr(supervisor, "cleanup_on_success", True):
+            with contextlib.suppress(Exception):
+                run = supervisor.store.get_run(supervisor.run_id)
+                cleanup_successful_run = RunStatus(run["status"]) is RunStatus.SUCCEEDED
         try:
             await supervisor.close()
         finally:
             lock.release()
+        if cleanup_successful_run:
+            successful_run_dir = supervisor.run_dir
+            _cleanup_successful_run(successful_run_dir, supervisor.working_dir)
+            typer.echo(f"Removed successful Runwatch state: {successful_run_dir}")
 
 
 def _serve_lock(supervisor: RunSupervisor, run_lock: RunLock | None) -> RunLock:
@@ -521,6 +556,13 @@ def execute(
     ] = None,
     browser: Annotated[bool | None, typer.Option("--browser/--no-browser")] = None,
     qr: Annotated[bool | None, typer.Option("--qr/--no-qr")] = None,
+    keep_run: Annotated[
+        bool,
+        typer.Option(
+            "--keep-run",
+            help="Retain successful Runwatch state after the dashboard closes.",
+        ),
+    ] = False,
 ) -> None:
     """Execute NOTEBOOK and expose its durable Runwatch dashboard."""
     loaded = _override_server(
@@ -542,14 +584,18 @@ def execute(
         run_dir=target_run_dir,
         config=loaded,
         name=name,
+        cleanup_on_success=not keep_run,
     )
     try:
         raise typer.Exit(asyncio.run(_serve(supervisor, start_run=True)))
     except KeyboardInterrupt:
-        typer.echo(
-            "\nRunwatch process stopped. Resume with: runwatch resume "
-            + str(target_run_dir)
-        )
+        if target_run_dir.exists():
+            typer.echo(
+                "\nRunwatch process stopped. Resume with: runwatch resume "
+                + str(target_run_dir)
+            )
+        else:
+            typer.echo("\nRunwatch dashboard closed after successful cleanup.")
         raise typer.Exit(130) from None
 
 

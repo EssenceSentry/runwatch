@@ -1,0 +1,8 @@
+notebook:
+  # Refreshed by the VS Code prerequisite task for the active file workspace.
+  kernel_name: runwatch-workspace
+
+notifications:
+  # Keep the private topic in the notebook workspace's ignored .env file.
+  ntfy_base_url: ${RUNWATCH_NTFY_BASE_URL}
+  ntfy_topic: ${RUNWATCH_NTFY_TOPIC}

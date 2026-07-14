@@ -50,6 +50,7 @@ class RunSupervisor:
         reopen: bool = False,
         initial_from_cell: int = 0,
         bootstrap_action_id: str | None = None,
+        cleanup_on_success: bool = True,
     ) -> None:
         self.notebook_path = notebook_path.resolve()
         self.output_path = output_path.resolve()
@@ -59,6 +60,7 @@ class RunSupervisor:
         self.name = name or notebook_path.stem
         self.run_id = run_id or str(uuid4())
         self.initial_from_cell = initial_from_cell
+        self.cleanup_on_success = cleanup_on_success
         self.source_path = self.run_dir / "source.ipynb"
         self.input_snapshot_path = self.run_dir / "input.ipynb"
         self.partial_output_path = self.run_dir / "executed.partial.ipynb"
@@ -109,6 +111,7 @@ class RunSupervisor:
         )
         self.runner = NotebookRunner(
             run_id=self.run_id,
+            notebook_path=self.notebook_path,
             source_path=self.source_path,
             output_path=self.output_path,
             run_dir=self.run_dir,
@@ -175,6 +178,7 @@ class RunSupervisor:
             reopen=True,
             initial_from_cell=from_cell,
             bootstrap_action_id=bootstrap_action_id,
+            cleanup_on_success=bool(manifest.get("cleanup_on_success", True)),
         )
 
     @staticmethod
@@ -200,6 +204,7 @@ class RunSupervisor:
                 "source_path": str(self.source_path),
                 "output_path": str(self.output_path),
                 "working_dir": str(self.working_dir),
+                "cleanup_on_success": self.cleanup_on_success,
                 "config": self.config.model_dump(mode="json"),
             },
             indent=2,

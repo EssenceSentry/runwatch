@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from botocore.exceptions import ClientError
 
@@ -14,6 +14,26 @@ from .cloudwatch_logs import LogStreamDiscovery, discover_log_streams_with_curso
 
 def _iso(value: Any) -> str | None:
     return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _processing_cluster_metrics(description: dict[str, Any]) -> dict[str, Any]:
+    processing_resources = description.get("ProcessingResources")
+    if not isinstance(processing_resources, dict):
+        return {}
+    cluster_config = cast(dict[str, Any], processing_resources).get("ClusterConfig")
+    if not isinstance(cluster_config, dict):
+        return {}
+    typed_cluster_config = cast(dict[str, Any], cluster_config)
+    field_names = {
+        "InstanceCount": "instance_count",
+        "InstanceType": "instance_type",
+        "VolumeSizeInGB": "volume_size_gb",
+    }
+    return {
+        metric_name: typed_cluster_config[field_name]
+        for field_name, metric_name in field_names.items()
+        if typed_cluster_config.get(field_name) is not None
+    }
 
 
 @dataclass(frozen=True)
@@ -84,6 +104,7 @@ class SageMakerProcessingAdapter(ResourceAdapter):
             "log_stream_discovery_truncated": logs.discovery_truncated,
             "log_drain_truncated": logs.drain_truncated,
             "log_pages_read": logs.pages_read,
+            **_processing_cluster_metrics(description),
         }
         message = description.get("FailureReason") or description.get("ExitMessage")
         return ResourceObservation(

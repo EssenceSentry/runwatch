@@ -26,6 +26,10 @@ source changes; use the Runwatch CLI for run transitions and resource control.
    durable documentation.
 6. If Runwatch restarts or prints a replacement pairing URL, give the user the new URL
    and do not reuse the stale one.
+7. Settled cell source and outputs are written back to the notebook passed to
+   `execute`. By default the final dashboard remains observable for 90 seconds, then a
+   successful run directory is removed unless the run was launched with `--keep-run`;
+   failed and recoverable runs are retained.
 
 ## Recover a run
 

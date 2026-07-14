@@ -252,6 +252,8 @@ class NotebookSettings(BaseModel):
     timeout_seconds: int | None = Field(default=None, gt=0)
     startup_timeout_seconds: int = Field(default=60, gt=0)
     checkpoint_interval_seconds: float = Field(default=2.0, gt=0)
+    capture_tqdm: bool = True
+    tqdm_min_interval_seconds: float = Field(default=0.5, gt=0)
     wait_for_blocking_resources: bool = True
     resource_completion_timeout_seconds: float | None = Field(default=None, gt=0)
 
@@ -279,7 +281,7 @@ class ServerSettings(BaseModel):
     open_browser: bool = True
     show_qr: bool = True
     cloudflared_binary: str = "cloudflared"
-    linger_seconds: float | None = Field(default=None, ge=0)
+    linger_seconds: float | None = Field(default=90.0, ge=0)
 
 
 class NotificationSettings(BaseModel):

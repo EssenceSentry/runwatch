@@ -8,6 +8,10 @@ notebook:
   timeout_seconds: null
   startup_timeout_seconds: 60
   checkpoint_interval_seconds: 2.0
+  # Automatically mirror tqdm progress from Python kernels into the dashboard.
+  capture_tqdm: true
+  # Runwatch adds this floor on top of tqdm's own display throttling.
+  tqdm_min_interval_seconds: 0.5
   # Wait for resources explicitly registered as blocking after notebook execution.
   wait_for_blocking_resources: true
   # Recommended for unattended runs; null waits without a deadline.
@@ -35,8 +39,9 @@ server:
   open_browser: true
   show_qr: true
   cloudflared_binary: cloudflared
-  # null keeps the dashboard alive until Ctrl+C; 0 exits immediately after the run.
-  linger_seconds: null
+  # Keep the terminal result visible briefly before automatic close and cleanup.
+  # Set 0 to close immediately, or null to keep the dashboard alive until Ctrl+C.
+  linger_seconds: 90
 
 notifications:
   # Generic endpoints receive {title, message, data} JSON.

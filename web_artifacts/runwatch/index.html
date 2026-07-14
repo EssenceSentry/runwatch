@@ -5,62 +5,122 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#efede8" />
   <title>Runwatch · {{ run_name }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23536de7'/%3E%3Cpath d='M13 34h9l5-13 9 27 6-14h9' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/common/neumorphic-gloss-components.css?v={{ asset_version }}" />
   <link rel="stylesheet" href="/static/runwatch/styles.css?v={{ asset_version }}" />
 </head>
 <body>
   <main class="shell">
     <header class="topbar panel surface">
-      <div>
+      <div class="run-identity">
         <div class="eyebrow">RUNWATCH</div>
         <h1 id="run-name">{{ run_name }}</h1>
         <p id="run-message" class="muted">Loading run state…</p>
       </div>
-      <div class="status-stack">
+      <div class="status-stack" aria-label="Run status">
         <span class="soft-chip connection-chip"><span class="live-dot"></span><span id="connection">CONNECTING</span></span>
         <span id="run-status" class="status status-created">created</span>
-        <span id="elapsed" class="mono muted">—</span>
-        {% if ntfy_enabled %}<a class="soft-button ntfy-button" href="/notifications/ntfy/open"><span>Open ntfy app</span></a>{% endif %}
+        <span class="elapsed-block"><span>Elapsed</span><strong id="elapsed" class="mono">—</strong></span>
+        {% if ntfy_enabled %}
+        <a class="soft-button ntfy-button" href="/notifications/ntfy/open" aria-label="Open ntfy">
+          <span>
+            <!-- Official ntfy terminal-prompt mark from ntfy-splash.svg. -->
+            <svg class="ntfy-logo" viewBox="0 0 50 50" aria-hidden="true" focusable="false">
+              <g transform="translate(-51.451771 -87.327048)">
+                <path d="m59.291677 93.677052c-3.579993 0-6.646873 2.817003-6.646873 6.398338v.003l.03508 27.86677-.899113 6.63475 12.226096-3.24797H94.40052c3.579985 0 6.64687-2.82079 6.64687-6.40216v-24.85449c0-3.580312-3.065184-6.39668-6.643822-6.398338h-.0031zm0 4.516205h35.111944c1.257851.0013 2.12767.916373 2.12767 1.882133v24.85442c0 .9666-.871353 1.88213-2.13072 1.88213H63.344139l-6.211425 1.87679.0633-.36604-.03431-28.2473c0-.966516.870609-1.882133 2.129956-1.882133z" />
+                <g class="ntfy-terminal-prompt" transform="matrix(2.1452134 0 0 2.5503116 -71.247407 -178.388)">
+                  <path d="m62.57046 116.77004v-1.31201l3.280018-1.45904q.158346-.0679.305381-.1018.158346-.0452.282761-.0679.135725-.0113.271449-.0226v-.0905q-.135724-.0113-.271449-.0452-.124415-.0226-.282761-.0566-.147035-.0452-.305381-.1131l-3.280018-1.45904v-1.32332l5.067063 2.31863v1.4138z" />
+                  <path d="M62.308594 110.31055v1.90234l3.4375 1.5293.02148.008-.02148.008-3.4375 1.5293v1.89258l.371093-.16992 5.220704-2.39063v-1.75zm.52539.8164 4.541016 2.08008v1.07617l-4.541016 2.07813v-.73242l3.119141-1.38868.0039-.002c.09141-.0389.178343-.0676.257813-.0859h.0059l.0078-.002c.09483-.0271.176055-.0474.246093-.0606l.498047-.041v-.57422l-.240234-.0195c-.07606-.006-.153294-.0198-.230469-.0391l-.0078-.002-.0078-.002c-.07608-.0138-.16556-.0318-.263672-.0527-.08398-.0262-.172736-.058-.265625-.0977l-.0039-.002-3.119141-1.38868z" />
+                </g>
+                <g class="ntfy-terminal-cursor" transform="matrix(2.1388566 0 0 2.4558588 -69.745456 -170.93962)">
+                  <path d="M69.17132 117.75404h5.428996v1.27808H69.17132z" />
+                  <path d="M68.908203 117.49219v1.80273h5.955078v-1.80273zm.525391.52344h4.904297v.7539h-4.904297z" />
+                </g>
+              </g>
+            </svg>
+            Open ntfy
+          </span>
+        </a>
+        {% endif %}
       </div>
     </header>
 
-    <section class="overview-grid">
-      <article class="panel surface current-card">
-        <div class="card-label">CURRENT EXECUTION</div>
+    <section class="run-overview panel surface" aria-labelledby="current-label">
+      <div class="progress-main">
+        <div class="overview-heading">
+          <div class="card-label">RUN PROGRESS</div>
+          <span id="heartbeat" class="heartbeat"><span class="heartbeat-dot"></span><span id="heartbeat-copy">Waiting for state…</span></span>
+        </div>
         <h2 id="current-label">Starting…</h2>
-        <div id="current-meta" class="mono muted">—</div>
-        <div class="progress-track"><div id="notebook-progress" class="progress-fill"></div></div>
-        <div id="progress-copy" class="progress-copy">0 / 0 cells</div>
-      </article>
-      <article class="panel surface progress-card">
-        <div class="card-label">REPORTED PROGRESS</div>
-        <h2 id="reported-progress">No progress event yet</h2>
-        <div id="reported-message" class="muted">Notebook cells can call runwatch.emit_progress().</div>
-        <div class="progress-track secondary"><div id="reported-progress-fill" class="progress-fill"></div></div>
-      </article>
-      <article class="panel surface metrics-card">
-        <div class="headline-metric"><strong id="resource-active">0</strong><span>active</span></div>
-        <div class="headline-metric"><strong id="resource-failed">0</strong><span>failed</span></div>
-        <div class="headline-metric"><strong id="kernel-epoch">0</strong><span>kernel epoch</span></div>
-      </article>
+        <p id="current-meta" class="muted">Preparing notebook execution.</p>
+        <div class="primary-progress-row">
+          <strong id="reported-progress">No progress reported yet</strong>
+          <span id="reported-percent" class="mono muted"></span>
+        </div>
+        <progress id="reported-progress-bar" class="progress-track" aria-label="Run progress" max="100" value="0"></progress>
+        <div class="progress-context">
+          <span id="reported-message">Waiting for the notebook to report progress.</span>
+          <span id="progress-rate" class="mono"></span>
+        </div>
+        <div class="notebook-progress-row">
+          <span id="progress-copy">0 / 0 code cells</span>
+          <progress id="notebook-progress" class="mini-track" aria-label="Notebook cell progress" max="100" value="0"></progress>
+        </div>
+      </div>
+      <div class="run-signals" aria-label="Run signals">
+        <div class="signal-card">
+          <span>Last update</span>
+          <strong id="last-update">—</strong>
+        </div>
+        <div class="signal-card" id="issues-signal">
+          <span>Needs attention</span>
+          <strong id="issue-count">0</strong>
+        </div>
+        <div class="signal-card">
+          <span>Remote jobs</span>
+          <strong id="remote-count">0</strong>
+        </div>
+      </div>
     </section>
 
-    <section>
+    <section id="attention-section" class="attention-section" hidden aria-labelledby="attention-title">
+      <div class="section-heading compact-heading">
+        <div><div class="card-label">ATTENTION</div><h2 id="attention-title">What needs you</h2></div>
+      </div>
+      <div id="attention-list" class="attention-list"></div>
+    </section>
+
+    <section aria-labelledby="resources-title">
       <div class="section-heading">
-        <div><div class="card-label">OBSERVABILITY</div><h2>Resources</h2></div>
+        <div><div class="card-label">JOBS, OUTPUTS &amp; TOOLS</div><h2 id="resources-title">Resources</h2></div>
         <span id="resource-count" class="muted">0 tracked</span>
       </div>
       <div id="resources" class="resource-grid"></div>
     </section>
 
     <section class="lower-grid">
-      <div>
-        <div class="section-heading"><h2>Notebook</h2><span id="cell-count" class="muted">0 cells</span></div>
-        <div id="cells" class="timeline panel surface"></div>
+      <div class="detail-section">
+        <div class="section-heading">
+          <div><div class="card-label">EXECUTION</div><h2>Notebook</h2></div>
+          <span id="cell-count" class="muted">0 cells</span>
+        </div>
+        <div id="cell-highlights" class="timeline panel surface" aria-label="Relevant notebook cells"></div>
+        <details class="full-timeline panel surface">
+          <summary><span>View full notebook timeline</span><span id="timeline-count" class="muted"></span></summary>
+          <div id="cells" class="timeline timeline-full"></div>
+        </details>
       </div>
-      <div>
-        <div class="section-heading"><h2>Recent activity</h2><span class="muted">durable journal</span></div>
-        <div id="events" class="events panel surface mono"></div>
+
+      <div class="detail-section">
+        <div class="section-heading">
+          <div><div class="card-label">ACTIVITY</div><h2>What changed</h2></div>
+          <span class="muted">latest first</span>
+        </div>
+        <div id="activity" class="activity panel surface" aria-label="Recent meaningful activity"></div>
+        <details class="developer-diagnostics panel surface">
+          <summary><span>Developer diagnostics</span><span class="muted">durable journal</span></summary>
+          <div id="events" class="events mono"></div>
+        </details>
       </div>
     </section>
   </main>
@@ -79,7 +139,7 @@
       </div>
     </form>
   </dialog>
-  <div id="toast" class="toast"><span id="toast-message"></span></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"><span id="toast-message"></span></div>
   <script src="/static/runwatch/app.js?v={{ asset_version }}"></script>
 </body>
 </html>

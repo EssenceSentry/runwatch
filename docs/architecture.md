@@ -3,7 +3,8 @@
 Runwatch is a single local supervisor process with four authority domains:
 
 ```text
-source.ipynb
+user notebook ↔ conflict-guarded cell write-back
+  → source.ipynb
   → NotebookRunner / nbclient / kernel epoch
   → RunSupervisor + durable SQLite actions
   → ResourceManager + typed adapters
@@ -26,6 +27,10 @@ created → starting → running
 
 `input.ipynb` is immutable. `source.ipynb` is a normal, output-free nbformat v4 file
 that humans and agents may edit. The runner owns partial and final executed notebooks.
+At every settled cell boundary it atomically publishes the current executed notebook
+back to the user-owned notebook. A durable hash guard refuses publication when that
+notebook changed outside Runwatch, preserving both the external edit and the partial
+checkpoint.
 
 A cell execution timeout follows the same paused recovery path after Runwatch
 interrupts and synchronizes the kernel. If synchronization cannot be proven, the
@@ -35,6 +40,14 @@ A live resume accepts edits only to the failed and future cells. Structural chan
 edits to an already executed cell require restart. Restart reads the complete source
 notebook and starts a new kernel epoch. Replay begins at zero unless the local operator
 explicitly selects a later start cell.
+
+For Python kernels, each kernel epoch installs optional tqdm instrumentation before the
+first user cell. It wraps tqdm's standard and notebook display frontends without
+replacing their native output. Structured progress uses a Jupyter display ID, so later
+refreshes update one notebook output in place. The runner consumes both initial
+`display_data` and later `update_display_data` messages, validates them through the
+normal progress-event model, and keeps instrumentation failures isolated from notebook
+execution.
 
 ## Durable actions
 
@@ -54,6 +67,13 @@ Notification intents and per-destination delivery attempts also live in SQLite. 
 or failing webhook cannot block another destination, failed deliveries use bounded
 exponential backoff, and an attempt interrupted by process shutdown is retried when the
 run is reopened.
+
+Successful run directories are temporary operational state. The default 90-second
+post-terminal linger keeps the final dashboard state observable before the supervisor
+and store close, the run lock is released, and the CLI removes the successful run
+directory. Empty Runwatch parent directories are removed as well. Paused, failed,
+cancelled, interrupted, write-back-conflicted, and explicitly retained runs remain
+available for inspection or recovery.
 
 ## Resource protocol
 
