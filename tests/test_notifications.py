@@ -1094,6 +1094,7 @@ async def test_terminal_notification_deduplication_includes_kernel_epoch(
     await wait_until(
         lambda: store.notification_event_cursor("run") >= int(duplicate["seq"])
     )
+    await wait_until(lambda: len(sent_notification_events(store)) == 6)
     assert len(requests) == 6
 
     intent_ids = {

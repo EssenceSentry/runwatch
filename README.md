@@ -1,5 +1,10 @@
 # Runwatch
 
+[![quality-gate](https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main)](https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](.pre-commit-config.yaml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Runwatch is `nbclient` on steroids: durable notebook execution, structured AWS and local
 resource monitoring, restart/replay, and a mobile-friendly dashboard. The dashboard is
 observational except for one deliberately narrow remote action: stopping an owned,

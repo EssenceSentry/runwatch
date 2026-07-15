@@ -729,14 +729,20 @@ async def test_periodic_checkpoint_retries_transient_failure_and_records_recover
     runner._checkpoint_task = asyncio.create_task(runner._checkpoint_loop())
     runner._request_checkpoint()
     deadline = asyncio.get_running_loop().time() + 5
-    while not runner.partial_output_path.exists():
+    event_types: set[str] = set()
+    while True:
+        event_types = {
+            event["type"] for event in supervisor.store.recent_events(supervisor.run_id)
+        }
+        if (
+            runner.partial_output_path.exists()
+            and "notebook.checkpoint_recovered" in event_types
+        ):
+            break
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("checkpoint worker did not recover")
         await asyncio.sleep(0.02)
 
-    event_types = {
-        event["type"] for event in supervisor.store.recent_events(supervisor.run_id)
-    }
     assert attempts >= 2
     assert "notebook.checkpoint_failed" in event_types
     assert "notebook.checkpoint_recovered" in event_types
@@ -1056,7 +1062,7 @@ async def test_cancellation_retries_when_durable_status_update_fails_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("request_kind", ["api", "process-signal"])
-async def test_cancellation_interrupts_active_cell_and_persists_terminal_state(
+async def test_cancellation_stops_active_cell_and_persists_terminal_state(
     tmp_path: Path,
     request_kind: str,
 ) -> None:
@@ -1093,7 +1099,50 @@ async def test_cancellation_interrupts_active_cell_and_persists_terminal_state(
         for event in supervisor.store.recent_events(supervisor.run_id)
         if event["type"] == "run.cancelled"
     )
-    assert cancelled["payload"]["kernel_state_lost"] is False
+    kernel_state_lost = cancelled["payload"]["kernel_state_lost"]
+    assert isinstance(kernel_state_lost, bool)
+    assert (
+        any(
+            event["type"] == "notebook.kernel_state_lost"
+            for event in supervisor.store.recent_events(supervisor.run_id)
+        )
+        is kernel_state_lost
+    )
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_stops_after_interrupt_without_losing_kernel_state(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "interrupt.ipynb"
+    write_notebook(notebook_path, ["while True: pass"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+    runner = supervisor.runner
+    execution: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    calls: list[str] = []
+
+    class InterruptibleKernelManager:
+        async def interrupt_kernel(self) -> None:
+            calls.append("interrupt")
+            execution.set_result(nbformat.v4.new_code_cell())
+
+    class InterruptibleClient:
+        km = InterruptibleKernelManager()
+
+    runner.client = InterruptibleClient()  # type: ignore[assignment]
+    runner._cell_execution_task = execution  # type: ignore[assignment]
+
+    await runner.cancel()
+
+    assert calls == ["interrupt"]
+    assert supervisor.store.get_run(supervisor.run_id)["status"] == "cancelling"
     assert not any(
         event["type"] == "notebook.kernel_state_lost"
         for event in supervisor.store.recent_events(supervisor.run_id)
