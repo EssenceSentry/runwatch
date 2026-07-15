@@ -157,13 +157,16 @@ async def test_lan_proxy_authenticates_and_does_not_leak_runwatch_credentials(
             f"{public_base}/hello?token=pairing-secret&keep=yes",
             headers={"authorization": "Bearer pairing-secret"},
         )
-        forwarded = await client.get(f"{public_base}{paired.headers['location']}")
+        forwarded = await client.get(f"{public_base}/hello?keep=yes")
         redirected = await client.get(f"{public_base}/redirect")
 
     assert unauthorized.status_code == 401
-    assert paired.status_code == 303
-    assert paired.headers["location"] == "/hello?keep=yes"
+    assert paired.status_code == 200
+    assert 'window.location.replace("/hello?keep=yes")' in paired.text
+    assert "pairing-secret" not in paired.text
     assert "runwatch_access=pairing-secret" in paired.headers["set-cookie"]
+    assert paired.headers["cache-control"] == "no-store"
+    assert paired.headers["referrer-policy"] == "no-referrer"
     assert forwarded.status_code == 200
     assert all(
         "Domain=" not in value for value in forwarded.headers.get_list("set-cookie")

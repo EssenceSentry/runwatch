@@ -8,6 +8,8 @@ multi-user service.
 - Per-run directories are restricted to the current user (`0700`), and new run-state
   files, lock records, manifests, tokens, and the SQLite database use mode `0600`.
   Original-notebook write-back preserves the notebook's existing mode.
+- Local Jupyter manager-to-kernel channels require CurveZMQ encryption. Kernel
+  startup fails closed when the selected kernelspec does not advertise Curve support.
 - Random pairing token created atomically with `0600` permissions and validated before
   reuse.
 - Token exchange for an `HttpOnly`, `SameSite=Strict` cookie.

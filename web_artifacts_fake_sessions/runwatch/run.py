@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from socket import socket
@@ -118,6 +121,57 @@ def parse_args() -> argparse.Namespace:
         help="Skip Runwatch preflight validation before replaying.",
     )
     return parser.parse_args()
+
+
+def run_replay(command: list[str], environment: dict[str, str]) -> int:
+    """Run the replay in its own process group and forward terminal signals."""
+
+    replay = subprocess.Popen(  # noqa: S603
+        command,
+        env=environment,
+        start_new_session=True,
+    )
+    forwarded_signal: signal.Signals | None = None
+    forwarded_at = 0.0
+    force_stop = False
+    previous_handlers: dict[signal.Signals, signal.Handlers] = {}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal force_stop, forwarded_at, forwarded_signal
+        received = signal.Signals(signum)
+        if forwarded_signal is None:
+            forwarded_signal = received
+            forwarded_at = time.monotonic()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(replay.pid, received)
+            return
+        force_stop = True
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)  # type: ignore
+        signal.signal(signum, forward_signal)
+
+    try:
+        while True:
+            try:
+                return int(replay.wait(timeout=0.25))
+            except subprocess.TimeoutExpired:
+                if forwarded_signal is None:
+                    continue
+                if not force_stop and time.monotonic() - forwarded_at < 30:
+                    continue
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(replay.pid, signal.SIGTERM)
+                try:
+                    replay.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(replay.pid, signal.SIGKILL)
+                    replay.wait()
+                return 128 + int(forwarded_signal)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def main() -> int:
@@ -230,8 +284,7 @@ def main() -> int:
             "Linked dashboard: open it from the Runwatch resource card",
             flush=True,
         )
-        replay = subprocess.run(command, check=False, env=environment)  # noqa: S603
-        return int(replay.returncode)
+        return run_replay(command, environment)
     except KeyboardInterrupt:
         return 130
     finally:

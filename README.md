@@ -459,6 +459,10 @@ conditional S3 and local-file monitors require a concrete terminal condition; an
 
 ## Sharing and security
 
+Runwatch requires CurveZMQ encryption for the local Jupyter manager-to-kernel
+channels and fails kernel startup rather than falling back to plaintext TCP. The
+kernel must advertise Curve support; IPython kernels require `ipykernel>=7.3`.
+
 Localhost is the default. For a trusted LAN:
 
 ```bash

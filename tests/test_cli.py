@@ -383,6 +383,30 @@ async def test_announce_and_run_status_exit_codes(
 
 
 @pytest.mark.asyncio
+async def test_serve_signal_requests_process_stop_and_uses_shell_exit_code(
+    tmp_path: Path,
+) -> None:
+    cancellation_started = asyncio.Event()
+
+    class FakeRunner:
+        def request_process_stop(self) -> asyncio.Task[None]:
+            async def cancel() -> None:
+                cancellation_started.set()
+
+            return asyncio.create_task(cancel())
+
+    supervisor = SimpleNamespace(runner=FakeRunner(), run_dir=tmp_path)
+    stop = cli._ServeSignalState(cast(RunSupervisor, supervisor), start_run=True)
+
+    stop.request(cli.signal.SIGINT)
+    await stop.wait_for_cancellation()
+
+    assert stop.event.is_set()
+    assert stop.exit_code == 130
+    assert cancellation_started.is_set()
+
+
+@pytest.mark.asyncio
 async def test_run_and_linger_uses_default_observation_grace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -571,13 +595,20 @@ async def test_serve_stops_work_when_server_crashes_after_startup(
         def attach_dashboard_links(self, manager: object) -> None:
             return None
 
+        async def start(self) -> None:
+            return None
+
     work_started = asyncio.Event()
     work_cancelled = asyncio.Event()
     finish_called = asyncio.Event()
 
     async def wait_for_server_failure(
-        supervisor: RunSupervisor, *, start_run: bool
+        supervisor: RunSupervisor,
+        *,
+        start_run: bool,
+        stop: cli._ServeSignalState | None = None,
     ) -> int:
+        del supervisor, start_run, stop
         work_started.set()
         try:
             await asyncio.Event().wait()
@@ -806,7 +837,13 @@ async def test_success_cleanup_retains_state_when_terminal_notification_is_pendi
         transport=httpx.MockTransport(slow_handler)
     )
 
-    async def finish_without_kernel(active: RunSupervisor, *, start_run: bool) -> int:
+    async def finish_without_kernel(
+        active: RunSupervisor,
+        *,
+        start_run: bool,
+        stop: cli._ServeSignalState | None = None,
+    ) -> int:
+        del stop
         assert start_run
         await active.notifications.start()
         event = active.store.finish_run(

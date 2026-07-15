@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
+import json
 import re
 import socket
 from collections.abc import AsyncGenerator, Callable
@@ -253,16 +255,42 @@ class _DashboardProxy:
             )
         query = _query_without_token(request.query_params.multi_items())
         if _valid_token(query_token, self.access_token):
-            return self._pairing_redirect(request, query)
+            return self._pairing_landing(request, query)
         return await self._forward_http(request, path, query)
 
-    def _pairing_redirect(
+    def _pairing_landing(
         self, request: Request, query: list[tuple[str, str]]
-    ) -> RedirectResponse:
+    ) -> HTMLResponse:
         clean_location = urlunsplit(
             ("", "", request.url.path or "/", urlencode(query, doseq=True), "")
         )
-        response = RedirectResponse(clean_location, status_code=303)
+        location_json = (
+            json.dumps(clean_location)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
+        escaped_location = html.escape(clean_location, quote=True)
+        response = HTMLResponse(
+            (
+                '<!doctype html><html><head><meta charset="utf-8">'
+                '<meta name="referrer" content="no-referrer">'
+                "<title>Opening linked dashboard</title></head><body>"
+                f"<script>window.location.replace({location_json});</script>"
+                "<noscript><p>Pairing complete. "
+                f'<a href="{escaped_location}">Continue to the dashboard</a>.'
+                "</p></noscript></body></html>"
+            ),
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "base-uri 'none'; frame-ancestors 'none'"
+                ),
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
         _set_access_cookie(response, self.access_token, secure=self.secure_cookie)
         return response
 

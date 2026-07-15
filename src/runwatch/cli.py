@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import socket
 import time
 import webbrowser
@@ -418,6 +419,49 @@ async def _wait_for_server(server: uvicorn.Server, task: asyncio.Task[Any]) -> N
         await asyncio.sleep(0.05)
 
 
+class _ServeSignalState:
+    """Coordinate process signals with a served Runwatch lifecycle."""
+
+    def __init__(self, supervisor: RunSupervisor, *, start_run: bool) -> None:
+        self.supervisor = supervisor
+        self.start_run = start_run
+        self.event = asyncio.Event()
+        self.signum: int | None = None
+        self._cancel_task: asyncio.Task[None] | None = None
+        self._installed: list[signal.Signals] = []
+
+    @property
+    def exit_code(self) -> int:
+        return 128 + (self.signum or int(signal.SIGINT))
+
+    def install(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signum, self.request, signum)
+            except (NotImplementedError, RuntimeError):
+                continue
+            self._installed.append(signum)
+
+    def request(self, signum: signal.Signals) -> None:
+        if self.signum is not None:
+            return
+        self.signum = int(signum)
+        self.event.set()
+        if self.start_run:
+            self._cancel_task = self.supervisor.runner.request_process_stop()
+
+    async def wait_for_cancellation(self) -> None:
+        if self._cancel_task is not None:
+            await self._cancel_task
+
+    def uninstall(self) -> None:
+        loop = asyncio.get_running_loop()
+        for signum in self._installed:
+            loop.remove_signal_handler(signum)
+        self._installed.clear()
+
+
 async def _run_while_server_available(
     supervisor: RunSupervisor,
     *,
@@ -426,24 +470,38 @@ async def _run_while_server_available(
 ) -> int:
     """Run execute/open work only while the dashboard server remains available."""
 
+    stop = _ServeSignalState(supervisor, start_run=start_run)
+    stop.install()
     work_task = asyncio.create_task(
-        _run_and_linger(supervisor, start_run=start_run),
+        _run_and_linger(
+            supervisor,
+            start_run=start_run,
+            stop=stop,
+        ),
         name="runwatch-run-and-linger",
     )
+    stop_task = asyncio.create_task(stop.event.wait(), name="runwatch-process-signal")
     try:
         completed, _pending = await asyncio.wait(
-            {server_task, work_task}, return_when=asyncio.FIRST_COMPLETED
+            {server_task, work_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
         )
         if server_task in completed:
             error = None if server_task.cancelled() else server_task.exception()
             if error is not None:
                 raise RuntimeError("Runwatch web server exited unexpectedly") from error
             raise RuntimeError("Runwatch web server exited unexpectedly")
+        if stop_task in completed:
+            await stop.wait_for_cancellation()
         return await work_task
     finally:
+        stop.uninstall()
         if not work_task.done():
             work_task.cancel()
-        await asyncio.gather(work_task, return_exceptions=True)
+        if not stop_task.done():
+            stop_task.cancel()
+        await asyncio.gather(work_task, stop_task, return_exceptions=True)
+        await stop.wait_for_cancellation()
 
 
 async def _dashboard_base(
@@ -469,17 +527,27 @@ def _announce_run(supervisor: RunSupervisor, pairing_url: str) -> None:
         webbrowser.open(pairing_url)
 
 
-async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
+async def _run_and_linger(
+    supervisor: RunSupervisor,
+    *,
+    start_run: bool,
+    stop: _ServeSignalState | None = None,
+) -> int:
     if not start_run:
         await supervisor.notifications.start()
-        await asyncio.Event().wait()
-        return 0
+        if stop is None:
+            await asyncio.Event().wait()
+            return 0
+        await stop.event.wait()
+        return stop.exit_code
     await supervisor.start()
     status = await supervisor.wait()
     typer.echo(f"\nRun finished with status: {status.value}")
     typer.echo(f"Executed notebook: {supervisor.output_path}")
     if status is RunStatus.SUCCEEDED:
         typer.echo(f"Updated notebook: {supervisor.notebook_path}")
+    if stop is not None and stop.event.is_set():
+        return stop.exit_code
     linger = supervisor.config.server.linger_seconds
     if linger is None:
         typer.echo("Dashboard remains available; press Ctrl+C to close it.")
@@ -487,12 +555,21 @@ async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
         typer.echo(
             f"Dashboard remains available for {linger:g} seconds before closing."
         )
-    await _linger_while_action_loop_healthy(supervisor, linger)
+    await _linger_while_action_loop_healthy(
+        supervisor,
+        linger,
+        stop_event=stop.event if stop is not None else None,
+    )
+    if stop is not None and stop.event.is_set():
+        return stop.exit_code
     return 0 if status is RunStatus.SUCCEEDED else 1
 
 
 async def _linger_while_action_loop_healthy(
-    supervisor: RunSupervisor, linger_seconds: float | None
+    supervisor: RunSupervisor,
+    linger_seconds: float | None,
+    *,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     if linger_seconds is not None and linger_seconds <= 0:
         return
@@ -508,19 +585,28 @@ async def _linger_while_action_loop_healthy(
         supervisor.wait_for_action_loop_failure(),
         name="runwatch-action-loop-health",
     )
+    stop_task = (
+        asyncio.create_task(stop_event.wait(), name="runwatch-linger-process-signal")
+        if stop_event is not None
+        else None
+    )
+    wait_tasks: set[asyncio.Task[Any]] = {linger_task, health_task}
+    if stop_task is not None:
+        wait_tasks.add(stop_task)
     try:
         completed, _pending = await asyncio.wait(
-            {linger_task, health_task}, return_when=asyncio.FIRST_COMPLETED
+            wait_tasks, return_when=asyncio.FIRST_COMPLETED
         )
         if health_task in completed:
             await health_task
             raise RuntimeError("Runwatch action-loop health waiter exited unexpectedly")
-        await linger_task
+        if linger_task in completed:
+            await linger_task
     finally:
-        for task in (health_task, linger_task):
+        for task in wait_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(health_task, linger_task, return_exceptions=True)
+        await asyncio.gather(*wait_tasks, return_exceptions=True)
 
 
 async def _successful_cleanup_decision(

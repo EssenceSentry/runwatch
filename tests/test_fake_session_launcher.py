@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -43,6 +44,17 @@ def test_fake_session_supports_local_only_replay(monkeypatch) -> None:
     assert args.ntfy is False
 
 
+def test_vscode_active_notebook_task_uses_cloudflared() -> None:
+    tasks_path = Path(__file__).resolve().parents[1] / ".vscode" / "tasks.json"
+    tasks = json.loads(tasks_path.read_text(encoding="utf-8"))["tasks"]
+    active_notebook = next(
+        task for task in tasks if task["label"] == "notebook: run active notebook"
+    )
+
+    share_index = active_notebook["args"].index("--share")
+    assert active_notebook["args"][share_index + 1] == "cloudflared"
+
+
 def test_fake_session_registers_dependency_free_linked_results_dashboard() -> None:
     session_root = (
         Path(__file__).resolve().parents[1] / "web_artifacts_fake_sessions" / "runwatch"
@@ -74,3 +86,59 @@ def test_fake_session_executes_a_runtime_notebook_copy() -> None:
     assert '"linked-dashboard" / replay_id[:8]' in launcher
     assert "shutil.rmtree(linked_dashboard_root, ignore_errors=True)" in launcher
     assert 'environment["RUNWATCH_MASCOT_SHOWCASE"] = "1"' in launcher
+
+
+def test_fake_session_forwards_interrupt_and_waits_for_replay(monkeypatch) -> None:
+    launcher = _load_launcher()
+    handlers: dict[object, object] = {
+        launcher.signal.SIGINT: launcher.signal.SIG_DFL,
+        launcher.signal.SIGTERM: launcher.signal.SIG_DFL,
+    }
+    popen_options: dict[str, object] = {}
+    forwarded: list[tuple[int, object]] = []
+
+    class FakeReplay:
+        pid = 4242
+        wait_calls = 0
+
+        def wait(self, timeout=None) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                handler = handlers[launcher.signal.SIGINT]
+                assert callable(handler)
+                handler(int(launcher.signal.SIGINT), None)
+                raise launcher.subprocess.TimeoutExpired("runwatch", timeout)
+            return 130
+
+    replay = FakeReplay()
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeReplay:
+        popen_options["command"] = command
+        popen_options.update(kwargs)
+        return replay
+
+    def get_handler(signum: object) -> object:
+        return handlers[signum]
+
+    def set_handler(signum: object, handler: object) -> object:
+        previous = handlers[signum]
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+
+    def record_forward(pid: int, signum: object) -> None:
+        forwarded.append((pid, signum))
+
+    monkeypatch.setattr(launcher.signal, "getsignal", get_handler)
+    monkeypatch.setattr(launcher.signal, "signal", set_handler)
+    monkeypatch.setattr(launcher.os, "killpg", record_forward)
+
+    result = launcher.run_replay(["runwatch", "execute"], {"DEMO": "1"})
+
+    assert result == 130
+    assert popen_options["start_new_session"] is True
+    assert popen_options["env"] == {"DEMO": "1"}
+    assert forwarded == [(replay.pid, launcher.signal.SIGINT)]
+    assert handlers[launcher.signal.SIGINT] is launcher.signal.SIG_DFL
+    assert handlers[launcher.signal.SIGTERM] is launcher.signal.SIG_DFL

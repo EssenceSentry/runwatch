@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hashlib
 import inspect
 import json
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 import nbformat
+from jupyter_client.connect import KernelConnectionInfo
+from jupyter_client.manager import AsyncKernelManager
 from nbclient import NotebookClient
 from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
-from nbclient.util import run_sync
+from nbclient.util import run_hook, run_sync
 from nbformat import NotebookNode
+from traitlets.config import Config
 
 from ._fs import atomic_write_bytes
 from ._tqdm import tqdm_bootstrap_code
@@ -175,6 +180,26 @@ def summarize_output(output: NotebookNode, *, max_chars: int = 6_000) -> dict[st
     }
 
 
+class _CurveAsyncKernelManager(AsyncKernelManager):
+    """Create clients with the binary Curve keys expected by pyzmq.
+
+    jupyter_client 8.9 serializes these keys as text in connection dictionaries,
+    while its kernel client traits still require bytes. Keep the compatibility
+    conversion at the manager boundary until the upstream types and behavior agree.
+    """
+
+    def get_connection_info(self, session: bool = False) -> KernelConnectionInfo:
+        info = super().get_connection_info(session=session)
+        if not session:
+            return info
+        client_info = cast(dict[str, Any], info)
+        for name in ("curve_publickey", "curve_secretkey"):
+            value = client_info.get(name)
+            if isinstance(value, str):
+                client_info[name] = value.encode("ascii")
+        return info
+
+
 class MonitoredNotebookClient(NotebookClient):
     def __init__(
         self,
@@ -187,6 +212,37 @@ class MonitoredNotebookClient(NotebookClient):
         self.current_attempt = 0
         self._output_poll_task: asyncio.Task[None] | None = None
         self._kernel_cleanup_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def async_setup_kernel(self, **kwargs: Any) -> AsyncGenerator[None]:
+        """Own kernel cleanup without nbclient's competing process signals.
+
+        Runwatch coordinates SIGINT and SIGTERM at the supervisor boundary so an
+        active cell can settle before its ZeroMQ channels are closed.  nbclient's
+        default context manager installs handlers that start cleanup immediately,
+        which can race an in-flight execute reply.
+        """
+
+        cleanup_kc = kwargs.pop("cleanup_kc", self.owns_km)
+        if self.km is None:
+            self.km = self.create_kernel_manager()
+
+        atexit.register(self._cleanup_kernel)
+        if not self.km.has_kernel:
+            await self.async_start_new_kernel(**kwargs)
+        if self.kc is None:
+            await self.async_start_new_kernel_client()
+
+        try:
+            yield
+        except RuntimeError:
+            await run_hook(self.on_notebook_error, notebook=self.nb)
+            raise
+        finally:
+            if cleanup_kc:
+                await self._async_cleanup_kernel()
+            await run_hook(self.on_notebook_complete, notebook=self.nb)
+            atexit.unregister(self._cleanup_kernel)
 
     async def _async_cleanup_kernel(self) -> None:
         """Serialize signal and context-manager cleanup of the owned kernel."""
@@ -333,6 +389,8 @@ class NotebookRunner:
         self._cancel_requested = asyncio.Event()
         self._cancel_lock = asyncio.Lock()
         self._cancel_escalation_task: asyncio.Task[None] | None = None
+        self._process_stop_task: asyncio.Task[None] | None = None
+        self._process_stop_requested = asyncio.Event()
         self._cancel_command_enqueued = False
         self._cancel_abandon_execution = asyncio.Event()
         self._running_cell = False
@@ -371,11 +429,29 @@ class NotebookRunner:
         async with self._cancel_lock:
             escalation = self._cancel_escalation_task
             self._cancel_escalation_task = None
-        if escalation is None or escalation is asyncio.current_task():
-            return
-        if not escalation.done():
-            escalation.cancel()
-        await asyncio.gather(escalation, return_exceptions=True)
+        if escalation is not None and escalation is not asyncio.current_task():
+            if not escalation.done():
+                escalation.cancel()
+            await asyncio.gather(escalation, return_exceptions=True)
+        process_stop = self._process_stop_task
+        if process_stop is not None and process_stop is not asyncio.current_task():
+            await asyncio.gather(process_stop, return_exceptions=True)
+
+    @property
+    def process_stop_requested(self) -> bool:
+        return self._process_stop_requested.is_set()
+
+    def request_process_stop(self) -> asyncio.Task[None]:
+        """Convert a process signal into Runwatch's durable cancellation flow."""
+
+        self._process_stop_requested.set()
+        current = self._process_stop_task
+        if current is None or current.done():
+            current = asyncio.create_task(
+                self.cancel(), name=f"process-stop:{self.run_id}"
+            )
+            self._process_stop_task = current
+        return current
 
     def _cell_execution_active(self) -> bool:
         execution = self._cell_execution_task
@@ -1015,6 +1091,11 @@ class NotebookRunner:
         self._kernel_dead = (
             isinstance(error, DeadKernelError) or not timeout_synchronized
         )
+        if (
+            self._process_stop_requested.is_set()
+            and not self._cancel_requested.is_set()
+        ):
+            await self.cancel()
         if self._cancel_requested.is_set():
             await self._record_interrupted_cell(
                 index,
@@ -1515,6 +1596,8 @@ class NotebookRunner:
             "allow_errors": False,
             "record_timing": True,
             "store_widget_state": True,
+            "config": Config({"KernelManager": {"transport_encryption": "required"}}),
+            "kernel_manager_class": _CurveAsyncKernelManager,
         }
         if self.settings.kernel_name:
             kwargs["kernel_name"] = self.settings.kernel_name

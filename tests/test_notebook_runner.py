@@ -53,6 +53,39 @@ def config() -> RunwatchConfig:
     )
 
 
+def test_curve_kernel_manager_supplies_binary_client_keys() -> None:
+    manager = notebook_module._CurveAsyncKernelManager()
+    manager.curve_publickey = b"public"
+    manager.curve_secretkey = b"secret"
+
+    client = manager.client()
+
+    assert client.curve_publickey == b"public"
+    assert client.curve_secretkey == b"secret"
+
+
+@pytest.mark.asyncio
+async def test_notebook_runner_requires_curve_transport(tmp_path: Path) -> None:
+    notebook_path = tmp_path / "encrypted.ipynb"
+    write_notebook(notebook_path, ["print('encrypted')"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+
+    try:
+        client = supervisor.runner._make_client()
+        manager = client.create_kernel_manager()
+
+        assert isinstance(manager, notebook_module._CurveAsyncKernelManager)
+        assert manager.trait_values()["transport_encryption"] == "required"
+    finally:
+        await supervisor.close()
+
+
 def timeout_config() -> RunwatchConfig:
     return RunwatchConfig(
         notebook=NotebookSettings(
@@ -115,6 +148,39 @@ async def test_monitored_client_serializes_concurrent_kernel_cleanup(
 
     assert cleanup_calls == 1
     assert client.km is None
+
+
+@pytest.mark.asyncio
+async def test_monitored_client_leaves_process_signal_handling_to_runwatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_handlers: list[int] = []
+
+    class FakeProvisioner:
+        has_process = True
+
+    def ignore_output(_output: Any, _cell_index: int, _attempt: int) -> None:
+        return
+
+    manager = AsyncKernelManager()
+    manager.provisioner = FakeProvisioner()  # type: ignore[assignment]
+    client = notebook_module.MonitoredNotebookClient(
+        nbformat.v4.new_notebook(),
+        km=manager,
+        output_callback=ignore_output,
+    )
+    client.kc = object()  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+
+    def record_signal_handler(signum: int, *_args: Any) -> None:
+        signal_handlers.append(signum)
+
+    monkeypatch.setattr(loop, "add_signal_handler", record_signal_handler)
+
+    async with client.async_setup_kernel(cleanup_kc=False):
+        pass
+
+    assert signal_handlers == []
 
 
 def immediate_cancel_config() -> RunwatchConfig:
@@ -989,8 +1055,10 @@ async def test_cancellation_retries_when_durable_status_update_fails_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_kind", ["api", "process-signal"])
 async def test_cancellation_interrupts_active_cell_and_persists_terminal_state(
     tmp_path: Path,
+    request_kind: str,
 ) -> None:
     notebook_path = tmp_path / "active.ipynb"
     write_notebook(notebook_path, ["import time\ntime.sleep(60)"])
@@ -1008,7 +1076,12 @@ async def test_cancellation_interrupts_active_cell_and_persists_terminal_state(
             raise AssertionError("notebook cell did not start")
         await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(supervisor.runner.cancel(), timeout=20)
+    if request_kind == "process-signal":
+        cancellation = supervisor.runner.request_process_stop()
+        assert supervisor.runner.process_stop_requested
+    else:
+        cancellation = asyncio.create_task(supervisor.runner.cancel())
+    await asyncio.wait_for(cancellation, timeout=20)
     status = await asyncio.wait_for(supervisor.wait(), timeout=20)
 
     assert status.value == "cancelled"
