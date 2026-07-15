@@ -21,6 +21,17 @@ multi-user service.
 - SSE carries only an event sequence, timestamp, and type as an invalidation signal.
   Dashboard documents, snapshots, SSE, and authenticated redirects use
   `Cache-Control: no-store`.
+- The full notebook snapshot is a separate authenticated view, not part of the bounded
+  dashboard state API. Rendering is content-digest cached in memory, input and output
+  sizes are bounded, and the parent page binds its metadata and iframe to the same
+  saved generation.
+- Rendered notebooks are sanitized and stripped of scripts, frames, forms, remote
+  media, navigation targets, event handlers, raw cells, widget state, and
+  JavaScript-only output bundles. The child response additionally uses an iframe
+  sandbox and a route-specific CSP that disables scripts, connections, forms, objects,
+  and child frames. It grants `allow-same-origin` without `allow-scripts` only so the
+  trusted parent can observe downward scrolling and collapse the mobile metadata
+  header; it grants no form, navigation, popup, download, or modal capability.
 - The dashboard has one mutation: stop an exclusive, adapter-stoppable resource.
 - Detailed stop confirmation includes the cascading cancellation scope.
 - Optimistic resource versions reject stale stop confirmations.
@@ -74,6 +85,10 @@ multi-user service.
   An authenticated dashboard intentionally displays bounded notebook output,
   tracebacks, resource identifiers and metrics, and log tails. That user-controlled
   text can itself contain paths, secrets, or other sensitive values.
+- The notebook snapshot intentionally exposes the complete saved notebook source and
+  outputs to the paired browser. Sanitization prevents active browser behavior; it is
+  not secret detection or redaction. Source, text, tables, images, tracebacks, and
+  rendered output may contain credentials or sensitive data.
 - LAN mode is plain HTTP; a quick tunnel is transport, not complete identity.
 - There is no user identity, role separation, token-revocation UI, explicit CSRF token,
   rate limiting, or tamper-resistant audit.

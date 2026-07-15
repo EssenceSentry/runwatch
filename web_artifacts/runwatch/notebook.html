@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#efede8" />
+  <title>Notebook snapshot · {{ run_name }}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23536de7'/%3E%3Cpath d='M13 34h9l5-13 9 27 6-14h9' fill='none' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/common/neumorphic-gloss-components.css?v={{ asset_version }}" />
+  <link rel="stylesheet" href="/static/runwatch/styles.css?v={{ asset_version }}" />
+</head>
+<body class="notebook-snapshot-page">
+  <main class="snapshot-shell">
+    <header id="snapshot-toolbar" class="snapshot-toolbar panel surface">
+      <details id="snapshot-disclosure" class="snapshot-disclosure" open>
+        <summary class="snapshot-summary">
+          <span class="snapshot-summary-copy">
+            <span class="eyebrow">RUNWATCH · READ-ONLY</span>
+            <span class="snapshot-title">{{ run_name }}</span>
+          </span>
+          <span class="snapshot-summary-controls">
+            {% if snapshot.available %}
+            <span class="status status-{{ snapshot.kind }}">{{ snapshot.kind | replace('_', ' ') | title }}</span>
+            {% endif %}
+            <span class="snapshot-details-label">Details</span>
+            <svg class="snapshot-chevron" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="m5 7.5 5 5 5-5" />
+            </svg>
+          </span>
+        </summary>
+        <div class="snapshot-details">
+        {% if snapshot.available %}
+        <p class="snapshot-freshness">
+          <span>{{ snapshot.settled_code_cells }} of {{ snapshot.code_cell_count }} code cells settled</span>
+          <span>Saved <time datetime="{{ snapshot.updated_at }}">{{ snapshot.updated_at }}</time></span>
+        </p>
+        {% else %}
+        <p class="muted">{{ error_message }}</p>
+        {% endif %}
+        {% if snapshot.current_cell_incomplete %}
+        <p class="snapshot-warning">Notebook cell {{ snapshot.current_cell_number }} is still in progress; this view stops at the latest durable save.</p>
+        {% endif %}
+        <p class="snapshot-refresh-hint">Refresh this page—or pull down on mobile—to load the latest durable save.</p>
+        </div>
+      </details>
+      <nav class="snapshot-actions" aria-label="Notebook snapshot actions">
+        <a class="soft-button" href="/"><span>Back to dashboard</span></a>
+      </nav>
+    </header>
+
+    {% if snapshot.available %}
+    <section class="snapshot-frame-panel panel surface" aria-label="Rendered notebook">
+      <iframe
+        class="snapshot-frame"
+        src="{{ content_href }}"
+        title="Read-only rendered notebook for {{ run_name }}"
+        sandbox="allow-same-origin"
+        referrerpolicy="no-referrer"
+      ></iframe>
+    </section>
+    {% else %}
+    <section class="snapshot-unavailable panel surface">
+      <div class="card-label">SNAPSHOT UNAVAILABLE</div>
+      <h2>{{ error_message }}</h2>
+      <p>The source or latest saved checkpoint may still be appearing. Use your browser's refresh control to try again.</p>
+    </section>
+    {% endif %}
+  </main>
+  <script src="/static/runwatch/notebook.js?v={{ asset_version }}"></script>
+</body>
+</html>

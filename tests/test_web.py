@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +164,207 @@ def test_dashboard_auth_and_reduced_remote_surface(
     supervisor.store.close()
 
 
+def test_notebook_snapshot_is_paired_sandboxed_and_not_cacheable(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "visible.ipynb"
+    nbformat.write(
+        nbformat.v4.new_notebook(
+            cells=[
+                nbformat.v4.new_markdown_cell("# Snapshot heading"),
+                nbformat.v4.new_code_cell(
+                    "print('hello')",
+                    outputs=[nbformat.v4.new_output("stream", text="saved output\n")],
+                ),
+            ]
+        ),
+        notebook_path,
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+    nbformat.write(
+        nbformat.v4.new_notebook(
+            cells=[
+                nbformat.v4.new_markdown_cell("# Snapshot heading"),
+                nbformat.v4.new_code_cell(
+                    "print('hello')",
+                    outputs=[nbformat.v4.new_output("stream", text="saved output\n")],
+                ),
+            ]
+        ),
+        supervisor.partial_output_path,
+    )
+    supervisor.store.update_run_status(
+        supervisor.run_id,
+        RunStatus.RUNNING,
+        current_cell_index=1,
+        started=True,
+    )
+    supervisor.store.begin_cell_attempt(
+        supervisor.run_id,
+        1,
+        "print('hello')",
+        "source-digest",
+        0,
+    )
+    app = create_app(supervisor, "secret-token")
+    client = TestClient(app)
+
+    assert client.get("/notebook").status_code == 401
+    assert client.get("/api/notebook/render?digest=" + "0" * 64).status_code == 401
+    dashboard = client.get("/?token=secret-token")
+    assert 'id="notebook-snapshot-button"' in dashboard.text
+    assert 'href="/notebook"' in dashboard.text
+    assert "Open notebook" in dashboard.text
+    assert 'target="_blank"' in dashboard.text
+    assert dashboard.text.count('id="notebook-snapshot-button"') == 1
+    topbar_actions = re.search(
+        r'<div class="topbar-actions">(.*?)</div>',
+        dashboard.text,
+        re.DOTALL,
+    )
+    assert topbar_actions is not None
+    assert 'id="notebook-snapshot-button"' in topbar_actions.group(1)
+
+    wrapper = client.get("/notebook")
+    assert wrapper.status_code == 200
+    assert wrapper.headers["cache-control"] == "no-store"
+    assert wrapper.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in wrapper.headers["content-security-policy"]
+    assert "Checkpoint" in wrapper.text
+    assert "0 of 1 code cells settled" in wrapper.text
+    assert "Notebook cell 2 is still in progress" in wrapper.text
+    assert "pull down on mobile" in wrapper.text
+    assert "Refresh snapshot" not in wrapper.text
+    assert '<details id="snapshot-disclosure"' in wrapper.text
+    assert 'class="snapshot-disclosure" open' in wrapper.text
+    assert 'class="snapshot-summary"' in wrapper.text
+    assert 'sandbox="allow-same-origin"' in wrapper.text
+    assert 'referrerpolicy="no-referrer"' in wrapper.text
+    asset_version = app.state.runwatch_asset_version
+    assert f"/static/runwatch/notebook.js?v={asset_version}" in wrapper.text
+    assert str(supervisor.source_path) not in wrapper.text
+    assert "secret-token" not in wrapper.text
+    content_match = re.search(
+        r'src="(/api/notebook/render\?digest=[0-9a-f]{64})"', wrapper.text
+    )
+    assert content_match is not None
+
+    content = client.get(content_match.group(1))
+    assert content.status_code == 200
+    assert content.headers["cache-control"] == "no-store"
+    assert content.headers["x-frame-options"] == "SAMEORIGIN"
+    policy = content.headers["content-security-policy"]
+    assert "sandbox allow-same-origin" in policy
+    assert "allow-scripts" not in policy
+    assert "allow-forms" not in policy
+    assert "allow-top-navigation" not in policy
+    assert "script-src 'none'" in policy
+    assert "connect-src 'none'" in policy
+    assert "frame-src 'none'" in policy
+    assert "frame-ancestors 'self'" in policy
+    assert "Snapshot heading" in content.text
+    assert "saved output" in content.text
+
+    notebook_script = client.get("/static/runwatch/notebook.js")
+    assert notebook_script.status_code == 200
+    assert '"(max-width: 560px), (max-width: 960px) and (max-height: 560px)"' in (
+        notebook_script.text
+    )
+    assert "frame.contentWindow" in notebook_script.text
+    assert "disclosure.open = false" in notebook_script.text
+
+    styles = client.get("/static/runwatch/styles.css")
+    assert "a.soft-button" in styles.text
+    assert "text-decoration: none" in styles.text
+    supervisor.store.close()
+
+
+def test_notebook_snapshot_ignores_stale_final_until_notebook_cells_finish(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "source.ipynb"
+    nbformat.write(nbformat.v4.new_notebook(), notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+
+    def write_marker(path: Path, marker: str) -> None:
+        nbformat.write(
+            nbformat.v4.new_notebook(
+                cells=[nbformat.v4.new_markdown_cell(f"# {marker}")]
+            ),
+            path,
+        )
+
+    write_marker(supervisor.partial_output_path, "current checkpoint")
+    write_marker(supervisor.output_path, "stale final")
+    supervisor.store.update_run_status(supervisor.run_id, RunStatus.RUNNING)
+    client = TestClient(create_app(supervisor, "secret-token"))
+    client.get("/?token=secret-token")
+
+    running_wrapper = client.get("/notebook")
+    running_href = re.search(
+        r'src="(/api/notebook/render\?digest=[0-9a-f]{64})"',
+        running_wrapper.text,
+    )
+    assert running_href is not None
+    assert "Checkpoint" in running_wrapper.text
+    running_content = client.get(running_href.group(1)).text
+    assert "current checkpoint" in running_content
+    assert "stale final" not in running_content
+
+    supervisor.store.update_run_status(
+        supervisor.run_id,
+        RunStatus.WAITING_EXTERNAL,
+    )
+    final_wrapper = client.get("/notebook")
+    final_href = re.search(
+        r'src="(/api/notebook/render\?digest=[0-9a-f]{64})"',
+        final_wrapper.text,
+    )
+    assert final_href is not None
+    assert "Final" in final_wrapper.text
+    final_content = client.get(final_href.group(1)).text
+    assert "stale final" in final_content
+    supervisor.store.close()
+
+
+def test_notebook_snapshot_returns_branded_safe_render_error(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "source.ipynb"
+    nbformat.write(nbformat.v4.new_notebook(), notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+    supervisor.source_path.write_text("invalid notebook", encoding="utf-8")
+    client = TestClient(create_app(supervisor, "secret-token"))
+    client.get("/?token=secret-token")
+
+    response = client.get("/notebook")
+
+    assert response.status_code == 422
+    assert response.headers["cache-control"] == "no-store"
+    assert "Runwatch could not render this notebook snapshot." in response.text
+    assert str(supervisor.source_path) not in response.text
+    assert "Traceback" not in response.text
+    supervisor.store.close()
+
+
 def test_dashboard_exposes_authenticated_ntfy_app_handoff(tmp_path: Path) -> None:
     notebook_path = tmp_path / "empty.ipynb"
     nbformat.write(nbformat.v4.new_notebook(), notebook_path)
@@ -188,6 +390,16 @@ def test_dashboard_exposes_authenticated_ntfy_app_handoff(tmp_path: Path) -> Non
     assert 'class="ntfy-terminal-prompt"' in dashboard.text
     assert 'class="ntfy-terminal-cursor"' in dashboard.text
     assert "Open ntfy" in dashboard.text
+    topbar_actions = re.search(
+        r'<div class="topbar-actions">(.*?)</div>',
+        dashboard.text,
+        re.DOTALL,
+    )
+    assert topbar_actions is not None
+    actions_html = topbar_actions.group(1)
+    assert actions_html.index('id="notebook-snapshot-button"') < actions_html.index(
+        'class="soft-button ntfy-button"'
+    )
     styles = client.get("/static/runwatch/styles.css")
     assert styles.status_code == 200
     assert "background: #338574" in styles.text

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PACKAGE_FILES = {
     "runwatch/__init__.py",
     "runwatch/_cli_entrypoint.py",
+    "runwatch/_notebook_snapshot.py",
     "runwatch/adapters.py",
     "runwatch/cli.py",
     "runwatch/default_config.yaml",
@@ -23,6 +24,8 @@ REQUIRED_DATA_SUFFIXES = {
     "share/runwatch/web_artifacts/common/neumorphic-gloss-components.css",
     "share/runwatch/web_artifacts/runwatch/app.js",
     "share/runwatch/web_artifacts/runwatch/index.html",
+    "share/runwatch/web_artifacts/runwatch/notebook.html",
+    "share/runwatch/web_artifacts/runwatch/notebook.js",
     "share/runwatch/web_artifacts/runwatch/mascot/alert.png",
     "share/runwatch/web_artifacts/runwatch/mascot/confused.png",
     "share/runwatch/web_artifacts/runwatch/mascot/inspecting.png",
@@ -139,8 +142,10 @@ def main() -> int:
                         "names = {d.metadata['Name'].lower() "
                         "for d in importlib.metadata.distributions()}; "
                         "assert not names.intersection({'boto3', 'fastapi', "
-                        "'httpx', 'nbclient', 'uvicorn'}); "
-                        "assert not {'boto3', 'fastapi', 'httpx', 'nbclient'} "
+                        "'httpx', 'nbclient', 'nbconvert', 'beautifulsoup4', "
+                        "'uvicorn'}); "
+                        "assert not {'boto3', 'fastapi', 'httpx', 'nbclient', "
+                        "'nbconvert', 'bs4'} "
                         ".intersection(sys.modules)"
                     ),
                 ],
@@ -162,8 +167,12 @@ def main() -> int:
                     str(python),
                     "-c",
                     (
+                        "from nbconvert import HTMLExporter; import bs4; "
                         "from runwatch.web import _web_artifacts_root; "
-                        "assert _web_artifacts_root().is_dir()"
+                        "root = _web_artifacts_root(); "
+                        "assert (root / 'runwatch/notebook.html').is_file(); "
+                        "assert (root / 'runwatch/notebook.js').is_file(); "
+                        "assert HTMLExporter and bs4"
                     ),
                 ],
                 cwd=root,

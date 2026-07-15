@@ -395,6 +395,22 @@ the notebook kernel and is not captured automatically.
 The dashboard shows notebook state, reported progress, outputs, tracebacks, resource
 metrics and charts, log tails, and the durable event journal.
 
+The dashboard header provides an **Open notebook** action beside the ntfy action. It
+opens a separate, authenticated, read-only rendering of the saved notebook in a new
+tab. While the notebook is executing, the view uses `executed.partial.ipynb`; after
+notebook cells finish, it uses the final output; before the first checkpoint, it renders
+the saved source. The page does not update automatically: the browser's normal refresh
+control (including pull-to-refresh on mobile) loads the newest durable save. The page
+reports the snapshot timestamp and settled-cell count. On mobile, scrolling down in the
+notebook collapses that metadata header; selecting its compact summary expands it again.
+
+This full-notebook view is intentionally different from the bounded dashboard timeline:
+it can contain all notebook source and saved outputs. Runwatch removes active and
+navigation-capable HTML, omits JavaScript-only outputs, and isolates the rendering in a
+sandboxed frame with scripts and network access disabled. The child retains only its
+same-origin identity so the trusted wrapper can observe scroll position for the compact
+mobile header. Treat access to it as access to the notebook itself.
+
 The browser API is an explicit presentation model rather than a dump of SQLite state.
 It allowlists display-safe run, cell, resource, metric, and event fields and omits
 notebook source, resolved configuration, notification endpoints, provider cursors and

@@ -198,6 +198,17 @@ controller credentials, and dedicated internal-path fields do not cross that bou
 Displayed cell output and tracebacks, resource logs, chart series, and event text are
 bounded but remain user-controlled content and can contain sensitive values.
 
+`/notebook` is an explicit, authenticated exception to that bounded presentation
+boundary. On demand, it selects the current run's authoritative durable notebook
+(partial checkpoint while cells are active, final output after cells finish, or source
+before the first checkpoint), renders it in memory, and binds the wrapper and iframe to
+one content digest. The rendering is never persisted and is refreshed only by a new
+page request. Its child route has a separate CSP so it can be framed by the Runwatch
+wrapper while remaining scriptless, networkless, and sandboxed. The frame keeps its
+same-origin identity, but not script capability, so the trusted wrapper can observe
+downward scrolling and compact its mobile metadata header. All other Runwatch documents
+retain frame denial.
+
 SSE is an invalidation channel, not a second persistence API. Initial and replayed
 events contain only sequence, timestamp, and type; the browser reloads the sanitized
 snapshot for details. The dashboard document, state API, SSE response, and authenticated
