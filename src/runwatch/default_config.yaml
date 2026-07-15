@@ -57,12 +57,16 @@ notifications:
   # Set both values to enable ntfy push notifications.
   ntfy_base_url: null
   ntfy_topic: null
-  # Optional periodic status notification interval; null disables status reminders.
+  # Optional periodic status notification interval (minimum 60 seconds).
   periodic_seconds: null
   # Bound the terminal outbox drain before retaining successful run state for retry.
   terminal_drain_timeout_seconds: 30.0
   # Failed destinations retry independently through the durable SQLite outbox.
   request_timeout_seconds: 15.0
+  # Plain HTTP is allowed automatically only for loopback destinations.
+  allow_insecure_http: false
+  # Encoded webhook payload ceiling after presentation sanitization.
+  max_payload_bytes: 16384
   max_delivery_attempts: 4
   retry_initial_seconds: 1.0
   retry_max_seconds: 60.0
@@ -74,7 +78,14 @@ storage:
   max_log_bytes_per_resource: 2097152
   max_events_per_run: 10000
   max_event_bytes_per_run: 8388608
-  max_resource_payload_bytes: 2097152
+  # Reject any one event before it can bypass aggregate retention budgets.
+  max_event_payload_bytes: 2097152
+  # Applies independently to registrations, cursors, and observations.
+  max_resource_payload_bytes: 4194304
+  # Includes notification title, message, data, dedup key, and destinations.
+  max_notification_record_bytes: 524288
+  # UTF-8 byte ceiling for each persisted delivery diagnostic.
+  max_delivery_error_bytes: 4096
   dashboard_chart_points: 300
 
 # Static resources can be declared here. Dynamically created resources should use

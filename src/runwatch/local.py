@@ -6,20 +6,11 @@ from typing import Any, Literal
 
 from .emit import emit_resource
 from .models import Ownership, ResourceEvent, ResourceLifecycle, ResourceSpec
-from .resources.base import ResourceAdapter
-from .resources.dashboard import DashboardAdapter
-from .resources.local import (
-    FileCountAdapter,
-    LineCountAdapter,
-    SystemMetricsAdapter,
+from .protocol_validation import (
+    validate_dashboard_configuration,
+    validate_file_count_configuration,
+    validate_line_count_configuration,
 )
-
-
-def _validate_event(adapter: type[ResourceAdapter], event: ResourceEvent) -> None:
-    try:
-        adapter.validate_registration(event)
-    except RuntimeError as error:
-        raise ValueError(str(error)) from error
 
 
 def emit_system_metrics(
@@ -30,6 +21,8 @@ def emit_system_metrics(
     logical_key: str = "system",
     poll_interval_seconds: float | None = 5.0,
 ) -> dict[str, Any]:
+    if gpu not in {"all", "none"}:
+        raise ValueError("gpu must be 'all' or 'none'")
     if not include_host and not include_kernel and gpu == "none":
         raise ValueError("at least one system metric scope must be enabled")
     event = ResourceEvent(
@@ -52,7 +45,6 @@ def emit_system_metrics(
             poll_interval_seconds=poll_interval_seconds,
         ),
     )
-    _validate_event(SystemMetricsAdapter, event)
     return emit_resource(event, text="Local system metrics")
 
 
@@ -90,6 +82,13 @@ def emit_dashboard(
     dict[str, Any]
         The structured resource event written to notebook output.
     """
+    metadata: dict[str, Any] = {
+        "name": name,
+        "health_path": health_path,
+        "expected_status_code": expected_status_code,
+        "request_timeout_seconds": request_timeout_seconds,
+    }
+    validate_dashboard_configuration(url, metadata)
     event = ResourceEvent(
         resource=ResourceSpec(
             provider="local",
@@ -97,12 +96,7 @@ def emit_dashboard(
             id=url,
             logical_key=logical_key or url,
             ownership=Ownership.EXTERNAL,
-            metadata={
-                "name": name,
-                "health_path": health_path,
-                "expected_status_code": expected_status_code,
-                "request_timeout_seconds": request_timeout_seconds,
-            },
+            metadata=metadata,
         ),
         lifecycle=ResourceLifecycle(
             blocking=False,
@@ -111,7 +105,6 @@ def emit_dashboard(
             poll_interval_seconds=poll_interval_seconds,
         ),
     )
-    _validate_event(DashboardAdapter, event)
     return emit_resource(event, text=f"Local dashboard: {name or url}")
 
 
@@ -128,10 +121,14 @@ def emit_file_count(
     poll_interval_seconds: float | None = 2.0,
 ) -> dict[str, Any]:
     value = str(path)
-    if expected_count is not None and expected_count < 0:
-        raise ValueError("expected_count must be nonnegative")
-    if settled_seconds is not None and settled_seconds <= 0:
-        raise ValueError("settled_seconds must be positive")
+    metadata: dict[str, Any] = {
+        "pattern": pattern,
+        "recursive": recursive,
+        "expected_count": expected_count,
+        "completion_marker": completion_marker,
+        "settled_seconds": settled_seconds,
+    }
+    validate_file_count_configuration(metadata)
     if (
         blocking
         and expected_count is None
@@ -148,13 +145,7 @@ def emit_file_count(
             id=value,
             logical_key=logical_key or f"{value}:{pattern}",
             ownership=Ownership.BORROWED,
-            metadata={
-                "pattern": pattern,
-                "recursive": recursive,
-                "expected_count": expected_count,
-                "completion_marker": completion_marker,
-                "settled_seconds": settled_seconds,
-            },
+            metadata=metadata,
         ),
         lifecycle=ResourceLifecycle(
             blocking=blocking,
@@ -162,7 +153,6 @@ def emit_file_count(
             poll_interval_seconds=poll_interval_seconds,
         ),
     )
-    _validate_event(FileCountAdapter, event)
     return emit_resource(event, text=f"Local files: {value}/{pattern}")
 
 
@@ -176,10 +166,11 @@ def emit_line_count(
     poll_interval_seconds: float | None = 2.0,
 ) -> dict[str, Any]:
     value = str(path)
-    if expected_lines is not None and expected_lines < 0:
-        raise ValueError("expected_lines must be nonnegative")
-    if tail_lines < 0:
-        raise ValueError("tail_lines must be nonnegative")
+    metadata: dict[str, Any] = {
+        "expected_lines": expected_lines,
+        "tail_lines": tail_lines,
+    }
+    validate_line_count_configuration(metadata)
     if blocking and expected_lines is None:
         raise ValueError("blocking line-count monitors require expected_lines")
     event = ResourceEvent(
@@ -189,7 +180,7 @@ def emit_line_count(
             id=value,
             logical_key=logical_key or value,
             ownership=Ownership.BORROWED,
-            metadata={"expected_lines": expected_lines, "tail_lines": tail_lines},
+            metadata=metadata,
         ),
         lifecycle=ResourceLifecycle(
             blocking=blocking,
@@ -197,5 +188,4 @@ def emit_line_count(
             poll_interval_seconds=poll_interval_seconds,
         ),
     )
-    _validate_event(LineCountAdapter, event)
     return emit_resource(event, text=f"Local line count: {value}")

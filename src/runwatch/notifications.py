@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -8,16 +9,18 @@ import httpx
 
 from .events import EventBus
 from .models import NotificationSettings
+from .notification_config import (
+    compatible_notification_settings,
+    notification_destinations,
+)
+from .notification_presentation import (
+    NotificationDeliveryError,
+    NotificationEnvelope,
+    NotificationPresenter,
+    PresentedNotification,
+    safe_delivery_error,
+)
 from .storage import RunStore
-
-
-def _event_kernel_epoch(payload: dict[str, Any]) -> str:
-    value = payload.get("kernel_epoch")
-    if value is None:
-        return "unknown"
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("Notification event kernel_epoch must be nonnegative")
-    return str(value)
 
 
 @dataclass(frozen=True)
@@ -50,16 +53,36 @@ class NotificationManager:
         self._periodic_task: asyncio.Task[None] | None = None
         self._delivery_task: asyncio.Task[None] | None = None
         self._delivery_wake = asyncio.Event()
-        self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+        self._client = httpx.AsyncClient(
+            timeout=settings.request_timeout_seconds, follow_redirects=False
+        )
+        self._presenter = NotificationPresenter(
+            store=store, run_id=run_id, settings=settings
+        )
         if self._destinations():
             self.store.require_notification_event_routing(self.run_id)
 
     async def start(self) -> None:
         if self._delivery_task is not None:
             return
-        if not self._destinations():
+        destinations = self._destinations()
+        persisted = self.store.notification_configuration(self.run_id)
+        current_destinations = (
+            notification_destinations(compatible_notification_settings(persisted))
+            if persisted is not None
+            else None
+        )
+        self.store.reconcile_notification_configuration(
+            self.run_id,
+            current_destinations=current_destinations,
+            desired_destinations=destinations,
+            desired_configuration=self.settings.model_dump(mode="json"),
+        )
+        if not destinations:
             return
-        self.store.recover_notification_deliveries(self.run_id)
+        self._recover_interrupted_deliveries()
+        for notification in self._presenter.reconcile_state():
+            await self.send(notification)
         self._delivery_task = asyncio.create_task(
             self._deliver(), name=f"notification-delivery:{self.run_id}"
         )
@@ -83,7 +106,7 @@ class NotificationManager:
                 task.cancel()
         existing = [task for task in tasks if task]
         results = await asyncio.gather(*existing, return_exceptions=True)
-        recovered = self.store.recover_notification_deliveries(self.run_id)
+        recovered = self._recover_interrupted_deliveries()
         for task, result in zip(existing, results, strict=True):
             if isinstance(result, BaseException) and not isinstance(
                 result, asyncio.CancelledError
@@ -92,7 +115,7 @@ class NotificationManager:
                     "notification.shutdown_error",
                     {
                         "task": task.get_name(),
-                        "error": f"{type(result).__name__}: {result}",
+                        "error": _error_payload(result),
                     },
                 )
         if recovered:
@@ -176,11 +199,7 @@ class NotificationManager:
 
     async def send(
         self,
-        *,
-        title: str,
-        message: str,
-        data: dict[str, Any] | None = None,
-        dedup_key: str | None = None,
+        notification: PresentedNotification,
     ) -> dict[str, Any] | None:
         """Durably enqueue a notification and wake the delivery worker.
 
@@ -192,27 +211,36 @@ class NotificationManager:
         destinations = self._destinations()
         if not destinations:
             return None
-        intent = self.store.enqueue_notification(
-            run_id=self.run_id,
-            title=title,
-            message=message,
-            data=data or {},
-            dedup_key=dedup_key,
-            destinations=destinations,
-        )
+        payload = notification.envelope.webhook_payload()
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > (
+            self.settings.max_payload_bytes
+        ):
+            raise ValueError("Notification presentation exceeds max_payload_bytes")
+        if notification.rolling:
+            if notification.dedup_key is None:
+                raise ValueError("A rolling notification requires a deduplication key")
+            intent = self.store.enqueue_rolling_notification(
+                run_id=self.run_id,
+                title=notification.envelope.title,
+                message=notification.envelope.message,
+                data=payload["data"],
+                dedup_key=notification.dedup_key,
+                destinations=destinations,
+            )
+        else:
+            intent = self.store.enqueue_notification(
+                run_id=self.run_id,
+                title=notification.envelope.title,
+                message=notification.envelope.message,
+                data=payload["data"],
+                dedup_key=notification.dedup_key,
+                destinations=destinations,
+            )
         self._delivery_wake.set()
         return intent
 
     def _destinations(self) -> list[tuple[str, str]]:
-        destinations = [("webhook", url) for url in self.settings.webhook_urls]
-        if self.settings.ntfy_base_url and self.settings.ntfy_topic:
-            destinations.append(
-                (
-                    "ntfy",
-                    f"{self.settings.ntfy_base_url.rstrip('/')}/{self.settings.ntfy_topic}",
-                )
-            )
-        return destinations
+        return notification_destinations(self.settings)
 
     async def _deliver(self) -> None:
         idle_seconds = min(self.settings.retry_initial_seconds, 1.0)
@@ -228,7 +256,7 @@ class NotificationManager:
             except Exception as error:
                 await self._publish_safely(
                     "notification.worker_error",
-                    {"error": f"{type(error).__name__}: {error}"},
+                    {"error": _error_payload(error)},
                 )
             if claimed:
                 continue
@@ -253,7 +281,7 @@ class NotificationManager:
                 await self._recover_delivery_task_error(delivery, result)
 
     async def _recover_cancelled_deliveries(self) -> None:
-        recovered = self.store.recover_notification_deliveries(self.run_id)
+        recovered = self._recover_interrupted_deliveries()
         if not recovered:
             return
         await self._publish_safely(
@@ -269,7 +297,8 @@ class NotificationManager:
     async def _recover_delivery_task_error(
         self, delivery: dict[str, Any], error: BaseException
     ) -> None:
-        error_message = f"{type(error).__name__}: {error}"
+        delivery_error = safe_delivery_error(error)
+        error_message = delivery_error.persisted()
         attempt = int(delivery["attempt_count"])
         retry_delay = min(
             self.settings.retry_initial_seconds * (2 ** max(attempt - 1, 0)),
@@ -288,10 +317,8 @@ class NotificationManager:
                 {
                     "delivery_id": delivery["delivery_id"],
                     "intent_id": delivery["intent_id"],
-                    "error": error_message,
-                    "recovery_error": (
-                        f"{type(recovery_error).__name__}: {recovery_error}"
-                    ),
+                    "error": delivery_error.model_dump(mode="json"),
+                    "recovery_error": _error_payload(recovery_error),
                 },
             )
             return
@@ -300,36 +327,48 @@ class NotificationManager:
             {
                 "delivery_id": delivery["delivery_id"],
                 "intent_id": delivery["intent_id"],
-                "error": error_message,
+                "error": delivery_error.model_dump(mode="json"),
                 "outcome": outcome or "already_terminal",
             },
         )
         if outcome == "pending":
             self._delivery_wake.set()
 
+    def _recover_interrupted_deliveries(self) -> int:
+        error = NotificationDeliveryError(
+            code="internal",
+            message=(
+                "Notification delivery was interrupted before its outcome was persisted"
+            ),
+        )
+        return self.store.recover_notification_deliveries(
+            self.run_id,
+            max_attempts=self.settings.max_delivery_attempts,
+            error=error.persisted(),
+        )
+
     async def _attempt_delivery(self, delivery: dict[str, Any]) -> None:
-        error_message: str | None = None
+        delivery_error: NotificationDeliveryError | None = None
         idempotency_headers = {
             "Idempotency-Key": str(delivery["delivery_id"]),
             "X-Runwatch-Intent-ID": str(delivery["intent_id"]),
         }
         try:
+            envelope = self._stored_envelope(delivery)
             if delivery["kind"] == "webhook":
-                response = await self._client.post(
+                request = self._client.build_request(
+                    "POST",
                     delivery["destination"],
-                    json={
-                        "title": delivery["title"],
-                        "message": delivery["message"],
-                        "data": delivery["data"],
-                    },
+                    json=envelope.webhook_payload(),
                     headers=idempotency_headers,
                 )
             elif delivery["kind"] == "ntfy":
-                response = await self._client.post(
+                request = self._client.build_request(
+                    "POST",
                     delivery["destination"],
-                    content=str(delivery["message"]).encode("utf-8"),
+                    content=envelope.message.encode("utf-8"),
                     headers={
-                        "Title": str(delivery["title"]),
+                        "Title": envelope.title,
                         "Tags": "computer",
                         **idempotency_headers,
                     },
@@ -338,11 +377,17 @@ class NotificationManager:
                 raise ValueError(
                     f"Unsupported notification destination kind {delivery['kind']!r}"
                 )
-            response.raise_for_status()
+            response = await self._client.send(
+                request, stream=True, follow_redirects=False
+            )
+            try:
+                response.raise_for_status()
+            finally:
+                await response.aclose()
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            error_message = f"{type(error).__name__}: {error}"
+            delivery_error = safe_delivery_error(error)
 
         attempt = int(delivery["attempt_count"])
         retry_delay = min(
@@ -351,27 +396,45 @@ class NotificationManager:
         )
         self.store.finish_notification_delivery(
             delivery["delivery_id"],
-            succeeded=error_message is None,
+            succeeded=delivery_error is None,
             max_attempts=self.settings.max_delivery_attempts,
             retry_delay_seconds=retry_delay,
-            error=error_message,
+            error=delivery_error.persisted() if delivery_error else None,
         )
-        if error_message is not None:
+        if delivery_error is not None:
             self._delivery_wake.set()
+
+    def _stored_envelope(self, delivery: dict[str, Any]) -> NotificationEnvelope:
+        data = delivery.get("data")
+        if not isinstance(data, dict):
+            return self._presenter.legacy()
+        values = {
+            key: item
+            for key, item in cast(dict[object, object], data).items()
+            if isinstance(key, str)
+        }
+        schema_version = values.pop("schema_version", None)
+        kind = values.pop("kind", None)
+        try:
+            return NotificationEnvelope.model_validate(
+                {
+                    "schema_version": schema_version,
+                    "kind": kind,
+                    "title": delivery.get("title"),
+                    "message": delivery.get("message"),
+                    "data": values,
+                }
+            )
+        except (TypeError, ValueError):
+            return self._presenter.legacy()
 
     async def _report_intent_transitions(self) -> None:
         for intent in self.store.unreported_notification_intents(self.run_id):
             status = intent["status"]
             deliveries = self.store.notification_deliveries(intent["intent_id"])
-            errors = [
-                f"{item['kind']}: {item['last_error']}"
-                for item in deliveries
-                if item["last_error"]
-            ]
+            errors = [_stored_error(item) for item in deliveries if item["last_error"]]
             payload = {
                 "intent_id": intent["intent_id"],
-                "title": intent["title"],
-                "message": intent["message"],
                 "errors": errors,
                 "deliveries": [
                     {
@@ -403,7 +466,7 @@ class NotificationManager:
                 except Exception as error:
                     await self._publish_safely(
                         "notification.listener_error",
-                        {"error": f"{type(error).__name__}: {error}"},
+                        {"error": _error_payload(error)},
                     )
                     await asyncio.sleep(0.25)
 
@@ -448,94 +511,30 @@ class NotificationManager:
             {
                 "event_type": str(event.get("type", "<missing>")),
                 "event_seq": event.get("seq"),
-                "error": f"{type(error).__name__}: {error}",
+                "error": _error_payload(error),
             },
         )
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
-        event_type = event["type"]
-        payload_value = event["payload"]
-        if not isinstance(event_type, str) or not isinstance(payload_value, dict):
-            raise TypeError(
-                "Notification events require a string type and object payload"
-            )
-        payload = cast(dict[str, Any], payload_value)
-        if event_type == "cell.failed":
-            kernel_epoch = _event_kernel_epoch(payload)
-            await self.send(
-                title="Runwatch: notebook cell failed",
-                message=(
-                    f"Cell {payload['cell_index'] + 1} failed: "
-                    f"{payload.get('error_name')}: {payload.get('error_value')}"
-                ),
-                data=payload,
-                dedup_key=(
-                    f"cell-failed:{kernel_epoch}:"
-                    f"{payload['cell_index']}:{payload['attempt']}"
-                ),
-            )
-        elif event_type == "resource.observed" and payload.get("status") == "failed":
-            await self.send(
-                title="Runwatch: external resource failed",
-                message=str(payload.get("message") or payload["internal_id"]),
-                data=payload,
-                dedup_key=f"resource-failed:{payload['internal_id']}",
-            )
-        elif event_type == "run.succeeded":
-            kernel_epoch = _event_kernel_epoch(payload)
-            await self.send(
-                title="Runwatch: run completed",
-                message="Notebook and blocking resources completed successfully.",
-                data=payload,
-                dedup_key=f"run-succeeded:{kernel_epoch}",
-            )
-        elif event_type in {
-            "run.failed_external",
-            "run.runner_error",
-            "run.external_timeout",
-        }:
-            kernel_epoch = _event_kernel_epoch(payload)
-            await self.send(
-                title="Runwatch: run failed",
-                message=str(payload),
-                data=payload,
-                dedup_key=f"run-failed:{event_type}:{kernel_epoch}",
-            )
-        elif event_type == "run.cancelled":
-            kernel_epoch = _event_kernel_epoch(payload)
-            await self.send(
-                title="Runwatch: run cancelled",
-                message="The notebook run was cancelled.",
-                data=payload,
-                dedup_key=f"run-cancelled:{kernel_epoch}",
-            )
+        notification = self._presenter.from_event(event)
+        if notification is not None:
+            await self.send(notification)
 
     async def _periodic(self) -> None:
         assert self.settings.periodic_seconds is not None
         while True:
             await asyncio.sleep(self.settings.periodic_seconds)
             try:
-                snapshot = self.store.snapshot(self.run_id)
-                run = snapshot["run"]
-                if run["status"] in {"succeeded", "failed", "cancelled"}:
+                notification = self._presenter.periodic()
+                if notification is None:
                     return
-                resources = snapshot["resources"]
-                active = sum(not item["terminal"] for item in resources)
-                await self.send(
-                    title="Runwatch status",
-                    message=(
-                        f"{run['name']}: {run['status']}; "
-                        f"cell {run.get('current_cell_index')}; "
-                        f"{active} active resource(s)."
-                    ),
-                    data={"run": run, "active_resources": active},
-                )
+                await self.send(notification)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 await self._publish_safely(
                     "notification.periodic_error",
-                    {"error": f"{type(error).__name__}: {error}"},
+                    {"error": _error_payload(error)},
                 )
 
     async def _publish_safely(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -546,3 +545,21 @@ class NotificationManager:
         except Exception:
             # Notification diagnostics must never take down run supervision.
             return
+
+
+def _error_payload(error: BaseException) -> dict[str, Any]:
+    return safe_delivery_error(error).model_dump(mode="json")
+
+
+def _stored_error(delivery: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(str(delivery["last_error"]))
+        error = NotificationDeliveryError.model_validate(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        error = NotificationDeliveryError(
+            code="internal", message="Legacy notification delivery failure"
+        )
+    return {
+        "kind": str(delivery["kind"]),
+        **error.model_dump(mode="json"),
+    }

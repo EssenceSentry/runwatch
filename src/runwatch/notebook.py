@@ -40,6 +40,9 @@ _OUTPUT_PERSIST_INTERVAL_SECONDS = 0.25
 _TIMEOUT_RECOVERY_MAX_SECONDS = 10.0
 _CHECKPOINT_RETRY_MAX_SECONDS = 30.0
 _WRITEBACK_STATE_FILENAME = "writeback-state.json"
+_EVENT_TEXT_MAX_CHARS = 120
+_EVENT_RESOURCE_ID_MAX_CHARS = 64
+_EVENT_RESOURCE_SAMPLE_SIZE = 5
 
 
 @dataclass(frozen=True)
@@ -99,18 +102,18 @@ def _cell_label(notebook: NotebookNode, index: int) -> str:
     cell = notebook.cells[index]
     configured = cell.metadata.get("runwatch", {}).get("label")
     if configured:
-        return str(configured)
+        return str(configured)[:_EVENT_TEXT_MAX_CHARS]
     for previous in reversed(notebook.cells[:index]):
         if previous.cell_type != "markdown":
             continue
         for line in str(previous.source).splitlines():
             stripped = line.strip()
             if stripped.startswith("#"):
-                return stripped.lstrip("#").strip()[:120]
+                return stripped.lstrip("#").strip()[:_EVENT_TEXT_MAX_CHARS]
     first = next(
         (line.strip() for line in str(cell.source).splitlines() if line.strip()), ""
     )
-    return first[:120] or f"{cell.cell_type.title()} cell {index + 1}"
+    return first[:_EVENT_TEXT_MAX_CHARS] or f"{cell.cell_type.title()} cell {index + 1}"
 
 
 def ensure_cell_ids(notebook: NotebookNode) -> None:
@@ -176,7 +179,7 @@ class MonitoredNotebookClient(NotebookClient):
     def __init__(
         self,
         *args: Any,
-        output_callback: Callable[[NotebookNode, int, int], None],
+        output_callback: Callable[[NotebookNode, int, int], bool | None],
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -250,7 +253,9 @@ class MonitoredNotebookClient(NotebookClient):
     ) -> NotebookNode | None:
         output = super().process_message(msg, cell, cell_index)
         if output is not None:
-            self.output_callback(output, cell_index, self.current_attempt)
+            keep_output = self.output_callback(output, cell_index, self.current_attempt)
+            if keep_output is False:
+                cell.outputs = [item for item in cell.outputs if item is not output]
         elif msg.get("msg_type") == "update_display_data":
             content = cast(dict[str, Any], msg.get("content", {}))
             data = content.get("data")
@@ -395,11 +400,14 @@ class NotebookRunner:
         if run_status.terminal:
             return
         if not self._cancel_requested.is_set():
-            self.store.update_run_status(
-                self.run_id, RunStatus.CANCELLING, message="Cancellation requested"
+            event = self.store.request_run_cancellation(
+                self.run_id,
+                message="Cancellation requested",
+                event_payload={},
             )
             self._cancel_requested.set()
-            await self._publish_cancellation_event_safely("run.cancel_requested", {})
+            if event is not None:
+                self.bus.fan_out_persisted(event)
 
         escalation_task: asyncio.Task[None] | None = None
         async with self._cancel_lock:
@@ -590,7 +598,15 @@ class NotebookRunner:
             message="Starting notebook kernel",
             started=True,
         )
-        await self.bus.publish("run.started", {"working_dir": str(self.working_dir)})
+        working_dir = str(self.working_dir)
+        bounded_working_dir = working_dir[:_EVENT_TEXT_MAX_CHARS]
+        await self.bus.publish(
+            "run.started",
+            {
+                "working_dir": bounded_working_dir,
+                "projection_truncated": bounded_working_dir != working_dir,
+            },
+        )
         self._checkpoint_task = asyncio.create_task(
             self._checkpoint_loop(), name=f"checkpoint:{self.run_id}"
         )
@@ -599,30 +615,36 @@ class NotebookRunner:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.store.update_run_status(
+            checkpoint_error: Exception | None = None
+            try:
+                await self._drain_output_tasks()
+                await self._checkpoint(force=True)
+            except Exception as artifact_error:
+                checkpoint_error = artifact_error
+            message = f"Runner failure: {type(error).__name__}: {error}"
+            if checkpoint_error is not None:
+                message += (
+                    "; final checkpoint failed: "
+                    f"{type(checkpoint_error).__name__}: {checkpoint_error}"
+                )
+            event = self.store.finish_run(
                 self.run_id,
                 RunStatus.FAILED,
-                message=f"Runner failure: {type(error).__name__}: {error}",
-                ended=True,
-            )
-            await self.bus.publish(
-                "run.runner_error",
-                {
+                message=message,
+                event_type="run.runner_error",
+                event_payload={
                     "kernel_epoch": self.kernel_epoch,
                     "error_type": type(error).__name__,
                     "error": str(error),
                 },
             )
+            self.bus.fan_out_persisted(event)
             return RunStatus.FAILED
         finally:
-            try:
-                await self._drain_output_tasks()
-                await self._checkpoint(force=True)
-            finally:
-                if self._checkpoint_task:
-                    self._checkpoint_task.cancel()
-                    await asyncio.gather(self._checkpoint_task, return_exceptions=True)
-                self._finished.set()
+            if self._checkpoint_task:
+                self._checkpoint_task.cancel()
+                await asyncio.gather(self._checkpoint_task, return_exceptions=True)
+            self._finished.set()
 
     async def _run_sessions(self) -> RunStatus:
         await self._run_kernel_epochs()
@@ -637,6 +659,12 @@ class NotebookRunner:
         blocking_status = await self._wait_for_blocking_resources()
         if blocking_status is not None:
             return blocking_status
+        self.store.update_run_status(
+            self.run_id,
+            RunStatus.FINALIZING,
+            message="Persisting final notebook state",
+            current_cell_index=None,
+        )
         await self._checkpoint(force=True, writeback=True)
         return await self._finish_succeeded()
 
@@ -765,25 +793,26 @@ class NotebookRunner:
 
     async def _finish_cancelled(self) -> RunStatus:
         await self.resources.stop_cancel_resources()
+        if self._checkpoint_task is not None:
+            await self._drain_output_tasks()
+            await self._checkpoint(force=True)
         message = (
             "Run cancelled; in-memory kernel state was lost during escalation"
             if self._kernel_state_lost
             else "Run cancelled"
         )
-        self.store.update_run_status(
+        event = self.store.finish_run(
             self.run_id,
             RunStatus.CANCELLED,
             message=message,
             current_cell_index=None,
-            ended=True,
-        )
-        await self.bus.publish(
-            "run.cancelled",
-            {
+            event_type="run.cancelled",
+            event_payload={
                 "kernel_epoch": self.kernel_epoch,
                 "kernel_state_lost": self._kernel_state_lost,
             },
         )
+        self.bus.fan_out_persisted(event)
         return RunStatus.CANCELLED
 
     async def _wait_for_blocking_resources(self) -> RunStatus | None:
@@ -798,15 +827,16 @@ class NotebookRunner:
                 cancel_event=self._cancel_requested,
             )
         except TimeoutError:
-            self.store.update_run_status(
+            await self._drain_output_tasks()
+            await self._checkpoint(force=True)
+            event = self.store.finish_run(
                 self.run_id,
                 RunStatus.FAILED,
                 message="Timed out waiting for blocking resources",
-                ended=True,
+                event_type="run.external_timeout",
+                event_payload={"kernel_epoch": self.kernel_epoch},
             )
-            await self.bus.publish(
-                "run.external_timeout", {"kernel_epoch": self.kernel_epoch}
-            )
+            self.bus.fan_out_persisted(event)
             return RunStatus.FAILED
         if self._cancel_requested.is_set():
             return await self._finish_cancelled()
@@ -815,6 +845,11 @@ class NotebookRunner:
         return None
 
     async def _announce_blocking_wait(self, active: list[dict[str, Any]]) -> None:
+        resource_ids = [str(item["internal_id"]) for item in active]
+        resource_ids_sample = [
+            resource_id[:_EVENT_RESOURCE_ID_MAX_CHARS]
+            for resource_id in resource_ids[:_EVENT_RESOURCE_SAMPLE_SIZE]
+        ]
         self.store.update_run_status(
             self.run_id,
             RunStatus.WAITING_EXTERNAL,
@@ -823,7 +858,14 @@ class NotebookRunner:
         )
         await self.bus.publish(
             "run.waiting_external",
-            {"resource_ids": [item["internal_id"] for item in active]},
+            {
+                "resource_count": len(resource_ids),
+                "resource_ids_sample": resource_ids_sample,
+                "projection_truncated": (
+                    len(resource_ids) > len(resource_ids_sample)
+                    or resource_ids_sample != resource_ids[: len(resource_ids_sample)]
+                ),
+            },
         )
 
     async def _finish_external_failure(
@@ -831,40 +873,38 @@ class NotebookRunner:
     ) -> RunStatus:
         if self._cancel_requested.is_set():
             return await self._finish_cancelled()
-        self.store.update_run_status(
+        await self._drain_output_tasks()
+        await self._checkpoint(force=True)
+        event = self.store.finish_run(
             self.run_id,
             RunStatus.FAILED,
             message=f"{len(failures)} blocking resource(s) did not succeed",
-            ended=True,
-        )
-        await self.bus.publish(
-            "run.failed_external",
-            {
+            event_type="run.failed_external",
+            event_payload={
                 "kernel_epoch": self.kernel_epoch,
                 "resource_ids": [item["internal_id"] for item in failures],
             },
         )
+        self.bus.fan_out_persisted(event)
         return RunStatus.FAILED
 
     async def _finish_succeeded(self) -> RunStatus:
         if self._cancel_requested.is_set():
             return await self._finish_cancelled()
-        self.store.update_run_status(
+        event = self.store.finish_run(
             self.run_id,
             RunStatus.SUCCEEDED,
             message="Notebook and blocking resources completed",
             current_cell_index=None,
             failed_cell_index=None,
             failed_attempt=None,
-            ended=True,
-        )
-        await self.bus.publish(
-            "run.succeeded",
-            {
+            event_type="run.succeeded",
+            event_payload={
                 "kernel_epoch": self.kernel_epoch,
                 "output_path": str(self.output_path),
             },
         )
+        self.bus.fan_out_persisted(event)
         return RunStatus.SUCCEEDED
 
     async def _execute_cell_until_resolved(self, index: int) -> str:
@@ -1007,37 +1047,20 @@ class NotebookRunner:
     ) -> None:
         self.failed_cell_index = index
         self.failed_attempt = attempt
-        self.store.complete_cell(
+        await self._checkpoint(force=True, writeback=True)
+        event = self.store.pause_failed_cell(
             self.run_id,
             index,
-            status=CellStatus.FAILED,
+            attempt=attempt,
+            kernel_epoch=self.kernel_epoch,
             elapsed_seconds=elapsed,
             error_name=error_name,
             error_value=error_value,
             traceback=traceback,
-        )
-        self.store.update_run_status(
-            self.run_id,
-            RunStatus.PAUSED,
-            message=f"Cell {index + 1} failed: {error_name}: {error_value}",
-            current_cell_index=index,
-            failed_cell_index=index,
-            failed_attempt=attempt,
+            kernel_dead=self._kernel_dead,
         )
         self._paused.set()
-        await self._checkpoint(force=True, writeback=True)
-        await self.bus.publish(
-            "cell.failed",
-            {
-                "cell_index": index,
-                "attempt": attempt,
-                "kernel_epoch": self.kernel_epoch,
-                "error_name": error_name,
-                "error_value": error_value,
-                "traceback": traceback[-20:],
-                "kernel_dead": self._kernel_dead,
-            },
-        )
+        self.bus.fan_out_persisted(event)
 
     async def _handle_cancelled_execution(
         self, index: int, attempt: int, started: float, error: Exception
@@ -1266,9 +1289,10 @@ class NotebookRunner:
         clear_notebook_outputs(notebook)
         return notebook
 
-    def _on_output(self, output: NotebookNode, cell_index: int, attempt: int) -> None:
+    def _on_output(self, output: NotebookNode, cell_index: int, attempt: int) -> bool:
         structured_payloads = self._structured_payloads(output)
-        if not self._is_hidden_structured_output(output):
+        keep_output = self._strip_fallback_protocol_lines(output)
+        if keep_output and not self._is_hidden_structured_output(output):
             summary = summarize_output(output)
             self._buffer_cell_output(cell_index, summary)
             self._schedule_output_flush(cell_index, attempt)
@@ -1321,6 +1345,27 @@ class NotebookRunner:
                         )
                     )
         self._request_checkpoint()
+        return keep_output
+
+    @staticmethod
+    def _strip_fallback_protocol_lines(output: NotebookNode) -> bool:
+        """Remove valid fallback envelopes while preserving neighboring stream text."""
+
+        if output.get("output_type") != "stream":
+            return True
+        original = str(output.get("text", ""))
+        retained: list[str] = []
+        removed = False
+        for line in original.splitlines(keepends=True):
+            candidate = line.rstrip("\r\n")
+            if NotebookRunner._fallback_payload(candidate) is None:
+                retained.append(line)
+            else:
+                removed = True
+        if not removed:
+            return True
+        output["text"] = "".join(retained)
+        return bool(output["text"])
 
     @staticmethod
     def _is_hidden_structured_output(output: NotebookNode) -> bool:

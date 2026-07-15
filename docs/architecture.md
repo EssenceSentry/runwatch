@@ -92,12 +92,32 @@ exponential backoff, and an attempt interrupted by process shutdown returns to a
 recoverable state. Worker failures are collected and journaled during close rather than
 being discarded.
 
+The notification outbox stores a versioned presentation rather than an internal event
+or snapshot. Event-specific presenters allowlist small run, cell, and resource
+summaries before enqueueing. Delivery streams only response headers, does not follow
+redirects, and persists typed error categories without request URLs or response bodies.
+Periodic status uses one replaceable, reported intent slot and a direct aggregate query
+instead of loading the recovery snapshot.
+
+The run manifest is the desired-state journal for notification credential maintenance.
+An offline rotation writes it first, then one SQLite transaction consolidates legacy
+terminal deduplication aliases, maps actual delivery rows to a same-shape destination
+set, preserves already successful per-destination delivery, resets the remaining
+attempts, sanitizes legacy presentations, and updates the metadata copy of the config.
+`NotificationManager.start()` performs this reconciliation before its no-destination
+fast path and before recovering or claiming work, which completes a crash interrupted
+between the manifest and database steps. Purge advances the routing cursor to the event
+high-water mark while disabling routing, so enabling notifications later never replays
+pre-purge events.
+
 Successful run directories are temporary operational state. The default 90-second
 post-terminal linger keeps the final dashboard state observable. Cleanup then waits a
 separate bounded interval for notification routing and every outbox item to reach a
 terminal result. A nonterminal outbox or drain error retains the successful run, emits
 `run.cleanup_retained`, and gives the operator `runwatch open RUN_DIR` to restart the
-workers without rerunning the notebook.
+workers without rerunning the notebook. The recovery controller conservatively retains
+the run when `open` closes; it did not itself observe normal notebook finalization and
+therefore cannot authorize automatic successful-run cleanup.
 
 When cleanup is eligible, the controller keeps its run lock and publishes a sibling
 cleanup fence before deleting the run directory. The sibling survives that deletion and
@@ -130,18 +150,22 @@ metadata. The runner supplies the cell attempt and kernel epoch.
 
 Adapters implement inspection and may optionally implement stop. Observations and
 cursors are persisted after each poll. Observation history and resource log tails are
-bounded by both row count and encoded byte size; resource payloads also have an encoded
-byte ceiling. CloudWatch metric cards keep the full current lookback, while history
+bounded by both row count and encoded byte size. Independent hard per-record UTF-8 byte
+ceilings reject oversized full resource registrations, standalone cursors, aggregate
+observations, event payloads, and notification records at the final SQLite boundary;
+delivery diagnostics are truncated to valid UTF-8 within their own ceiling. CloudWatch
+metric cards keep the full current lookback, while history
 persists only new or revised timestamp samples rather than duplicating the lookback on
 every poll. History is evenly downsampled across the retained range for mobile charts.
 The general event journal is likewise bounded by count and bytes; high-volume cell
 output uses coalesced transient refresh events instead of growing SQLite without limit.
-These byte settings are retention targets, not a hard cap on the SQLite file: the newest
-observation or event remains available even when that row alone exceeds its target, and
-core notebook state, durable actions, and the notification outbox are not discarded to
-enforce a total database size. Unrouted notification-source events are also protected
-until the durable notification cursor consumes them, so a routing backlog may
-temporarily exceed the event target rather than lose an at-least-once notification.
+Aggregate byte settings are retention targets, while the per-record settings are hard
+admission limits. The newest admissible observation or event remains available even
+when it alone exceeds its aggregate retention target, and core notebook state, durable
+actions, and the notification outbox are not discarded to enforce a total database
+size. Unrouted notification-source events are also protected until the durable
+notification cursor consumes them, so a routing backlog may temporarily exceed the
+event target rather than lose an at-least-once notification.
 
 Each adapter also declares whether it can safely block and validates conditional
 terminal metadata. The same validation runs for static configuration, public emitters,
@@ -191,3 +215,5 @@ through replay; Runwatch does not attempt whole-process serialization.
 Runwatch is agent-agnostic. Codex and Claude use their native filesystem, shell, and
 remote applications. A repository skill explains the stable Runwatch CLI and nbformat
 workflow; no agent subprocess, transcript, or repair proposal is stored by Runwatch.
+The `status`, `context`, and `events` commands expose versioned CLI presentation models;
+they never serialize the internal recovery snapshot or raw event payloads.

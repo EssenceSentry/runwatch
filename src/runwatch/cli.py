@@ -11,7 +11,7 @@ import time
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import psutil
@@ -20,15 +20,21 @@ import typer
 import uvicorn
 
 from . import __version__
-from ._fs import PRIVATE_DIRECTORY_MODE, ensure_private_directory
+from ._fs import PRIVATE_DIRECTORY_MODE, atomic_write_bytes, ensure_private_directory
+from .cli_presentation import CliPresenter
 from .config import dump_default_config, load_config
 from .dashboard_links import DashboardLinkManager
 from .events import EventBus
 from .models import (
     ActionKind,
     ActionStatus,
+    NotificationSettings,
     RunStatus,
     RunwatchConfig,
+)
+from .notification_config import (
+    notification_destinations,
+    notification_topology,
 )
 from .resource_manager import ResourceManager, ResourceStopRejected
 from .storage import (
@@ -51,7 +57,11 @@ app = typer.Typer(
 resource_app = typer.Typer(
     help="Inspect and control typed resources.", no_args_is_help=True
 )
+notification_app = typer.Typer(
+    help="Rotate or purge persisted notification credentials.", no_args_is_help=True
+)
 app.add_typer(resource_app, name="resource")
+app.add_typer(notification_app, name="notifications")
 
 
 def _machine_identity() -> tuple[str, str | None]:
@@ -408,6 +418,34 @@ async def _wait_for_server(server: uvicorn.Server, task: asyncio.Task[Any]) -> N
         await asyncio.sleep(0.05)
 
 
+async def _run_while_server_available(
+    supervisor: RunSupervisor,
+    *,
+    start_run: bool,
+    server_task: asyncio.Task[Any],
+) -> int:
+    """Run execute/open work only while the dashboard server remains available."""
+
+    work_task = asyncio.create_task(
+        _run_and_linger(supervisor, start_run=start_run),
+        name="runwatch-run-and-linger",
+    )
+    try:
+        completed, _pending = await asyncio.wait(
+            {server_task, work_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if server_task in completed:
+            error = None if server_task.cancelled() else server_task.exception()
+            if error is not None:
+                raise RuntimeError("Runwatch web server exited unexpectedly") from error
+            raise RuntimeError("Runwatch web server exited unexpectedly")
+        return await work_task
+    finally:
+        if not work_task.done():
+            work_task.cancel()
+        await asyncio.gather(work_task, return_exceptions=True)
+
+
 async def _dashboard_base(
     config: RunwatchConfig, local_base: str
 ) -> tuple[str, CloudflaredTunnel | None]:
@@ -445,36 +483,78 @@ async def _run_and_linger(supervisor: RunSupervisor, *, start_run: bool) -> int:
     linger = supervisor.config.server.linger_seconds
     if linger is None:
         typer.echo("Dashboard remains available; press Ctrl+C to close it.")
-        await asyncio.Event().wait()
     elif linger > 0:
         typer.echo(
             f"Dashboard remains available for {linger:g} seconds before closing."
         )
-        await asyncio.sleep(linger)
+    await _linger_while_action_loop_healthy(supervisor, linger)
     return 0 if status is RunStatus.SUCCEEDED else 1
+
+
+async def _linger_while_action_loop_healthy(
+    supervisor: RunSupervisor, linger_seconds: float | None
+) -> None:
+    if linger_seconds is not None and linger_seconds <= 0:
+        return
+    if linger_seconds is None:
+        linger_task = asyncio.create_task(
+            asyncio.Event().wait(), name="runwatch-dashboard-indefinite-linger"
+        )
+    else:
+        linger_task = asyncio.create_task(
+            asyncio.sleep(linger_seconds), name="runwatch-dashboard-linger"
+        )
+    health_task = asyncio.create_task(
+        supervisor.wait_for_action_loop_failure(),
+        name="runwatch-action-loop-health",
+    )
+    try:
+        completed, _pending = await asyncio.wait(
+            {linger_task, health_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if health_task in completed:
+            await health_task
+            raise RuntimeError("Runwatch action-loop health waiter exited unexpectedly")
+        await linger_task
+    finally:
+        for task in (health_task, linger_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(health_task, linger_task, return_exceptions=True)
 
 
 async def _successful_cleanup_decision(
     supervisor: RunSupervisor,
 ) -> tuple[bool, str | None]:
-    if not getattr(supervisor, "cleanup_on_success", True):
-        return False, None
     try:
         run = supervisor.store.get_run(supervisor.run_id)
     except Exception:
         return False, None
-    if RunStatus(run["status"]) is not RunStatus.SUCCEEDED:
+    status = RunStatus(run["status"])
+    if not status.terminal:
         return False, None
+    cleanup_requested = bool(getattr(supervisor, "cleanup_on_success", False))
+    cleanup_authorized = bool(
+        cleanup_requested
+        and status is RunStatus.SUCCEEDED
+        and getattr(supervisor, "wait_completed_normally", False)
+        and run.get("finalization_complete", False)
+    )
     try:
         drain = await supervisor.notifications.drain(
             supervisor.config.notifications.terminal_drain_timeout_seconds
         )
     except Exception as error:
-        reason = f"notification drain failed: {type(error).__name__}: {error}"
+        reason = None
+        if cleanup_requested and status is RunStatus.SUCCEEDED:
+            reason = f"notification drain failed: {type(error).__name__}: {error}"
         return False, reason
     if drain.complete:
-        return True, None
-    return False, drain.reason or "notification delivery is incomplete"
+        return cleanup_authorized, None
+    reason = None
+    if cleanup_requested and status is RunStatus.SUCCEEDED:
+        reason = drain.reason or "notification delivery is incomplete"
+    return False, reason
 
 
 async def _publish_cleanup_retention(
@@ -570,7 +650,11 @@ async def _serve(
         public_base, tunnel = await _dashboard_base(config, local_base)
         pairing_url = with_token(public_base, token)
         _announce_run(supervisor, pairing_url)
-        return await _run_and_linger(supervisor, start_run=start_run)
+        return await _run_while_server_available(
+            supervisor,
+            start_run=start_run,
+            server_task=server_task,
+        )
     finally:
         if tunnel:
             with contextlib.suppress(Exception):
@@ -610,7 +694,10 @@ def _run_store(run_dir: Path) -> tuple[dict[str, Any], RunwatchConfig, RunStore]
         max_log_bytes_per_resource=config.storage.max_log_bytes_per_resource,
         max_events_per_run=config.storage.max_events_per_run,
         max_event_bytes_per_run=config.storage.max_event_bytes_per_run,
+        max_event_payload_bytes=config.storage.max_event_payload_bytes,
         max_resource_payload_bytes=config.storage.max_resource_payload_bytes,
+        max_notification_record_bytes=config.storage.max_notification_record_bytes,
+        max_delivery_error_bytes=config.storage.max_delivery_error_bytes,
     )
     return manifest, config, store
 
@@ -905,13 +992,18 @@ def status(
         snapshot = store.snapshot(
             manifest["run_id"], chart_points=config.storage.dashboard_chart_points
         )
+        presented = CliPresenter(
+            snapshot=snapshot, settings=config.notifications, run_dir=run_dir
+        ).status()
         if json_output:
-            typer.echo(json.dumps(snapshot, indent=2, default=str))
+            typer.echo(presented.model_dump_json(indent=2))
         else:
-            run = snapshot["run"]
-            typer.echo(f"{run['name']}: {run['status']} — {run.get('message') or ''}")
-            typer.echo(f"Source: {run['source_path']}")
-            typer.echo(f"Resources: {len(snapshot['resources'])}")
+            typer.echo(
+                f"{presented.run.name}: {presented.run.status} — "
+                f"{presented.run.message or ''}"
+            )
+            typer.echo(f"Source: {presented.source_path}")
+            typer.echo(f"Resources: {presented.resources.total}")
     finally:
         store.close()
 
@@ -930,46 +1022,23 @@ def context(
         snapshot = store.snapshot(
             manifest["run_id"], chart_points=config.storage.dashboard_chart_points
         )
-        run = snapshot["run"]
-        failed = next(
-            (
-                cell
-                for cell in snapshot["cells"]
-                if cell["cell_index"] == run.get("failed_cell_index")
-            ),
-            None,
-        )
-        dossier = {
-            "run": run,
-            "failed_cell": failed,
-            "resources": snapshot["resources"],
-            "recent_events": snapshot["events"][-40:],
-            "source_path": str(run_dir.resolve() / "source.ipynb"),
-            "suggested_commands": {
-                "resume": f"runwatch resume {run_dir.resolve()}",
-                "restart": f"runwatch restart {run_dir.resolve()}",
-            },
-        }
+        dossier = CliPresenter(
+            snapshot=snapshot, settings=config.notifications, run_dir=run_dir
+        ).context()
         if json_output or output_format == "json":
-            typer.echo(json.dumps(dossier, indent=2, default=str))
+            typer.echo(dossier.model_dump_json(indent=2))
             return
-        typer.echo(f"# Runwatch context: {run['name']}\n")
-        typer.echo(f"- Status: `{run['status']}`")
-        typer.echo(f"- Message: {run.get('message') or '—'}")
-        typer.echo(f"- Kernel epoch: {run['kernel_epoch']}")
-        typer.echo(f"- Editable notebook: `{dossier['source_path']}`")
-        if failed:
-            typer.echo(f"\n## Failed cell {failed['cell_index'] + 1}\n")
-            typer.echo(f"- Attempt: {failed['attempt']}")
-            typer.echo(
-                f"- Error: `{failed.get('error_name')}: {failed.get('error_value')}`"
-            )
-            typer.echo("\n```python\n" + failed["source"] + "\n```")
-        resources = dossier.get("resources")
-        resource_count = (
-            len(cast(list[Any], resources)) if isinstance(resources, list) else 0
-        )
-        typer.echo(f"\n## Resources\n\n{resource_count} tracked resource(s).")
+        typer.echo(f"# Runwatch context: {dossier.run.name}\n")
+        typer.echo(f"- Status: `{dossier.run.status}`")
+        typer.echo(f"- Message: {dossier.run.message or '—'}")
+        typer.echo(f"- Kernel epoch: {dossier.run.kernel_epoch}")
+        typer.echo(f"- Editable notebook: `{dossier.source_path}`")
+        if dossier.failed_cell:
+            failed = dossier.failed_cell
+            typer.echo(f"\n## Failed cell {failed.cell_index + 1}\n")
+            typer.echo(f"- Attempt: {failed.attempt}")
+            typer.echo(f"- Error type: `{failed.error_type or 'unknown'}`")
+        typer.echo(f"\n## Resources\n\n{len(dossier.resources)} tracked resource(s).")
     finally:
         store.close()
 
@@ -981,8 +1050,14 @@ def events(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Print persisted events and optionally follow new events."""
-    manifest, _config, store = _run_store(run_dir)
+    manifest, config, store = _run_store(run_dir)
     try:
+        snapshot = store.snapshot(
+            manifest["run_id"], chart_points=config.storage.dashboard_chart_points
+        )
+        presenter = CliPresenter(
+            snapshot=snapshot, settings=config.notifications, run_dir=run_dir
+        )
         seen = 0
         while True:
             values = store.recent_events(manifest["run_id"], limit=500)
@@ -990,10 +1065,13 @@ def events(
                 if event["seq"] <= seen:
                     continue
                 seen = event["seq"]
+                presented = presenter.event(event)
                 typer.echo(
-                    json.dumps(event, default=str)
+                    presented.model_dump_json()
                     if json_output
-                    else f"{event['timestamp']} {event['type']} {event['payload']}"
+                    else (
+                        f"{presented.timestamp} {presented.type} " f"{presented.data}"
+                    )
                 )
             if not follow:
                 return
@@ -1152,6 +1230,8 @@ async def _execute_offline_stop(
     resource_id: str,
 ) -> None:
     recovered_stop = _recover_confirmed_offline_stop(store, action, resource_id)
+    if recovered_stop:
+        await manager.finalize_terminal_resource(resource_id)
     if _finish_terminal_offline_stop(
         store, action["action_id"], resource_id, recovered_stop, run_id
     ):
@@ -1178,14 +1258,15 @@ async def _execute_offline_stop(
     ):
         return
     await manager.stop_cancel_resources()
-    store.update_run_status(
-        run_id, RunStatus.CANCELLED, message="Run cancelled", ended=True
-    )
     kernel_epoch = int(store.get_run(run_id)["kernel_epoch"])
-    await bus.publish(
-        "run.cancelled",
-        {"offline": True, "kernel_epoch": kernel_epoch},
+    event = store.finish_run(
+        run_id,
+        RunStatus.CANCELLED,
+        message="Run cancelled",
+        event_type="run.cancelled",
+        event_payload={"offline": True, "kernel_epoch": kernel_epoch},
     )
+    bus.fan_out_persisted(event)
     _finish_offline_stop_action(store, action["action_id"], resource_id)
 
 
@@ -1195,12 +1276,13 @@ async def _cancel_offline_run(store: RunStore, bus: EventBus, run_id: str) -> bo
         return False
     if current is RunStatus.CANCELLING:
         return True
-    store.update_run_status(
+    event = store.request_run_cancellation(
         run_id,
-        RunStatus.CANCELLING,
         message="Offline resource stop accepted; cancelling run",
+        event_payload={"offline": True},
     )
-    await bus.publish("run.cancel_requested", {"offline": True})
+    if event is not None:
+        bus.fan_out_persisted(event)
     return True
 
 
@@ -1277,6 +1359,120 @@ def _finish_offline_stop_action(
         ActionStatus.COMPLETED,
         message=message,
         result=result,
+    )
+
+
+def _write_run_manifest_config(
+    run_dir: Path, manifest: dict[str, Any], config: RunwatchConfig
+) -> None:
+    payload = {**manifest, "config": config.model_dump(mode="json")}
+    atomic_write_bytes(
+        run_dir / "run-manifest.json",
+        json.dumps(payload, indent=2).encode("utf-8"),
+    )
+
+
+def _require_offline_notification_store(
+    run_dir: Path,
+) -> tuple[dict[str, Any], RunwatchConfig, RunStore]:
+    manifest, config, store = _run_store(run_dir)
+    try:
+        run = store.get_run(str(manifest["run_id"]))
+        if not controller_is_alive(run):
+            return manifest, config, store
+    except Exception:
+        store.close()
+        raise
+    store.close()
+    raise RuntimeError(
+        "Notification credential maintenance requires a stopped Runwatch controller"
+    )
+
+
+@notification_app.command("rotate")
+def rotate_notifications(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    config_path: Annotated[
+        Path,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, readable=True),
+    ],
+) -> None:
+    """Rotate notification credentials without changing destination topology."""
+
+    run_dir = run_dir.resolve()
+    desired_notifications = load_config(config_path).notifications
+    lock = RunLock(run_dir)
+    lock.acquire()
+    try:
+        manifest, current_config, store = _require_offline_notification_store(run_dir)
+        try:
+            desired_topology = notification_topology(desired_notifications)
+            persisted_topology = store.notification_delivery_topology(
+                str(manifest["run_id"])
+            )
+            if persisted_topology and persisted_topology != desired_topology:
+                raise typer.BadParameter(
+                    "Notification rotation requires the same webhook/ntfy topology; "
+                    "purge the old outbox before changing topology"
+                )
+            desired_config = current_config.model_copy(
+                update={"notifications": desired_notifications}
+            )
+            _write_run_manifest_config(run_dir, manifest, desired_config)
+            result = store.reconcile_notification_configuration(
+                str(manifest["run_id"]),
+                current_destinations=notification_destinations(
+                    current_config.notifications
+                ),
+                desired_destinations=notification_destinations(desired_notifications),
+                desired_configuration=desired_notifications.model_dump(mode="json"),
+            )
+        finally:
+            store.close()
+    finally:
+        lock.release()
+    typer.echo(
+        "Rotated notification credentials "
+        f"({result['rotated_destinations']} destination mapping(s), "
+        f"{result['sanitized_intents']} legacy intent(s) sanitized)."
+    )
+
+
+@notification_app.command("purge")
+def purge_notifications(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Confirm irreversible notification-state deletion."),
+    ] = False,
+) -> None:
+    """Purge the notification outbox and disable notification routing."""
+
+    if not yes:
+        raise typer.BadParameter("Pass --yes to purge persisted notification state")
+    run_dir = run_dir.resolve()
+    lock = RunLock(run_dir)
+    lock.acquire()
+    try:
+        manifest, current_config, store = _require_offline_notification_store(run_dir)
+        try:
+            disabled = NotificationSettings()
+            desired_config = current_config.model_copy(
+                update={"notifications": disabled}
+            )
+            _write_run_manifest_config(run_dir, manifest, desired_config)
+            result = store.purge_notification_state(
+                str(manifest["run_id"]),
+                desired_configuration=disabled.model_dump(mode="json"),
+            )
+        finally:
+            store.close()
+    finally:
+        lock.release()
+    typer.echo(
+        "Purged notification state "
+        f"({result['deleted_intents']} intent(s), "
+        f"{result['deleted_deliveries']} delivery row(s))."
     )
 
 

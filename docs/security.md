@@ -27,6 +27,26 @@ multi-user service.
 - Notification routing replays persisted events and retries each destination
   independently. Delivery is at least once, with stable `Idempotency-Key` and
   `X-Runwatch-Intent-ID` headers for receiver-side deduplication.
+- Notification and agent-CLI output use dedicated allowlisted presentation schemas.
+  Webhooks do not receive resolved configuration, raw event payloads, tracebacks,
+  logs, metrics, provider responses, account IDs, controller credentials, or internal
+  paths. Delivery errors contain only a bounded error category and optional HTTP
+  status; response bodies and credential-bearing request URLs are never retained.
+- Notification response bodies are not read, redirects are not followed, encoded
+  webhook payloads are bounded, and non-loopback plain HTTP destinations require the
+  explicit `notifications.allow_insecure_http` opt-in.
+- Periodic notifications use a single rolling durable intent and a lightweight state
+  summary, so long-running jobs do not accumulate successful reminder history.
+- Offline `runwatch notifications rotate` uses manifest-first desired state and a
+  same-topology transaction to replace credentials in every pending and terminal
+  delivery row. Startup finishes an interrupted rotation before recovery workers can
+  claim old destinations. Legacy terminal deduplication aliases are consolidated before
+  delivery, and a one-time egress migration removes historical URL/body-bearing errors.
+- Offline `runwatch notifications purge --yes` deletes intents and deliveries, disables
+  routing at the current event high-water mark, scrubs notification diagnostic payloads
+  and metadata, and enables SQLite secure deletion before best-effort WAL truncation and
+  compaction. Filesystem snapshots, backups, and storage-device history remain outside
+  Runwatch's deletion guarantee.
 - Successful cleanup waits boundedly for notification routing and outbox attempts to
   become terminal. Incomplete delivery retains the run for `runwatch open` recovery.
 - Run ownership verifies PID, process start time, host, boot identity, and controller
@@ -61,6 +81,12 @@ multi-user service.
   payloads, durable actions, and the dashboard bearer token. File modes are access
   control for an ordinary single-user host, not encryption or protection from the
   account owner, privileged users, host compromise, backups, or disk forensics.
+- Run names, explicitly safe logical resource labels, and bounded error types remain
+  visible in presentations. Runwatch does not attempt to discover arbitrary secrets in
+  every user-authored name; keep credentials out of display labels.
+- Rotation intentionally preserves destination topology while an outbox exists. Purge
+  first when webhook count or ntfy presence must change, then rotate from the empty
+  outbox to record the replacement topology.
 - A local user able to edit the run directory can alter its source or SQLite state.
 - A linked dashboard is trusted local code. Once paired, its complete native interface
   is exposed through the proxy, including any mutations that application provides.

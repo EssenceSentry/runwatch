@@ -89,6 +89,21 @@
             "Guarding your job one heartbeat at a time."
         ]
     },
+    "finalizing": {
+        "image": "inspecting.png",
+        "phrases": [
+            "One last notebook sniff before we finish.",
+            "Tucking every result safely into place.",
+            "The final paw-print is almost dry.",
+            "Packing up the notebook for you.",
+            "Checking the result basket one last time.",
+            "Saving our place before the victory lap.",
+            "Almost done—just securing the last few sticks.",
+            "Finishing touches from the paw-powered crew.",
+            "Making sure every result made it home.",
+            "Final checks now, celebratory zoomies next."
+        ]
+    },
     "succeeded": {
         "image": "success.png",
         "phrases": [

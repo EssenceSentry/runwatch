@@ -12,9 +12,21 @@ runwatch resume RUN_DIR
 runwatch restart RUN_DIR [--from-cell N]
 runwatch resource stop RUN_DIR RESOURCE_ID
 runwatch open RUN_DIR
+runwatch notifications rotate RUN_DIR --config PATH
+runwatch notifications purge RUN_DIR --yes
 runwatch init-config [PATH]
 runwatch version
 ```
+
+JSON from `status`, `context`, and `events` uses Runwatch's bounded CLI presentation
+schema. It intentionally omits resolved configuration, credentials, raw provider state,
+and arbitrary event payload fields; read `source.ipynb` directly when deeper notebook
+inspection is required.
+
+Notification credential maintenance requires a stopped controller. Use `rotate` for
+credential-only changes with the same destination topology. To change webhook count or
+ntfy presence, purge first, then rotate from the empty outbox. Purge is irreversible and
+requires `--yes`; neither command prints endpoint values.
 
 ## Dashboard handoff
 

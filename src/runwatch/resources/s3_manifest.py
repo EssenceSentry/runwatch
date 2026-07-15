@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from ..models import ResourceObservation, ResourceStatus
-from .base import ResourceAdapter, ResourceOperationError
+from ..schema_versions import S3_PROGRESS_MANIFEST_SCHEMA_VERSION
+from .base import AwsResourceAdapter, ResourceOperationError
 from .s3 import parse_s3_uri
 
 _MAX_MANIFEST_BYTES = 1_048_576
@@ -84,7 +85,10 @@ def _decode_manifest(raw: bytes, location: str) -> dict[str, Any]:
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ResourceOperationError(f"Invalid JSON manifest at {location}") from error
     if not isinstance(decoded, dict):
-        raise ResourceOperationError("Runwatch manifests require schema_version=1")
+        raise ResourceOperationError(
+            "Runwatch manifests require schema_version="
+            f"{S3_PROGRESS_MANIFEST_SCHEMA_VERSION}"
+        )
     return cast(dict[str, Any], decoded)
 
 
@@ -93,9 +97,12 @@ def _manifest_status(payload: dict[str, Any]) -> _ManifestStatus:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version != 1
+        or schema_version != S3_PROGRESS_MANIFEST_SCHEMA_VERSION
     ):
-        raise ResourceOperationError("Runwatch manifests require schema_version=1")
+        raise ResourceOperationError(
+            "Runwatch manifests require schema_version="
+            f"{S3_PROGRESS_MANIFEST_SCHEMA_VERSION}"
+        )
     status = payload.get("status")
     if status not in {"running", "completed", "failed"}:
         raise ResourceOperationError(
@@ -182,7 +189,7 @@ def _manifest_observation(
     )
 
 
-class S3ManifestAdapter(ResourceAdapter):
+class S3ManifestAdapter(AwsResourceAdapter):
     provider = "aws"
     resource_type = "s3_manifest"
     supports_blocking = True

@@ -304,6 +304,7 @@ def test_ntfy_deep_link_marks_plain_http_as_insecure() -> None:
             NotificationSettings(
                 ntfy_base_url="http://192.168.1.3:8080",
                 ntfy_topic="runs",
+                allow_insecure_http=True,
             )
         )
         == "ntfy://192.168.1.3:8080/runs?secure=false"

@@ -9,8 +9,8 @@ import nbformat
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
 from nbformat import NotebookNode
 
+from .adapters import default_adapter_registry
 from .models import ResourceEvent, RunwatchConfig
-from .resources import BUILTIN_ADAPTER_TYPES, validate_resource_event
 
 
 class ValidationReport(TypedDict):
@@ -65,18 +65,17 @@ def _validate_resources(
     config: RunwatchConfig, errors: list[str]
 ) -> list[dict[str, Any]]:
     resources: list[dict[str, Any]] = []
+    registry = default_adapter_registry()
     for index, registration in enumerate(config.resources):
         event = ResourceEvent(
             resource=registration.resource,
             lifecycle=registration.lifecycle,
         )
+        adapter = None
         try:
-            validate_resource_event(event)
+            adapter = registry.validate(event)
         except Exception as error:
             errors.append(f"Configured resource {index + 1}: {error}")
-        adapter = BUILTIN_ADAPTER_TYPES.get(
-            (registration.resource.provider, registration.resource.type)
-        )
         resources.append(
             {
                 "provider": registration.resource.provider,

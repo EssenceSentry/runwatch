@@ -6,15 +6,15 @@ import os
 import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import uuid4
 
 import nbformat
 
 from ._fs import atomic_write_bytes, ensure_private_directory
 from .events import EventBus
+from .manifest import read_run_manifest
 from .models import (
-    SCHEMA_VERSION,
     ActionKind,
     ActionStatus,
     ResourceEvent,
@@ -31,6 +31,7 @@ from .notebook import (
 )
 from .notifications import NotificationManager
 from .resource_manager import ResourceManager, ResourceStopRejected
+from .schema_versions import RUN_MANIFEST_SCHEMA_VERSION
 from .storage import RunStore, controller_is_alive, process_start_time, source_hash
 
 if TYPE_CHECKING:
@@ -86,7 +87,12 @@ class RunSupervisor:
             max_log_bytes_per_resource=config.storage.max_log_bytes_per_resource,
             max_events_per_run=config.storage.max_events_per_run,
             max_event_bytes_per_run=config.storage.max_event_bytes_per_run,
+            max_event_payload_bytes=config.storage.max_event_payload_bytes,
             max_resource_payload_bytes=config.storage.max_resource_payload_bytes,
+            max_notification_record_bytes=(
+                config.storage.max_notification_record_bytes
+            ),
+            max_delivery_error_bytes=config.storage.max_delivery_error_bytes,
         )
         if not reopen:
             self.store.initialize_run(
@@ -132,7 +138,9 @@ class RunSupervisor:
         )
         self._runner_task: asyncio.Task[RunStatus] | None = None
         self._action_task: asyncio.Task[None] | None = None
+        self._action_task_termination_observed = False
         self._finalized = False
+        self._wait_completed_normally = False
         self._quiesced = False
         self._quiesce_error: BaseException | None = None
         self._closed = False
@@ -151,6 +159,12 @@ class RunSupervisor:
             raise RuntimeError("Dashboard links are already attached")
         self._dashboard_links = manager
         self.resources.attach_dashboard_links(manager)
+
+    @property
+    def wait_completed_normally(self) -> bool:
+        """Whether runner and supervisor finalization both returned normally."""
+
+        return self._wait_completed_normally
 
     def _validate_output_path_ownership(self) -> None:
         reserved = {
@@ -187,25 +201,19 @@ class RunSupervisor:
             reopen=True,
             initial_from_cell=from_cell,
             bootstrap_action_id=bootstrap_action_id,
-            cleanup_on_success=bool(manifest.get("cleanup_on_success", True)),
+            cleanup_on_success=manifest["cleanup_on_success"],
         )
 
     @staticmethod
     def read_manifest(run_dir: Path) -> dict[str, Any]:
         path = run_dir.resolve() / "run-manifest.json"
-        value = json.loads(path.read_text(encoding="utf-8"))
-        version = value.get("schema_version")
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Unsupported Runwatch manifest schema {version!r}; expected {SCHEMA_VERSION}"
-            )
-        return value
+        return read_run_manifest(path).model_dump(mode="json")
 
     def _write_manifest(self) -> None:
         path = self.run_dir / "run-manifest.json"
         payload = json.dumps(
             {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
                 "run_id": self.run_id,
                 "name": self.name,
                 "notebook_path": str(self.notebook_path),
@@ -349,11 +357,94 @@ class RunSupervisor:
     async def wait(self) -> RunStatus:
         if self._runner_task is None:
             raise RuntimeError("Supervisor has not been started")
-        status = await self._runner_task
+        status = await self._wait_for_runtime_completion()
         if not self._finalized:
             await self._after_run(status)
+            await self._raise_if_action_loop_terminated()
+            self.store.mark_run_finalized(self.run_id, status)
             self._finalized = True
+        self._wait_completed_normally = True
         return status
+
+    async def _wait_for_runtime_completion(self) -> RunStatus:
+        runner_task = self._runner_task
+        if runner_task is None:
+            raise RuntimeError("Supervisor has not been started")
+        action_task = self._action_task
+        if action_task is None:
+            return await runner_task
+        completed, _pending = await asyncio.wait(
+            {runner_task, action_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if action_task in completed and not self._quiesced:
+            await self._raise_unexpected_action_loop_termination(action_task)
+        return await runner_task
+
+    async def _raise_if_action_loop_terminated(self) -> None:
+        action_task = self._action_task
+        if (
+            action_task is not None
+            and action_task.done()
+            and not self._quiesced
+            and not self._action_task_termination_observed
+        ):
+            await self._raise_unexpected_action_loop_termination(action_task)
+
+    async def _raise_unexpected_action_loop_termination(
+        self, action_task: asyncio.Task[None]
+    ) -> NoReturn:
+        self._wait_completed_normally = False
+        failure, cause = self._action_loop_termination_failure(action_task)
+        self._action_task_termination_observed = True
+        try:
+            await self.quiesce()
+        except BaseException as quiesce_error:
+            combined = RuntimeError(
+                f"{failure}; runtime shutdown also failed "
+                f"({type(quiesce_error).__name__})"
+            )
+            raise combined from (cause or quiesce_error)
+        if cause is not None:
+            raise failure from cause
+        raise failure
+
+    async def wait_for_action_loop_failure(self) -> NoReturn:
+        """Wait until the live control loop terminates, then surface that failure.
+
+        This remains active after notebook finalization while the dashboard lingers.
+        Cancelling the waiter does not cancel the underlying action loop.
+
+        Raises
+        ------
+        RuntimeError
+            If the supervisor has not started or the action loop terminates while the
+            runtime is expected to remain available.
+        """
+
+        action_task = self._action_task
+        if action_task is None:
+            raise RuntimeError("Supervisor has not been started")
+        await asyncio.wait({action_task})
+        await self._raise_unexpected_action_loop_termination(action_task)
+
+    @staticmethod
+    def _action_loop_termination_failure(
+        action_task: asyncio.Task[None],
+    ) -> tuple[RuntimeError, BaseException | None]:
+        if action_task.cancelled():
+            return (
+                RuntimeError("Runwatch action loop was cancelled unexpectedly"),
+                asyncio.CancelledError(),
+            )
+        cause = action_task.exception()
+        if cause is None:
+            return RuntimeError("Runwatch action loop exited unexpectedly"), None
+        return (
+            RuntimeError(
+                "Runwatch action loop failed unexpectedly " f"({type(cause).__name__})"
+            ),
+            cause,
+        )
 
     async def quiesce(self) -> None:
         """Stop event producers while leaving notifications and storage available."""
@@ -386,7 +477,15 @@ class RunSupervisor:
         )
 
     async def _stop_runtime_tasks(self) -> None:
-        runner_was_running = bool(self._runner_task and not self._runner_task.done())
+        runner_existed = self._runner_task is not None
+        action_failure: tuple[RuntimeError, BaseException | None] | None = None
+        if (
+            self._action_task is not None
+            and self._action_task.done()
+            and not self._action_task_termination_observed
+        ):
+            action_failure = self._action_loop_termination_failure(self._action_task)
+            self._action_task_termination_observed = True
         tasks: list[asyncio.Task[Any]] = [
             task
             for task in (self._action_task, self._runner_task)
@@ -397,8 +496,13 @@ class RunSupervisor:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.runner.shutdown()
-        if runner_was_running:
+        if runner_existed:
             await self._pause_after_process_stop()
+        if action_failure is not None:
+            failure, cause = action_failure
+            if cause is not None:
+                raise failure from cause
+            raise failure
 
     async def _pause_after_process_stop(self) -> None:
         run = self.store.get_run(self.run_id)
@@ -411,7 +515,14 @@ class RunSupervisor:
                 "Runwatch process stopped; use runwatch resume to reconstruct the run"
             ),
         )
-        await self.bus.publish("run.process_stopped", {})
+        try:
+            await self.bus.publish("run.process_stopped", {})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # PAUSED is already durable. A diagnostic event failure must not mask the
+            # runtime/server error that initiated shutdown.
+            return
 
     async def _capture_async_cleanup(
         self, cleanup: Callable[[], Awaitable[None]]
@@ -633,6 +744,7 @@ class RunSupervisor:
         }:
             terminal_status = RunStatus(run["status"])
             if self._recover_confirmed_stop(action, internal_id):
+                await self.resources.finalize_terminal_resource(internal_id)
                 await self._complete_stop_action(
                     action,
                     [internal_id],
@@ -662,6 +774,8 @@ class RunSupervisor:
                 on_stop_accepted=self.runner.cancel,
                 allow_stopping=recovered,
             )
+        else:
+            await self.resources.finalize_terminal_resource(internal_id)
         await self.runner.cancel()
         terminal_status = self._terminal_run_status()
         if terminal_status is not None:

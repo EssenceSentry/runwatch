@@ -32,7 +32,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test
+        run: uv sync --locked --extra supervisor --extra test
       - name: Pytest
         run: >
           uv run python -m pytest tests

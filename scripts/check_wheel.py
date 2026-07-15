@@ -13,6 +13,8 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PACKAGE_FILES = {
     "runwatch/__init__.py",
+    "runwatch/_cli_entrypoint.py",
+    "runwatch/adapters.py",
     "runwatch/cli.py",
     "runwatch/default_config.yaml",
     "runwatch/py.typed",
@@ -36,6 +38,19 @@ REQUIRED_DATA_SUFFIXES = {
 
 def _run(command: list[str], *, cwd: Path) -> None:
     subprocess.run(command, cwd=cwd, check=True)
+
+
+def _assert_base_cli_requires_supervisor(command: list[str], *, cwd: Path) -> None:
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    output = f"{result.stdout}\n{result.stderr}"
+    if result.returncode == 0:
+        raise RuntimeError("base-only runwatch CLI unexpectedly succeeded")
+    if "runwatch-notebook[supervisor]" not in output:
+        raise RuntimeError(
+            "base-only runwatch CLI did not explain how to install extras"
+        )
+    if "Traceback (most recent call last)" in output:
+        raise RuntimeError("base-only runwatch CLI emitted a Python traceback")
 
 
 def _venv_python(venv: Path) -> Path:
@@ -111,9 +126,43 @@ def main() -> int:
                     str(python),
                     "-c",
                     (
-                        "import runwatch; "
-                        "from runwatch.web import _web_artifacts_root; "
+                        "import importlib.metadata, sys; "
+                        "import runwatch; import runwatch.aws; import runwatch.local; "
+                        "from runwatch import (ResourceEvent, ResourceLifecycle, "
+                        "ResourceSpec, emit_resource); "
                         "assert runwatch.__version__ == '0.2.0'; "
+                        "event = ResourceEvent(resource=ResourceSpec("
+                        "provider='example', type='job', id='job-1'), "
+                        "lifecycle=ResourceLifecycle()); "
+                        "assert emit_resource(event, text='example')['resource']"
+                        "['provider'] == 'example'; "
+                        "names = {d.metadata['Name'].lower() "
+                        "for d in importlib.metadata.distributions()}; "
+                        "assert not names.intersection({'boto3', 'fastapi', "
+                        "'httpx', 'nbclient', 'uvicorn'}); "
+                        "assert not {'boto3', 'fastapi', 'httpx', 'nbclient'} "
+                        ".intersection(sys.modules)"
+                    ),
+                ],
+                cwd=root,
+            )
+            _assert_base_cli_requires_supervisor(
+                [str(_venv_runwatch(venv)), "version"], cwd=root
+            )
+            _assert_base_cli_requires_supervisor(
+                [str(python), "-m", "runwatch", "version"], cwd=root
+            )
+            requirement = f"runwatch-notebook[supervisor] @ {wheel.as_uri()}"
+            _run(
+                [uv, "pip", "install", "--python", str(python), requirement],
+                cwd=root,
+            )
+            _run(
+                [
+                    str(python),
+                    "-c",
+                    (
+                        "from runwatch.web import _web_artifacts_root; "
                         "assert _web_artifacts_root().is_dir()"
                     ),
                 ],
@@ -123,7 +172,7 @@ def main() -> int:
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"wheel check failed: {exc}", file=sys.stderr)
         return 1
-    print("Runwatch wheel contents and isolated install passed.")
+    print("Runwatch base and supervisor-extra wheel installs passed.")
     return 0
 
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import stat
 import threading
 from collections.abc import Callable
@@ -20,6 +22,7 @@ from runwatch.models import (
     RunnerCommand,
     RunStatus,
     RunwatchConfig,
+    StorageSettings,
 )
 from runwatch.notebook import write_notebook_atomic
 from runwatch.storage import RunStore, source_hash
@@ -59,6 +62,17 @@ def timeout_config() -> RunwatchConfig:
             checkpoint_interval_seconds=0.05,
             wait_for_blocking_resources=False,
         )
+    )
+
+
+def minimum_event_payload_config() -> RunwatchConfig:
+    return RunwatchConfig(
+        notebook=NotebookSettings(
+            kernel_name="python3",
+            checkpoint_interval_seconds=0.05,
+            wait_for_blocking_resources=False,
+        ),
+        storage=StorageSettings(max_event_payload_bytes=1_024),
     )
 
 
@@ -138,6 +152,205 @@ def test_atomic_notebook_write_preserves_mode_and_defaults_to_private(
     assert stat.S_IMODE(created.stat().st_mode) == 0o600
 
 
+def test_configured_cell_label_is_bounded_for_minimum_event_payload() -> None:
+    notebook = nbformat.v4.new_notebook(
+        cells=[nbformat.v4.new_code_cell("pass", id="bounded-cell")]
+    )
+    notebook.cells[0].metadata["runwatch"] = {"label": "\x00" * 5_000}
+
+    label = notebook_module._cell_label(notebook, 0)
+    payload = {
+        "cell_index": 0,
+        "cell_id": notebook.cells[0].id,
+        "attempt": 1,
+        "kernel_epoch": 0,
+        "label": label,
+    }
+
+    assert len(label) == 120
+    assert (
+        len(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        <= 1_024
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transition", "expected_status", "expected_event"),
+    [
+        ("succeeded", "succeeded", "run.succeeded"),
+        ("cancelled", "cancelled", "run.cancelled"),
+        ("failed", "failed", "run.failed_external"),
+        ("paused_cell", "paused", "cell.failed"),
+    ],
+)
+async def test_durable_transitions_ignore_in_memory_fanout_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transition: str,
+    expected_status: str,
+    expected_event: str,
+) -> None:
+    notebook_path = tmp_path / f"{transition}.ipynb"
+    write_notebook(notebook_path, ["print('transition')"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+    runner = supervisor.runner
+
+    async def skip_checkpoint(*, force: bool, writeback: bool = False) -> None:
+        assert force is True
+        del writeback
+
+    def fail_in_memory_fan_out(event: dict[str, Any]) -> None:
+        raise RuntimeError(f"subscriber rejected event {event['seq']}")
+
+    monkeypatch.setattr(runner, "_checkpoint", skip_checkpoint)
+    monkeypatch.setattr(supervisor.bus, "_fan_out_nowait", fail_in_memory_fan_out)
+
+    if transition == "succeeded":
+        assert await runner._finish_succeeded() is RunStatus.SUCCEEDED
+    elif transition == "cancelled":
+        assert await runner._finish_cancelled() is RunStatus.CANCELLED
+    elif transition == "failed":
+        assert (
+            await runner._finish_external_failure([{"internal_id": "broken"}])
+            is RunStatus.FAILED
+        )
+    else:
+        supervisor.store.update_run_status(
+            supervisor.run_id,
+            RunStatus.RUNNING,
+            current_cell_index=0,
+            started=True,
+        )
+        attempt = supervisor.store.begin_cell_attempt(
+            supervisor.run_id,
+            0,
+            "print('transition')",
+            "source-digest",
+            runner.kernel_epoch,
+        )
+        await runner._pause_failed_cell(
+            0,
+            attempt,
+            0.25,
+            error_name="ValueError",
+            error_value="boom",
+            traceback=["trace"],
+        )
+
+    run = supervisor.store.get_run(supervisor.run_id)
+    assert run["status"] == expected_status
+    assert supervisor.store.recent_events(supervisor.run_id)[-1]["type"] == (
+        expected_event
+    )
+    if transition == "paused_cell":
+        cell = supervisor.store.snapshot(supervisor.run_id)["cells"][0]
+        assert cell["status"] == "failed"
+        assert runner.paused is True
+    await supervisor.close()
+
+
+def test_nbclient_private_hook_signatures_match_supported_range() -> None:
+    """Fail clearly when a supported nbclient release changes private hooks."""
+
+    assert list(
+        inspect.signature(
+            notebook_module.NotebookClient._async_poll_output_msg
+        ).parameters
+    ) == ["self", "parent_msg_id", "cell", "cell_index"]
+    assert list(
+        inspect.signature(
+            notebook_module.NotebookClient._async_cleanup_kernel
+        ).parameters
+    ) == ["self"]
+    assert list(
+        inspect.signature(notebook_module.NotebookClient.process_message).parameters
+    ) == ["self", "msg", "cell", "cell_index"]
+
+
+def test_fallback_filter_preserves_only_nonprotocol_stream_lines() -> None:
+    wrapper: dict[str, Any] = {
+        "mime_type": notebook_module.EVENT_MIME_TYPE,
+        "payload": {
+            "schema_version": 2,
+            "event_id": "progress-1",
+            "event": "progress",
+            "completed": 1,
+            "metrics": {},
+        },
+    }
+    valid = notebook_module.FALLBACK_PREFIX + json.dumps(wrapper)
+    malformed = notebook_module.FALLBACK_PREFIX + "{not-json}"
+    output = nbformat.v4.new_output(
+        "stream",
+        name="stdout",
+        text=f"before\n{valid}\nafter\n{malformed}\n",
+    )
+
+    keep = notebook_module.NotebookRunner._strip_fallback_protocol_lines(output)
+
+    assert keep is True
+    assert output.text == f"before\nafter\n{malformed}\n"
+
+
+@pytest.mark.asyncio
+async def test_fallback_event_is_processed_but_not_written_to_notebook(
+    tmp_path: Path,
+) -> None:
+    wrapper = {
+        "mime_type": notebook_module.EVENT_MIME_TYPE,
+        "payload": {
+            "schema_version": 2,
+            "event_id": "progress-1",
+            "event": "progress",
+            "completed": 1,
+            "metrics": {"rows": 1},
+        },
+    }
+    fallback = notebook_module.FALLBACK_PREFIX + json.dumps(wrapper)
+    notebook_path = tmp_path / "fallback.ipynb"
+    write_notebook(notebook_path, [f"print('ordinary')\nprint({fallback!r})"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+
+    await supervisor.start()
+    assert await asyncio.wait_for(supervisor.wait(), timeout=20) is RunStatus.SUCCEEDED
+
+    executed = nbformat.read(supervisor.output_path, as_version=4)
+    written_back = nbformat.read(notebook_path, as_version=4)
+    for settled in (executed, written_back):
+        text = "".join(
+            str(output.get("text", ""))
+            for output in settled.cells[0].outputs
+            if output.output_type == "stream"
+        )
+        assert text == "ordinary\n"
+        assert notebook_module.FALLBACK_PREFIX not in text
+    progress = [
+        event
+        for event in supervisor.store.recent_events(supervisor.run_id, limit=100)
+        if event["type"] == "notebook.progress"
+    ]
+    assert len(progress) == 1
+    assert progress[0]["payload"]["metrics"]["rows"] == 1
+    await supervisor.close()
+
+
 @pytest.mark.asyncio
 async def test_failed_cell_can_be_edited_with_nbformat_and_resumed(
     tmp_path: Path,
@@ -165,6 +378,137 @@ async def test_failed_cell_can_be_edited_with_nbformat_and_resumed(
     updated = nbformat.read(notebook_path, as_version=4)
     assert updated.cells[1].source == "y = x + 4"
     assert updated.cells[2].outputs[0].text.strip() == "18"
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_cell_failure_pauses_with_one_bounded_event(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "oversized-failure.ipynb"
+    canary = "CELL_FAILURE_EVENT_TAIL_CANARY"
+    write_notebook(
+        notebook_path,
+        [
+            'detail = "x" * 100_000 + '
+            '("CELL_FAILURE_EVENT_" + "TAIL_CANARY")\n'
+            "raise RuntimeError(detail)"
+        ],
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=minimum_event_payload_config(),
+    )
+
+    await supervisor.start()
+    await asyncio.wait_for(supervisor.runner.wait_until_paused(), timeout=20)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot["run"]["status"] == RunStatus.PAUSED.value
+    assert snapshot["cells"][0]["status"] == "failed"
+    assert len(snapshot["cells"][0]["error_value"].encode("utf-8")) <= 16_384
+    events = supervisor.store.recent_events(supervisor.run_id, limit=100)
+    failures = [event for event in events if event["type"] == "cell.failed"]
+    assert len(failures) == 1
+    assert not any(event["type"] == "run.runner_error" for event in events)
+    serialized = json.dumps(
+        failures[0]["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
+    assert failures[0]["payload"]["projection_truncated"] is True
+
+    await supervisor.runner.cancel()
+    assert await asyncio.wait_for(supervisor.wait(), timeout=20) is RunStatus.CANCELLED
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_runner_error_and_working_dir_terminalize_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notebook_path = tmp_path / "runner-error.ipynb"
+    write_notebook(notebook_path, ["pass"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=minimum_event_payload_config(),
+    )
+    runner = supervisor.runner
+    runner.working_dir = Path("/" + ("deep-segment/" * 500))
+    canary = "RUNNER_EVENT_TAIL_CANARY"
+
+    async def fail_sessions() -> RunStatus:
+        raise RuntimeError(("x" * 100_000) + canary)
+
+    async def skip_checkpoint(*, force: bool, writeback: bool = False) -> None:
+        assert force is True
+        del writeback
+
+    monkeypatch.setattr(runner, "_run_sessions", fail_sessions)
+    monkeypatch.setattr(runner, "_checkpoint", skip_checkpoint)
+
+    assert await runner.run() is RunStatus.FAILED
+
+    events = supervisor.store.recent_events(supervisor.run_id, limit=100)
+    started = [event for event in events if event["type"] == "run.started"]
+    failures = [event for event in events if event["type"] == "run.runner_error"]
+    assert len(started) == 1
+    assert len(failures) == 1
+    assert started[0]["payload"]["projection_truncated"] is True
+    for event in (started[0], failures[0]):
+        assert (
+            len(
+                json.dumps(
+                    event["payload"], ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            <= 1_024
+        )
+    assert canary not in json.dumps(failures[0]["payload"])
+    run = supervisor.store.get_run(supervisor.run_id)
+    assert run["status"] == RunStatus.FAILED.value
+    assert len(str(run["message"]).encode("utf-8")) <= 16_384
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_blocking_wait_event_uses_bounded_resource_count_and_sample(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "blocking-wait.ipynb"
+    write_notebook(notebook_path, ["pass"])
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=minimum_event_payload_config(),
+    )
+    canary = "WAITING_RESOURCE_TAIL_CANARY"
+    active = [
+        {"internal_id": f"resource-{index}-" + ("r" * 100)} for index in range(2_000)
+    ]
+    active[-1]["internal_id"] += canary
+
+    await supervisor.runner._announce_blocking_wait(active)
+
+    event = supervisor.store.recent_events(supervisor.run_id)[-1]
+    assert event["type"] == "run.waiting_external"
+    assert event["payload"]["resource_count"] == 2_000
+    assert len(event["payload"]["resource_ids_sample"]) == 5
+    assert event["payload"]["projection_truncated"] is True
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
     await supervisor.close()
 
 
@@ -615,17 +959,23 @@ async def test_cancellation_retries_when_durable_status_update_fails_once(
         config=config(),
     )
     runner = supervisor.runner
-    original_update = supervisor.store.update_run_status
+    original_request = supervisor.store.request_run_cancellation
     attempts = 0
 
-    def fail_once(run_id: str, status: RunStatus, **kwargs: Any) -> None:
+    def fail_once(
+        run_id: str, *, message: str, event_payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise OSError("injected status persistence failure")
-        original_update(run_id, status, **kwargs)
+        return original_request(
+            run_id,
+            message=message,
+            event_payload=event_payload,
+        )
 
-    monkeypatch.setattr(supervisor.store, "update_run_status", fail_once)
+    monkeypatch.setattr(supervisor.store, "request_run_cancellation", fail_once)
     with pytest.raises(OSError, match="injected status persistence failure"):
         await runner.cancel()
     assert not runner._cancel_requested.is_set()

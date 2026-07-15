@@ -25,6 +25,23 @@ class EventBus:
         await self._fan_out(event)
         return event
 
+    def fan_out_persisted(self, event: dict[str, Any]) -> None:
+        """Best-effort fan-out for an event already committed with domain state.
+
+        Durable state is authoritative once its transaction commits. Subscriber
+        validation or queue failures must never escape and rewrite control flow after
+        that point; reconnecting clients can recover the event from SQLite.
+        """
+
+        try:
+            if event.get("run_id") != self.run_id or not isinstance(
+                event.get("seq"), int
+            ):
+                return
+            self._fan_out_nowait(event)
+        except Exception:
+            return
+
     async def publish_ephemeral(
         self, event_type: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -42,18 +59,21 @@ class EventBus:
 
     async def _fan_out(self, event: dict[str, Any]) -> None:
         async with self._lock:
-            stale: list[asyncio.Queue[dict[str, Any]]] = []
-            for queue in self._subscribers:
+            self._fan_out_nowait(event)
+
+    def _fan_out_nowait(self, event: dict[str, Any]) -> None:
+        stale: list[asyncio.Queue[dict[str, Any]]] = []
+        for queue in self._subscribers:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
                 try:
+                    queue.get_nowait()
                     queue.put_nowait(event)
-                except asyncio.QueueFull:
-                    try:
-                        queue.get_nowait()
-                        queue.put_nowait(event)
-                    except (asyncio.QueueEmpty, asyncio.QueueFull):
-                        stale.append(queue)
-            for queue in stale:
-                self._subscribers.discard(queue)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    stale.append(queue)
+        for queue in stale:
+            self._subscribers.discard(queue)
 
     @asynccontextmanager
     async def subscribe(self) -> AsyncGenerator[asyncio.Queue[dict[str, Any]], None]:

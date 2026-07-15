@@ -155,6 +155,7 @@ summary:focus-visible {
 
 .status-running,
 .status-restarting,
+.status-finalizing,
 .status-monitoring {
   color: var(--blue-4);
 }

@@ -10,7 +10,7 @@ description: "The local and GitHub quality gates required for every Runwatch cha
 Install all development dependencies and hooks once:
 
 ```bash
-uv sync --extra test --extra dev --extra docs
+uv sync --extra supervisor --extra test --extra dev --extra docs
 uv run pre-commit install
 ```
 
@@ -43,11 +43,22 @@ local POSIX execution platforms; they do not imply Windows or shared-filesystem 
 `scripts/check_quality_gate_parity.py` prevents the Ruff and Black target lists from
 drifting between local and remote gates.
 
+The main jobs use the committed lockfile for reproducibility. A separate compatibility
+matrix deliberately resolves without that lockfile: Python 3.10 uses uv's
+`lowest-direct` strategy to exercise declared dependency floors, while Python 3.13 uses
+the latest available versions within Runwatch's declared bounds. Both lanes execute the
+private `nbclient` hook signature probes, cleanup serialization, and a real fallback
+event notebook run. This catches dependency drift that a single locked environment
+cannot expose. `nbclient` is bounded to the minor versions whose private hooks Runwatch
+tests directly; widening that bound requires updating the probes first.
+
 The cognitive-complexity ceiling is 15. Exceptions must be explicit in
 `scripts/complexity_allowlist.json`, include a reason and follow-up, and fail once
 unused. Runwatch currently carries no exceptions.
 
-The wheel gate builds the actual distribution in a temporary directory, verifies the
-package, default config, typing marker, dashboard assets, and console command, installs
-the wheel into an isolated environment, and checks that no `auto_classifier` namespace
-is present.
+The wheel gate builds the actual distribution in a temporary directory and verifies the
+package, default config, typing marker, dashboard assets, and console command. It first
+installs the base wheel and proves that the root API, AWS/local emitter modules, and a
+generic resource event work without supervisor dependencies. It then installs the
+`supervisor` extra in the same isolated environment and checks the dashboard assets and
+CLI. The wheel must not contain an `auto_classifier` namespace.

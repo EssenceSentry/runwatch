@@ -7,7 +7,7 @@ from typing import Any, cast
 from botocore.exceptions import ClientError
 
 from ..models import ResourceEvent, ResourceObservation, ResourceStatus
-from .base import ResourceAdapter, ResourceOperationError
+from .base import AwsResourceAdapter, ResourceOperationError
 
 
 @dataclass(frozen=True)
@@ -249,7 +249,7 @@ def _prune_stale_log_tokens(
     cursor.pop(cycle_key, None)
 
 
-class CloudWatchLogsAdapter(ResourceAdapter):
+class CloudWatchLogsAdapter(AwsResourceAdapter):
     provider = "aws"
     resource_type = "cloudwatch_logs"
 

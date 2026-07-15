@@ -1,6 +1,6 @@
 # Structured resource and progress events
 
-Runwatch schema version 2 recognizes:
+Runwatch kernel resource-event schema version 2 recognizes:
 
 ```text
 application/vnd.runwatch.resource+json
@@ -74,6 +74,69 @@ local.emit_dashboard(
 
 Runwatch injects `run_id`, `cell_index`, `attempt`, and `kernel_epoch` while consuming
 the event. Notebook code cannot supply those execution fields.
+
+## Third-party resource adapters
+
+Provider integrations can live in separately distributed packages. Register each
+adapter class under the `runwatch.adapters` entry-point group using the exact
+`provider.resource_type` handled by the class:
+
+```toml
+[project.entry-points."runwatch.adapters"]
+"example.batch_job" = "example_runwatch:BatchJobAdapter"
+```
+
+An adapter subclasses `ResourceAdapter`, declares its identity and capabilities, and
+implements asynchronous inspection:
+
+```python
+from typing import Any
+
+from runwatch.models import ResourceObservation, ResourceStatus
+from runwatch.resources import ResourceAdapter
+
+
+class BatchJobAdapter(ResourceAdapter):
+    provider = "example"
+    resource_type = "batch_job"
+    supports_blocking = True
+
+    async def inspect(
+        self,
+        resource: dict[str, Any],
+        cursor: dict[str, Any],
+    ) -> ResourceObservation:
+        status = await inspect_batch_job(resource["external_id"], cursor)
+        return ResourceObservation(
+            status=ResourceStatus.COMPLETED if status.done else ResourceStatus.RUNNING,
+            terminal=status.done,
+            message=status.message,
+            metrics={"completed": status.completed},
+        )
+```
+
+Runwatch discovers entry points lazily and rejects duplicate names, non-adapter
+classes, or a class whose `provider.resource_type` does not match its entry-point name.
+The adapter constructor receives an `AdapterContext` as `self.context`. It exposes the
+run `working_dir`, supervisor-owned namespaced `settings`, and
+`service(name, factory)` for lazily sharing a process-local client between adapter
+instances. Provider packages own their dependencies and client setup; they should not
+place credentials or raw provider responses in observations.
+
+For a blocking resource, a provider terminal observation does not settle the resource
+until its configured final log drain finishes and Runwatch durably closes the monitor.
+If the controller stops in that interval, reopening the run restores the terminal
+monitor and retries the final inspection before run finalization. Nonblocking monitors
+remain best effort and do not delay run completion.
+
+Set `supports_blocking = True` only when the resource has a real terminal condition.
+Override `has_terminal_condition()` when that depends on registration metadata.
+Set `supports_stop = True` and implement `stop()` only when Runwatch can safely stop
+exclusively owned resources. `validate_registration()` can enforce any additional
+provider-neutral lifecycle constraints. `close()` may release adapter-owned clients.
+The supervisor extra and the third-party adapter package must be installed in the
+controller environment; a notebook kernel that only emits generic protocol events can
+continue to use the dependency-light base package.
 
 ## Progress event
 

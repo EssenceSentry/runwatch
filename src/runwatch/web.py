@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from .dashboard_links import DASHBOARD_ACCESS_COOKIE
 from .models import NotificationSettings
 from .resource_manager import ResourceStopRejected
+from .schema_versions import DASHBOARD_SCHEMA_VERSION
 from .supervisor import RunSupervisor
 from .tunnel import with_token
 
@@ -146,7 +147,7 @@ class DashboardCapabilities(BaseModel):
 
 
 class DashboardState(BaseModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1] = DASHBOARD_SCHEMA_VERSION
     run: DashboardRun
     cells: list[DashboardCell]
     resources: list[DashboardResource]

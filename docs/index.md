@@ -17,7 +17,7 @@ agent-agnostic: edit the run-owned `source.ipynb` with ordinary `nbformat`, then
 Install the package:
 
 ```bash
-python -m pip install "runwatch-notebook"
+python -m pip install "runwatch-notebook[supervisor]"
 runwatch init-config runwatch.yaml
 runwatch validate notebook.ipynb --config runwatch.yaml
 runwatch execute notebook.ipynb --config runwatch.yaml

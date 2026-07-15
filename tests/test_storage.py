@@ -17,11 +17,13 @@ import pytest
 from runwatch.models import (
     ActionKind,
     ActionStatus,
+    CellStatus,
     ResourceDisposition,
     ResourceEvent,
     ResourceObservation,
     ResourceSpec,
     ResourceStatus,
+    RunStatus,
 )
 from runwatch.storage import (
     CorruptRunState,
@@ -191,6 +193,622 @@ def test_snapshot_loads_all_resource_histories_with_one_query(tmp_path: Path) ->
     store.close()
 
 
+def test_terminal_run_and_event_roll_back_together_on_event_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    store.update_run_status("run", RunStatus.RUNNING, started=True)
+    store._connection.execute("""
+        CREATE TRIGGER reject_run_succeeded BEFORE INSERT ON events
+        WHEN NEW.type = 'run.succeeded'
+        BEGIN SELECT RAISE(ABORT, 'injected terminal event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected terminal event failure"):
+        store.finish_run(
+            "run",
+            RunStatus.SUCCEEDED,
+            message="completed",
+            event_type="run.succeeded",
+            event_payload={"kernel_epoch": 0},
+        )
+
+    rolled_back = store.get_run("run")
+    assert rolled_back["status"] == RunStatus.RUNNING.value
+    assert rolled_back["ended_at"] is None
+    assert rolled_back["finalization_complete"] is False
+    assert store.recent_events("run") == []
+
+    store._connection.execute(  # noqa: SLF001 - deliberate fault removal
+        "DROP TRIGGER reject_run_succeeded"
+    )
+    store._connection.commit()  # noqa: SLF001 - deliberate fault removal
+    event = store.finish_run(
+        "run",
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 0},
+    )
+
+    committed = store.get_run("run")
+    assert committed["status"] == RunStatus.SUCCEEDED.value
+    assert committed["ended_at"] is not None
+    assert committed["finalization_complete"] is False
+    assert event["type"] == "run.succeeded"
+    assert [item["type"] for item in store.recent_events("run")] == ["run.succeeded"]
+    store.close()
+
+
+def test_oversized_runner_error_terminalizes_with_bounded_projection(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    canary = "RUNNER_ERROR_TAIL_CANARY"
+    huge_error = ("\x00" * 100_000) + canary
+    huge_error_type = ("E" * 10_000) + canary
+
+    event = store.finish_run(
+        "run",
+        RunStatus.FAILED,
+        message=f"Runner failure: {huge_error_type}: {huge_error}",
+        event_type="run.runner_error",
+        event_payload={
+            "kernel_epoch": 2**100,
+            "error_type": huge_error_type,
+            "error": huge_error,
+        },
+    )
+
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
+    assert event["payload"]["projection_truncated"] is True
+    run = store.get_run("run")
+    assert run["status"] == RunStatus.FAILED.value
+    assert len(str(run["message"]).encode("utf-8")) <= 16_384
+    store.close()
+
+
+def test_oversized_external_failure_terminalizes_with_count_and_sample(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    canary = "EXTERNAL_FAILURE_TAIL_CANARY"
+    resource_ids = [f"resource-{index}-" + ("r" * 100) for index in range(2_000)]
+    resource_ids[-1] += canary
+
+    event = store.finish_run(
+        "run",
+        RunStatus.FAILED,
+        message="Blocking resources failed",
+        event_type="run.failed_external",
+        event_payload={"kernel_epoch": 3, "resource_ids": resource_ids},
+    )
+
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
+    assert event["payload"]["failure_count"] == 2_000
+    assert len(event["payload"]["resource_ids_sample"]) == 5
+    assert event["payload"]["projection_truncated"] is True
+    assert store.get_run("run")["status"] == RunStatus.FAILED.value
+    store.close()
+
+
+def test_oversized_success_output_path_uses_bounded_terminal_projection(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    canary = "OUTPUT_PATH_TAIL_CANARY"
+    output_path = ("/deep-output" * 10_000) + canary
+
+    event = store.finish_run(
+        "run",
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 1, "output_path": output_path},
+    )
+
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
+    assert event["payload"]["projection_truncated"] is True
+    assert store.get_run("run")["status"] == RunStatus.SUCCEEDED.value
+    store.close()
+
+
+def test_failed_cell_run_pause_and_event_roll_back_together_on_event_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    store.initialize_cells(
+        "run",
+        [
+            {
+                "cell_index": 0,
+                "cell_id": "cell-0",
+                "cell_type": "code",
+                "source": "raise ValueError('boom')",
+                "source_hash": "source-digest",
+            }
+        ],
+    )
+    store.update_run_status("run", RunStatus.RUNNING, current_cell_index=0)
+    attempt = store.begin_cell_attempt(
+        "run",
+        0,
+        "raise ValueError('boom')",
+        "source-digest",
+        0,
+    )
+    store._connection.execute("""
+        CREATE TRIGGER reject_cell_failed BEFORE INSERT ON events
+        WHEN NEW.type = 'cell.failed'
+        BEGIN SELECT RAISE(ABORT, 'injected cell event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected cell event failure"):
+        store.pause_failed_cell(
+            "run",
+            0,
+            attempt=attempt,
+            kernel_epoch=0,
+            elapsed_seconds=0.5,
+            error_name="ValueError",
+            error_value="boom",
+            traceback=["trace"],
+            kernel_dead=False,
+        )
+
+    rolled_back = store.snapshot("run")
+    assert rolled_back["run"]["status"] == RunStatus.RUNNING.value
+    assert rolled_back["run"]["failed_cell_index"] is None
+    assert rolled_back["cells"][0]["status"] == CellStatus.RUNNING.value
+    assert rolled_back["cells"][0]["error_name"] is None
+    assert store.recent_events("run") == []
+
+    store._connection.execute(  # noqa: SLF001 - deliberate fault removal
+        "DROP TRIGGER reject_cell_failed"
+    )
+    store._connection.commit()  # noqa: SLF001 - deliberate fault removal
+    event = store.pause_failed_cell(
+        "run",
+        0,
+        attempt=attempt,
+        kernel_epoch=0,
+        elapsed_seconds=0.5,
+        error_name="ValueError",
+        error_value="boom",
+        traceback=["trace"],
+        kernel_dead=False,
+    )
+
+    committed = store.snapshot("run")
+    assert committed["run"]["status"] == RunStatus.PAUSED.value
+    assert committed["run"]["failed_cell_index"] == 0
+    assert committed["cells"][0]["status"] == CellStatus.FAILED.value
+    assert committed["cells"][0]["error_name"] == "ValueError"
+    assert event["type"] == "cell.failed"
+    store.close()
+
+
+def test_oversized_cell_failure_commits_bounded_pause_projection(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    store.initialize_cells(
+        "run",
+        [
+            {
+                "cell_index": 0,
+                "cell_id": "cell-0",
+                "cell_type": "code",
+                "source": "raise RuntimeError(detail)",
+                "source_hash": "source-digest",
+            }
+        ],
+    )
+    store.update_run_status("run", RunStatus.RUNNING, current_cell_index=0)
+    attempt = store.begin_cell_attempt(
+        "run",
+        0,
+        "raise RuntimeError(detail)",
+        "source-digest",
+        0,
+    )
+    canary = "CELL_FAILURE_TAIL_CANARY"
+    huge_detail = ("x" * 100_000) + canary
+    traceback = [f"frame-{index}" for index in range(100)] + [
+        ("\x00" * 100_000) + canary
+    ]
+
+    event = store.pause_failed_cell(
+        "run",
+        0,
+        attempt=attempt,
+        kernel_epoch=0,
+        elapsed_seconds=0.5,
+        error_name=("RuntimeError" * 1_000) + canary,
+        error_value=huge_detail,
+        traceback=traceback,
+        kernel_dead=False,
+    )
+
+    snapshot = store.snapshot("run")
+    assert snapshot["run"]["status"] == RunStatus.PAUSED.value
+    assert snapshot["cells"][0]["status"] == CellStatus.FAILED.value
+    assert len(snapshot["cells"][0]["error_value"].encode("utf-8")) <= 16_384
+    assert len(snapshot["cells"][0]["traceback"]) == 50
+    assert all(
+        len(json.dumps(line, ensure_ascii=False).encode("utf-8")) <= 4_096
+        for line in snapshot["cells"][0]["traceback"]
+    )
+    failures = [item for item in snapshot["events"] if item["type"] == "cell.failed"]
+    assert len(failures) == 1
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert canary.encode() not in serialized
+    assert event["payload"]["projection_truncated"] is True
+    store.close()
+
+
+def test_resource_observation_and_event_roll_back_together_on_event_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="logs", id="stream")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.save_resource_cursor(internal_id, {"token": "page-1"})
+    store._connection.execute("""
+        CREATE TRIGGER reject_resource_observed BEFORE INSERT ON events
+        WHEN NEW.type = 'resource.observed'
+        BEGIN SELECT RAISE(ABORT, 'injected resource event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+    observation = ResourceObservation(
+        status=ResourceStatus.COMPLETED,
+        terminal=True,
+        metrics={"page": 2},
+        log_lines=["page-2"],
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected resource event failure"):
+        store.record_resource_inspection(
+            "run", internal_id, observation, {"token": "page-2"}
+        )
+
+    rolled_back = store.get_resource(internal_id)
+    assert rolled_back is not None
+    assert rolled_back["status"] == ResourceStatus.REGISTERED.value
+    assert rolled_back["terminal"] is False
+    assert rolled_back["cursor"] == {"token": "page-1"}
+    assert rolled_back["log_tail"] == []
+    assert store.resource_observations(internal_id) == []
+    assert store.recent_events("run") == []
+
+    store._connection.execute(  # noqa: SLF001 - deliberate fault removal
+        "DROP TRIGGER reject_resource_observed"
+    )
+    store._connection.commit()  # noqa: SLF001 - deliberate fault removal
+    event = store.record_resource_inspection(
+        "run", internal_id, observation, {"token": "page-2"}
+    )
+
+    committed = store.get_resource(internal_id)
+    assert committed is not None
+    assert committed["status"] == ResourceStatus.COMPLETED.value
+    assert committed["terminal"] is True
+    assert committed["cursor"] == {"token": "page-2"}
+    assert committed["log_tail"] == ["page-2"]
+    assert len(store.resource_observations(internal_id)) == 1
+    assert event["type"] == "resource.observed"
+    store.close()
+
+
+def test_resource_registration_event_uses_bounded_allowlisted_projection(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    secret = "REGISTRATION_METADATA_CANARY" * 4_000
+    registration = ResourceEvent(
+        event_id="event-" + ("e" * 500),
+        resource=ResourceSpec(
+            provider="provider-" + ("p" * 500),
+            type="type-" + ("t" * 500),
+            id="identifier-" + ("i" * 500),
+            logical_key="logical-" + ("l" * 500),
+            metadata={"secret": secret},
+        ),
+    )
+
+    internal_id, created, event = store.register_resource_with_event(
+        run_id="run",
+        event=registration,
+        cell_index=1,
+        attempt=2,
+        kernel_epoch=3,
+        supports_stop=False,
+    )
+
+    assert created is True
+    assert event["type"] == "resource.registered"
+    assert event["payload"]["projection_truncated"] is True
+    assert "metadata" not in event["payload"]["resource"]
+    serialized = json.dumps(event["payload"], ensure_ascii=False).encode("utf-8")
+    assert len(serialized) <= 1_024
+    assert secret.encode() not in serialized
+    resource = store.get_resource(internal_id)
+    assert resource is not None and resource["metadata"] == {"secret": secret}
+
+    duplicate_id, duplicate_created, reconciled = store.register_resource_with_event(
+        run_id="run",
+        event=registration,
+        cell_index=1,
+        attempt=2,
+        kernel_epoch=3,
+        supports_stop=False,
+    )
+    assert duplicate_id == internal_id
+    assert duplicate_created is False
+    assert reconciled["type"] == "resource.reconciled"
+    assert len(store.list_resources("run")) == 1
+    store.close()
+
+
+def test_new_resource_rolls_back_when_bounded_event_exceeds_cap(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=256)
+    initialize(store, tmp_path)
+
+    with pytest.raises(ValueError, match="max_event_payload_bytes"):
+        store.register_resource_with_event(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(provider="fake", type="job", id="new")
+            ),
+            cell_index=None,
+            attempt=None,
+            kernel_epoch=None,
+            supports_stop=False,
+        )
+
+    assert store.list_resources("run") == []
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_reconciled_resource_rolls_back_when_event_append_fails(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    internal_id, _created = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            event_id="original-event",
+            resource=ResourceSpec(
+                provider="fake",
+                type="job",
+                id="same-job",
+                logical_key="logical-job",
+                metadata={"revision": 1},
+            ),
+        ),
+        cell_index=0,
+        attempt=1,
+        kernel_epoch=1,
+        supports_stop=False,
+    )
+    before = store.get_resource(internal_id)
+    assert before is not None
+    store._connection.execute("""
+        CREATE TRIGGER reject_resource_reconciled BEFORE INSERT ON events
+        WHEN NEW.type = 'resource.reconciled'
+        BEGIN SELECT RAISE(ABORT, 'injected reconcile event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+
+    with pytest.raises(sqlite3.IntegrityError, match="reconcile event failure"):
+        store.register_resource_with_event(
+            run_id="run",
+            event=ResourceEvent(
+                event_id="replacement-event",
+                resource=ResourceSpec(
+                    provider="fake",
+                    type="job",
+                    id="same-job",
+                    logical_key="logical-job",
+                    metadata={"revision": 2},
+                ),
+            ),
+            cell_index=4,
+            attempt=5,
+            kernel_epoch=6,
+            supports_stop=True,
+        )
+
+    assert store.get_resource(internal_id) == before
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_superseded_resource_and_replacement_roll_back_with_event_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    original_id, _created = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(
+                provider="fake", type="job", id="old", logical_key="logical-job"
+            )
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    before = store.get_resource(original_id)
+    assert before is not None
+    store._connection.execute("""
+        CREATE TRIGGER reject_resource_registered BEFORE INSERT ON events
+        WHEN NEW.type = 'resource.registered'
+        BEGIN SELECT RAISE(ABORT, 'injected registration event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+
+    with pytest.raises(sqlite3.IntegrityError, match="registration event failure"):
+        store.register_resource_with_event(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(
+                    provider="fake",
+                    type="job",
+                    id="replacement",
+                    logical_key="logical-job",
+                )
+            ),
+            cell_index=None,
+            attempt=None,
+            kernel_epoch=None,
+            supports_stop=False,
+        )
+
+    assert store.list_resources("run") == [before]
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_resource_stop_intent_and_event_roll_back_together_on_event_failure(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="job", id="job")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=True,
+    )
+    before = store.get_resource(internal_id)
+    assert before is not None
+    store._connection.execute("""
+        CREATE TRIGGER reject_resource_stop BEFORE INSERT ON events
+        WHEN NEW.type = 'resource.stop_requested'
+        BEGIN SELECT RAISE(ABORT, 'injected stop event failure'); END
+        """)  # noqa: SLF001 - deliberate transaction fault
+    store._connection.commit()  # noqa: SLF001 - deliberate transaction fault
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected stop event failure"):
+        store.request_resource_stop_with_event(
+            internal_id, ResourceDisposition.CANCELLED
+        )
+
+    rolled_back = store.get_resource(internal_id)
+    assert rolled_back is not None
+    assert rolled_back["status"] == ResourceStatus.REGISTERED.value
+    assert rolled_back["disposition"] == ResourceDisposition.ACTIVE.value
+    assert rolled_back["version"] == before["version"]
+    assert store.recent_events("run") == []
+
+    store._connection.execute(  # noqa: SLF001 - deliberate fault removal
+        "DROP TRIGGER reject_resource_stop"
+    )
+    store._connection.commit()  # noqa: SLF001 - deliberate fault removal
+    committed, event = store.request_resource_stop_with_event(
+        internal_id, ResourceDisposition.CANCELLED
+    )
+
+    assert committed["status"] == ResourceStatus.STOPPING.value
+    assert committed["disposition"] == ResourceDisposition.ACTIVE.value
+    assert committed["version"] == before["version"] + 1
+    assert event is not None and event["type"] == "resource.stop_requested"
+    store.close()
+
+
+def test_update_run_status_rejects_terminal_transitions(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+
+    for status in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED):
+        with pytest.raises(ValueError, match="finish_run"):
+            store.update_run_status("run", status)
+
+    assert store.get_run("run")["status"] == RunStatus.CREATED.value
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_v2_database_migration_keeps_existing_terminal_runs_unfinalized(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = RunStore(path)
+    initialize(store, tmp_path)
+    store._connection.execute(  # noqa: SLF001 - construct legacy schema fixture
+        "UPDATE runs SET status = ?, ended_at = ? WHERE run_id = 'run'",
+        (RunStatus.SUCCEEDED.value, "2026-01-01T00:00:00+00:00"),
+    )
+    store._connection.execute(  # noqa: SLF001 - construct legacy schema fixture
+        "ALTER TABLE runs DROP COLUMN finalized_at"
+    )
+    store._connection.execute(  # noqa: SLF001 - construct legacy schema fixture
+        "ALTER TABLE runs DROP COLUMN finalization_complete"
+    )
+    store._connection.execute(  # noqa: SLF001 - construct legacy schema fixture
+        "UPDATE runwatch_meta SET value = '2' WHERE key = 'schema_version'"
+    )
+    store._connection.commit()  # noqa: SLF001 - construct legacy schema fixture
+    store.close()
+
+    migrated = RunStore(path)
+    run = migrated.get_run("run")
+
+    assert run["status"] == RunStatus.SUCCEEDED.value
+    assert run["ended_at"] == "2026-01-01T00:00:00+00:00"
+    assert run["finalization_complete"] is False
+    assert run["finalized_at"] is None
+    version = migrated._connection.execute(  # noqa: SLF001 - schema assertion
+        "SELECT value FROM runwatch_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    assert version is not None and version["value"] == "3"
+    migrated.close()
+
+
 def test_terminal_stop_inspection_is_one_atomic_recoverable_commit(
     tmp_path: Path,
 ) -> None:
@@ -258,7 +876,7 @@ def test_terminal_stop_inspection_is_one_atomic_recoverable_commit(
     assert committed["status"] == "stopped"
     assert committed["terminal"] is True
     assert committed["disposition"] == "cancelled"
-    assert committed["monitor_closed"] is True
+    assert committed["monitor_closed"] is False
     assert len(recovered.resource_observations(internal_id)) == 1
     recovered.close()
 
@@ -291,7 +909,7 @@ def test_stop_request_atomically_confirms_a_prior_terminal_monitor_observation(
     assert requested["status"] == "stopped"
     assert requested["terminal"] is True
     assert requested["disposition"] == "cancelled"
-    assert requested["monitor_closed"] is True
+    assert requested["monitor_closed"] is False
     store.close()
 
     reopened = RunStore(path)
@@ -683,3 +1301,326 @@ os._exit(17)
     assert action["status"] == ActionStatus.REQUESTED.value
     assert action["payload"]["recovered"] is True
     recovered.close()
+
+
+def test_full_resource_identity_and_standalone_cursor_use_utf8_byte_cap(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_resource_payload_bytes=1_024)
+    initialize(store, tmp_path)
+
+    with pytest.raises(ValueError, match="Resource registration.*max_resource"):
+        store.register_resource(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(
+                    provider="fake",
+                    type="metric",
+                    id="é" * 600,
+                )
+            ),
+            cell_index=None,
+            attempt=None,
+            kernel_epoch=None,
+            supports_stop=False,
+        )
+    assert store.list_resources("run") == []
+
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="small")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.save_resource_cursor(internal_id, {"offset": 1})
+    with pytest.raises(ValueError, match="Resource cursor.*max_resource"):
+        store.save_resource_cursor(internal_id, {"token": "é" * 600})
+    assert store.resource_cursor(internal_id) == {"offset": 1}
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["message", "metrics", "history_metrics", "raw", "log_lines"],
+)
+def test_aggregate_observation_cap_covers_every_persisted_payload(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_resource_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="small")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.save_resource_cursor(internal_id, {"offset": 1})
+    values: dict[str, Any] = {
+        "status": ResourceStatus.RUNNING,
+        field: "é" * 600 if field == "message" else {"blob": "é" * 600},
+    }
+    if field == "log_lines":
+        values[field] = ["é" * 600]
+    observation = ResourceObservation.model_validate(values)
+
+    with pytest.raises(ValueError, match="Resource observation.*max_resource"):
+        store.record_resource_inspection("run", internal_id, observation, {"offset": 2})
+
+    resource = store.get_resource(internal_id)
+    assert resource is not None
+    assert resource["status"] == ResourceStatus.REGISTERED.value
+    assert resource["cursor"] == {"offset": 1}
+    assert resource["metrics"] == {}
+    assert resource["raw"] == {}
+    assert resource["log_tail"] == []
+    assert store.resource_observations(internal_id) == []
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_event_payload_failure_rolls_back_atomic_resource_inspection(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(
+        tmp_path / "state.sqlite3",
+        max_resource_payload_bytes=8_192,
+        max_event_payload_bytes=256,
+    )
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="small")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.save_resource_cursor(internal_id, {"offset": 1})
+    observation = ResourceObservation(
+        status=ResourceStatus.RUNNING,
+        message="é" * 200,
+        metrics={"value": 2},
+    )
+
+    with pytest.raises(ValueError, match="max_event_payload_bytes"):
+        store.record_resource_inspection("run", internal_id, observation, {"offset": 2})
+
+    resource = store.get_resource(internal_id)
+    assert resource is not None
+    assert resource["status"] == ResourceStatus.REGISTERED.value
+    assert resource["cursor"] == {"offset": 1}
+    assert store.resource_observations(internal_id) == []
+    assert store.recent_events("run") == []
+
+    with pytest.raises(ValueError, match="max_event_payload_bytes"):
+        store.append_event("run", "probe", {"text": "é" * 200})
+    assert store.recent_events("run") == []
+    store.close()
+
+
+@pytest.mark.parametrize("field", ["title", "message", "data", "destinations"])
+def test_notification_record_cap_rejects_all_columns_atomically(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_notification_record_bytes=512)
+    initialize(store, tmp_path)
+    title = "Runwatch"
+    message = "status"
+    data: dict[str, Any] = {"kind": "status"}
+    destinations = [("webhook", "https://hooks.example/runwatch")]
+    if field == "title":
+        title = "é" * 400
+    elif field == "message":
+        message = "é" * 400
+    elif field == "data":
+        data = {"blob": "é" * 400}
+    else:
+        destinations = [("webhook", "https://hooks.example/" + "é" * 400)]
+
+    with pytest.raises(ValueError, match="max_notification_record_bytes"):
+        store.enqueue_notification(
+            run_id="run",
+            title=title,
+            message=message,
+            data=data,
+            dedup_key="status",
+            destinations=destinations,
+        )
+
+    assert store.notification_outbox_state("run") == {
+        "nonterminal_intents": 0,
+        "nonterminal_deliveries": 0,
+        "pending_deliveries": 0,
+        "sending_deliveries": 0,
+    }
+    store.close()
+
+
+def test_delivery_errors_are_truncated_to_valid_utf8_bytes(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_delivery_error_bytes=17)
+    initialize(store, tmp_path)
+    intent = store.enqueue_notification(
+        run_id="run",
+        title="Runwatch",
+        message="failed",
+        data={"kind": "failure"},
+        dedup_key="failure",
+        destinations=[
+            ("webhook", "https://hooks.example/one"),
+            ("webhook", "https://hooks.example/two"),
+        ],
+    )
+    claimed = store.claim_due_notification_deliveries("run")
+    assert len(claimed) == 2
+
+    store.finish_notification_delivery(
+        claimed[0]["delivery_id"],
+        succeeded=False,
+        max_attempts=1,
+        retry_delay_seconds=1,
+        error="💥" * 20,
+    )
+    store.recover_claimed_notification_delivery(
+        claimed[1]["delivery_id"],
+        max_attempts=1,
+        retry_delay_seconds=1,
+        error="🔥" * 20,
+    )
+
+    deliveries = store.notification_deliveries(intent["intent_id"])
+    assert len(deliveries) == 2
+    for delivery in deliveries:
+        error = delivery["last_error"]
+        assert isinstance(error, str)
+        assert len(error.encode("utf-8")) <= 17
+        assert "�" not in error
+    store.close()
+
+
+def test_terminal_dedup_lookup_prefers_any_succeeded_legacy_alias(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    keys = ("run-terminal:succeeded:3", "run-succeeded:3")
+    intents = [
+        store.enqueue_notification(
+            run_id="run",
+            title="terminal",
+            message="terminal",
+            data={},
+            dedup_key=key,
+            destinations=[("webhook", "https://hooks.example/terminal")],
+        )
+        for key in keys
+    ]
+    with store._lock:
+        store._connection.execute(
+            "UPDATE notification_intents SET status = 'failed' WHERE intent_id = ?",
+            (intents[0]["intent_id"],),
+        )
+        store._connection.execute(
+            "UPDATE notification_intents SET status = 'succeeded' WHERE intent_id = ?",
+            (intents[1]["intent_id"],),
+        )
+        store._connection.commit()
+
+    assert store.existing_notification_dedup_key("run", keys) == "run-succeeded:3"
+    store.close()
+
+
+def test_repeated_crash_recovery_does_not_refund_notification_attempts(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = RunStore(path)
+    initialize(store, tmp_path)
+    intent = store.enqueue_notification(
+        run_id="run",
+        title="Runwatch",
+        message="ambiguous delivery",
+        data={},
+        dedup_key="crash-loop",
+        destinations=[("webhook", "https://hooks.example/ambiguous")],
+    )
+    delivery_id: str | None = None
+
+    for attempt in range(1, 4):
+        claimed = store.claim_due_notification_deliveries("run")
+        assert len(claimed) == 1
+        claimed_delivery_id = str(claimed[0]["delivery_id"])
+        if delivery_id is None:
+            delivery_id = claimed_delivery_id
+        assert claimed_delivery_id == delivery_id
+        assert claimed[0]["intent_id"] == intent["intent_id"]
+        assert claimed[0]["attempt_count"] == attempt
+        store.close()  # Simulate a crash after the destination may have accepted it.
+
+        store = RunStore(path)
+        assert (
+            store.recover_notification_deliveries(
+                "run",
+                max_attempts=3,
+                error="ambiguous accepted-before-crash outcome",
+            )
+            == 1
+        )
+        delivery = store.notification_deliveries(intent["intent_id"])[0]
+        assert delivery["delivery_id"] == delivery_id
+        assert delivery["attempt_count"] == attempt
+        assert delivery["status"] == ("failed" if attempt == 3 else "pending")
+
+    assert store.claim_due_notification_deliveries("run") == []
+    assert (
+        store.recover_notification_deliveries(
+            "run", max_attempts=3, error="must not rearm a terminal delivery"
+        )
+        == 0
+    )
+    terminal = store.notification_intent(intent["intent_id"])
+    assert terminal is not None
+    assert terminal["status"] == "failed"
+    store.close()
+
+
+def test_log_tail_byte_truncation_never_introduces_replacement_overflow(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_log_bytes_per_resource=4)
+    initialize(store, tmp_path)
+    internal_id, _ = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="metric", id="small")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+        supports_stop=False,
+    )
+    store.update_resource_observation(
+        "run",
+        internal_id,
+        ResourceObservation(
+            status=ResourceStatus.RUNNING,
+            log_lines=["a🙂b"],
+        ),
+    )
+
+    resource = store.get_resource(internal_id)
+    assert resource is not None
+    assert sum(len(line.encode("utf-8")) for line in resource["log_tail"]) <= 4
+    assert "�" not in "".join(resource["log_tail"])
+    store.close()

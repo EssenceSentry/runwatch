@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import math
 from datetime import datetime, timezone
 from enum import Enum
@@ -9,7 +10,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = 2
+from .schema_versions import CONFIG_SCHEMA_VERSION, RESOURCE_EVENT_SCHEMA_VERSION
+
 JSONDict = dict[str, Any]
 
 
@@ -51,6 +53,7 @@ class RunStatus(StrEnum):
     PAUSED = "paused"
     RESTARTING = "restarting"
     WAITING_EXTERNAL = "waiting_external"
+    FINALIZING = "finalizing"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLING = "cancelling"
@@ -209,7 +212,7 @@ class ResourceEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2] = RESOURCE_EVENT_SCHEMA_VERSION
     event_id: str = Field(default_factory=lambda: str(uuid4()))
     event: Literal["resource_created"] = "resource_created"
     resource: ResourceSpec
@@ -219,7 +222,7 @@ class ResourceEvent(BaseModel):
 class ProgressEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2] = RESOURCE_EVENT_SCHEMA_VERSION
     event_id: str = Field(default_factory=lambda: str(uuid4()))
     event: Literal["progress"] = "progress"
     completed: float = Field(ge=0)
@@ -295,9 +298,11 @@ class NotificationSettings(BaseModel):
     webhook_urls: list[str] = Field(default_factory=list)
     ntfy_base_url: str | None = None
     ntfy_topic: str | None = None
-    periodic_seconds: float | None = Field(default=None, gt=0)
+    periodic_seconds: float | None = Field(default=None, ge=60)
     terminal_drain_timeout_seconds: float = Field(default=30.0, ge=0)
     request_timeout_seconds: float = Field(default=15.0, gt=0)
+    allow_insecure_http: bool = False
+    max_payload_bytes: int = Field(default=16_384, ge=1_024, le=262_144)
     max_delivery_attempts: int = Field(default=4, ge=1, le=20)
     retry_initial_seconds: float = Field(default=1.0, gt=0)
     retry_max_seconds: float = Field(default=60.0, gt=0)
@@ -316,12 +321,24 @@ class NotificationSettings(BaseModel):
             return None
         return cls._validated_http_url(value, field="ntfy_base_url").rstrip("/")
 
+    @field_validator("ntfy_topic")
+    @classmethod
+    def valid_ntfy_topic(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("ntfy_topic must not be empty")
+        return candidate
+
     @staticmethod
     def _validated_http_url(value: str, *, field: str) -> str:
         candidate = value.strip()
         parts = urlsplit(candidate)
         if parts.scheme not in {"http", "https"} or not parts.hostname:
             raise ValueError(f"{field} entries must be absolute HTTP(S) URLs")
+        if parts.fragment:
+            raise ValueError(f"{field} entries must not contain URL fragments")
         try:
             parts.port
         except ValueError as error:
@@ -337,7 +354,27 @@ class NotificationSettings(BaseModel):
                 "retry_max_seconds must be greater than or equal to "
                 "retry_initial_seconds"
             )
+        for url in [*self.webhook_urls, self.ntfy_base_url]:
+            if (
+                url
+                and urlsplit(url).scheme == "http"
+                and not (self.allow_insecure_http or self._is_loopback_url(url))
+            ):
+                raise ValueError(
+                    "Plain HTTP notification destinations require "
+                    "allow_insecure_http=true unless they are loopback URLs"
+                )
         return self
+
+    @staticmethod
+    def _is_loopback_url(value: str) -> bool:
+        hostname = (urlsplit(value).hostname or "").lower().rstrip(".")
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
 
 
 class StorageSettings(BaseModel):
@@ -349,14 +386,17 @@ class StorageSettings(BaseModel):
     max_log_bytes_per_resource: int = Field(default=2_097_152, ge=1_024)
     max_events_per_run: int = Field(default=10_000, ge=500)
     max_event_bytes_per_run: int = Field(default=8_388_608, ge=1_024)
-    max_resource_payload_bytes: int = Field(default=2_097_152, ge=1_024)
+    max_event_payload_bytes: int = Field(default=2_097_152, ge=1_024)
+    max_resource_payload_bytes: int = Field(default=4_194_304, ge=1_024)
+    max_notification_record_bytes: int = Field(default=524_288, ge=1_024)
+    max_delivery_error_bytes: int = Field(default=4_096, ge=256)
     dashboard_chart_points: int = Field(default=300, ge=20, le=2_000)
 
 
 class RunwatchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2] = CONFIG_SCHEMA_VERSION
     notebook: NotebookSettings = Field(default_factory=NotebookSettings)
     aws: AwsSettings = Field(default_factory=AwsSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)

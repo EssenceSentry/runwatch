@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -17,7 +17,6 @@ from pydantic import BaseModel
 
 from ._fs import PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE
 from .models import (
-    SCHEMA_VERSION,
     ActionKind,
     ActionStatus,
     CellStatus,
@@ -28,6 +27,7 @@ from .models import (
     RunStatus,
     utc_now,
 )
+from .schema_versions import DATABASE_SCHEMA_VERSION, RUN_SNAPSHOT_SCHEMA_VERSION
 
 
 class UnsupportedRunSchema(RuntimeError):
@@ -44,6 +44,152 @@ class ResourceEventConflict(RuntimeError):
 
 _NOTIFICATION_EVENT_CURSOR_KEY = "_notification_event_cursor"
 _NOTIFICATION_ROUTING_REQUIRED_KEY = "_notification_routing_required"
+_NOTIFICATION_EGRESS_SCHEMA_KEY = "_notification_egress_schema_version"
+_NOTIFICATION_EGRESS_SCHEMA_VERSION = 1
+_RESOURCE_DOMAIN_EVENT_TEXT_MAX_BYTES = 64
+_RESOURCE_DOMAIN_EVENT_INDEX_LIMIT = 2_147_483_647
+_RUN_MESSAGE_MAX_BYTES = 16_384
+_CELL_ERROR_NAME_MAX_BYTES = 256
+_CELL_ERROR_VALUE_MAX_BYTES = 16_384
+_CELL_TRACEBACK_MAX_LINES = 50
+_CELL_TRACEBACK_LINE_JSON_BYTES = 4_096
+_CELL_EVENT_ERROR_NAME_JSON_BYTES = 96
+_CELL_EVENT_ERROR_VALUE_JSON_BYTES = 192
+_CELL_EVENT_TRACEBACK_LINES = 2
+_CELL_EVENT_TRACEBACK_LINE_JSON_BYTES = 128
+_TERMINAL_EVENT_ERROR_TYPE_JSON_BYTES = 96
+_TERMINAL_EVENT_ERROR_JSON_BYTES = 384
+_TERMINAL_EVENT_OUTPUT_PATH_JSON_BYTES = 384
+_TERMINAL_EVENT_RESOURCE_ID_JSON_BYTES = 80
+_TERMINAL_EVENT_RESOURCE_SAMPLE_SIZE = 5
+_SAFE_LEGACY_NOTIFICATION_DATA: dict[str, Any] = {
+    "schema_version": 1,
+    "kind": "legacy",
+    "note": "Retained notification details were removed for safety",
+}
+_NOTIFICATION_DATA_FIELDS: dict[str, frozenset[str]] = {
+    "periodic_status": frozenset(
+        {
+            "schema_version",
+            "kind",
+            "name",
+            "status",
+            "current_cell_index",
+            "active_resource_count",
+            "elapsed_seconds",
+        }
+    ),
+    "cell_failed": frozenset({"schema_version", "kind", "cell_index", "error_type"}),
+    "resource_failed": frozenset(
+        {
+            "schema_version",
+            "kind",
+            "provider",
+            "resource_type",
+            "display_id",
+            "status",
+        }
+    ),
+    "run_succeeded": frozenset(
+        {"schema_version", "kind", "status", "reason", "elapsed_seconds"}
+    ),
+    "run_failed": frozenset(
+        {"schema_version", "kind", "status", "reason", "elapsed_seconds"}
+    ),
+    "run_cancelled": frozenset(
+        {"schema_version", "kind", "status", "reason", "elapsed_seconds"}
+    ),
+    "legacy": frozenset({"schema_version", "kind", "note"}),
+}
+
+
+def _unique_notification_destinations(
+    values: Iterable[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    destinations = list(dict.fromkeys(values))
+    if any(not kind or not destination for kind, destination in destinations):
+        raise ValueError("Notification destinations require a kind and destination")
+    return destinations
+
+
+def _notification_topology(
+    values: Iterable[tuple[str, str]],
+) -> tuple[tuple[str, int], ...]:
+    counts: dict[str, int] = {}
+    for kind, _destination in values:
+        counts[kind] = counts.get(kind, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
+def _notification_rotation_pairs(
+    actual: list[tuple[str, str]],
+    current: list[tuple[str, str]] | None,
+    desired: list[tuple[str, str]],
+) -> list[tuple[str, str, str]]:
+    if not actual:
+        return []
+    if _notification_topology(actual) != _notification_topology(desired):
+        raise ValueError(
+            "Persisted notification destinations do not match the desired topology"
+        )
+    pairs: list[tuple[str, str, str]] = []
+    for kind, _count in _notification_topology(desired):
+        actual_values = sorted(
+            destination for item_kind, destination in actual if item_kind == kind
+        )
+        current_values = (
+            [destination for item_kind, destination in current if item_kind == kind]
+            if current is not None
+            else []
+        )
+        sources = (
+            current_values
+            if len(current_values) == len(actual_values)
+            and set(current_values) == set(actual_values)
+            else actual_values
+        )
+        targets = [
+            destination for item_kind, destination in desired if item_kind == kind
+        ]
+        pairs.extend(
+            (kind, old, new) for old, new in zip(sources, targets, strict=True)
+        )
+    return pairs
+
+
+def _current_notification_data(raw: str) -> bool:
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(value, dict):
+        return False
+    raw_mapping = cast(dict[object, object], value)
+    mapping: dict[str, object] = {
+        key: item for key, item in raw_mapping.items() if isinstance(key, str)
+    }
+    if len(mapping) != len(raw_mapping) or mapping.get("schema_version") != 1:
+        return False
+    kind = mapping.get("kind")
+    allowed = _NOTIFICATION_DATA_FIELDS.get(kind) if isinstance(kind, str) else None
+    return allowed is not None and set(mapping).issubset(allowed)
+
+
+def _terminal_notification_alias_group(
+    dedup_key: object,
+) -> tuple[str, str] | None:
+    if not isinstance(dedup_key, str):
+        return None
+    parts = dedup_key.split(":")
+    if len(parts) == 3 and parts[0] == "run-terminal":
+        status = parts[1]
+        if status in {"succeeded", "failed", "cancelled"} and parts[2]:
+            return status, parts[2]
+    if len(parts) == 2 and parts[0] in {"run-succeeded", "run-cancelled"}:
+        return parts[0].removeprefix("run-"), parts[1]
+    if len(parts) == 3 and parts[0] == "run-failed" and parts[1] and parts[2]:
+        return "failed", parts[2]
+    return None
 
 
 def _json_default(value: Any) -> Any:
@@ -81,6 +227,191 @@ def source_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bounded_utf8_text(value: str, max_bytes: int) -> str:
+    """Truncate text to a valid UTF-8 byte budget."""
+
+    if max_bytes < 1:
+        raise ValueError("UTF-8 byte limits must be positive")
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = "…".encode("utf-8")
+    if max_bytes < len(suffix):
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(suffix)].decode("utf-8", errors="ignore")
+    return prefix + "…"
+
+
+def _bounded_json_text(value: str, max_bytes: int) -> str:
+    """Truncate text so its serialized JSON string fits a byte budget."""
+
+    if max_bytes < len(json_dumps("").encode("utf-8")):
+        raise ValueError("JSON string byte limits must fit an empty string")
+    if len(json_dumps(value).encode("utf-8")) <= max_bytes:
+        return value
+
+    suffix = "…"
+    low = 0
+    high = len(value)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = value[:middle] + suffix
+        if len(json_dumps(candidate).encode("utf-8")) <= max_bytes:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _bounded_event_index(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(
+        -_RESOURCE_DOMAIN_EVENT_INDEX_LIMIT,
+        min(value, _RESOURCE_DOMAIN_EVENT_INDEX_LIMIT),
+    )
+
+
+def _terminal_event_kernel_epoch(
+    payload: dict[str, Any],
+) -> tuple[int | None, bool]:
+    value = payload.get("kernel_epoch")
+    kernel_epoch = (
+        _bounded_event_index(value)
+        if isinstance(value, int) and not isinstance(value, bool)
+        else None
+    )
+    return kernel_epoch, kernel_epoch != value
+
+
+def _project_runner_error_terminal_event(
+    payload: dict[str, Any],
+    kernel_epoch: int | None,
+    kernel_epoch_truncated: bool,
+) -> dict[str, Any]:
+    raw_error_type = str(payload.get("error_type", ""))
+    raw_error = str(payload.get("error", ""))
+    error_type = _bounded_json_text(
+        raw_error_type, _TERMINAL_EVENT_ERROR_TYPE_JSON_BYTES
+    )
+    error = _bounded_json_text(raw_error, _TERMINAL_EVENT_ERROR_JSON_BYTES)
+    return {
+        "kernel_epoch": kernel_epoch,
+        "error_type": error_type,
+        "error": error,
+        "projection_truncated": (
+            kernel_epoch_truncated
+            or error_type != raw_error_type
+            or error != raw_error
+            or set(payload) != {"kernel_epoch", "error_type", "error"}
+        ),
+    }
+
+
+def _project_external_failure_terminal_event(
+    payload: dict[str, Any],
+    kernel_epoch: int | None,
+    kernel_epoch_truncated: bool,
+) -> dict[str, Any]:
+    raw_resource_ids = payload.get("resource_ids", [])
+    resource_id_values = (
+        cast(list[object], raw_resource_ids)
+        if isinstance(raw_resource_ids, list)
+        else []
+    )
+    resource_ids = [str(resource_id) for resource_id in resource_id_values]
+    sample = resource_ids[:_TERMINAL_EVENT_RESOURCE_SAMPLE_SIZE]
+    bounded_sample = [
+        _bounded_json_text(resource_id, _TERMINAL_EVENT_RESOURCE_ID_JSON_BYTES)
+        for resource_id in sample
+    ]
+    return {
+        "kernel_epoch": kernel_epoch,
+        "failure_count": len(resource_ids),
+        "resource_ids_sample": bounded_sample,
+        "projection_truncated": (
+            kernel_epoch_truncated
+            or not isinstance(raw_resource_ids, list)
+            or len(resource_ids) > len(sample)
+            or bounded_sample != sample
+            or set(payload) != {"kernel_epoch", "resource_ids"}
+        ),
+    }
+
+
+def _project_succeeded_terminal_event(
+    payload: dict[str, Any],
+    kernel_epoch: int | None,
+    kernel_epoch_truncated: bool,
+) -> dict[str, Any]:
+    raw_output_path = str(payload.get("output_path", ""))
+    output_path = _bounded_json_text(
+        raw_output_path, _TERMINAL_EVENT_OUTPUT_PATH_JSON_BYTES
+    )
+    return {
+        "kernel_epoch": kernel_epoch,
+        "output_path": output_path,
+        "projection_truncated": (
+            kernel_epoch_truncated
+            or output_path != raw_output_path
+            or set(payload) != {"kernel_epoch", "output_path"}
+        ),
+    }
+
+
+def _project_cancelled_terminal_event(
+    payload: dict[str, Any],
+    kernel_epoch: int | None,
+    kernel_epoch_truncated: bool,
+) -> dict[str, Any]:
+    projected: dict[str, Any] = {"kernel_epoch": kernel_epoch}
+    if "kernel_state_lost" in payload:
+        projected["kernel_state_lost"] = bool(payload["kernel_state_lost"])
+    if "offline" in payload:
+        projected["offline"] = bool(payload["offline"])
+    projected["projection_truncated"] = (
+        kernel_epoch_truncated
+        or set(payload) - {"kernel_epoch", "kernel_state_lost", "offline"} != set()
+    )
+    return projected
+
+
+def _project_external_timeout_terminal_event(
+    payload: dict[str, Any],
+    kernel_epoch: int | None,
+    kernel_epoch_truncated: bool,
+) -> dict[str, Any]:
+    return {
+        "kernel_epoch": kernel_epoch,
+        "projection_truncated": (
+            kernel_epoch_truncated or set(payload) != {"kernel_epoch"}
+        ),
+    }
+
+
+_TerminalEventProjector = Callable[[dict[str, Any], int | None, bool], dict[str, Any]]
+_TERMINAL_EVENT_PROJECTORS: dict[str, _TerminalEventProjector] = {
+    "run.runner_error": _project_runner_error_terminal_event,
+    "run.failed_external": _project_external_failure_terminal_event,
+    "run.succeeded": _project_succeeded_terminal_event,
+    "run.cancelled": _project_cancelled_terminal_event,
+    "run.external_timeout": _project_external_timeout_terminal_event,
+}
+
+
+def _utf8_suffix(value: str, max_bytes: int) -> str:
+    """Return the largest valid suffix that fits a UTF-8 byte budget."""
+
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+
 class RunStore:
     """Versioned SQLite state and action journal for one or more Runwatch runs."""
 
@@ -94,7 +425,10 @@ class RunStore:
         max_log_bytes_per_resource: int = 2_097_152,
         max_events_per_run: int = 10_000,
         max_event_bytes_per_run: int = 8_388_608,
-        max_resource_payload_bytes: int = 2_097_152,
+        max_event_payload_bytes: int = 2_097_152,
+        max_resource_payload_bytes: int = 4_194_304,
+        max_notification_record_bytes: int = 524_288,
+        max_delivery_error_bytes: int = 4_096,
     ) -> None:
         try:
             path.parent.mkdir(parents=True, mode=PRIVATE_DIRECTORY_MODE)
@@ -110,7 +444,10 @@ class RunStore:
         self.max_log_bytes_per_resource = max_log_bytes_per_resource
         self.max_events_per_run = max_events_per_run
         self.max_event_bytes_per_run = max_event_bytes_per_run
+        self.max_event_payload_bytes = max_event_payload_bytes
         self.max_resource_payload_bytes = max_resource_payload_bytes
+        self.max_notification_record_bytes = max_notification_record_bytes
+        self.max_delivery_error_bytes = max_delivery_error_bytes
         self._connection = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
@@ -147,15 +484,16 @@ class RunStore:
         if "runwatch_meta" not in tables:
             raise UnsupportedRunSchema(
                 "This run directory uses the unsupported Runwatch 0.1 schema; "
-                "start a new run with Runwatch schema version 2"
+                "start a new run with Runwatch schema version 3"
             )
         row = self._connection.execute(
             "SELECT value FROM runwatch_meta WHERE key = 'schema_version'"
         ).fetchone()
         version = int(row["value"]) if row else 0
-        if version != SCHEMA_VERSION:
+        if version not in {2, DATABASE_SCHEMA_VERSION}:
             raise UnsupportedRunSchema(
-                f"Unsupported Runwatch schema version {version}; expected {SCHEMA_VERSION}"
+                "Unsupported Runwatch database schema version "
+                f"{version}; expected {DATABASE_SCHEMA_VERSION}"
             )
         required = {
             "runs",
@@ -172,10 +510,29 @@ class RunStore:
             raise CorruptRunState(
                 "Runwatch database is missing required table(s): " + ", ".join(missing)
             )
+        if version == 2:
+            self._migrate_schema_v2_to_v3()
         integrity = self._connection.execute("PRAGMA quick_check").fetchone()
         if integrity is None or integrity[0] != "ok":
             detail = integrity[0] if integrity else "no result"
             raise CorruptRunState(f"Runwatch database integrity check failed: {detail}")
+
+    def _migrate_schema_v2_to_v3(self) -> None:
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                "ALTER TABLE runs ADD COLUMN finalization_complete "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._connection.execute("ALTER TABLE runs ADD COLUMN finalized_at TEXT")
+            self._connection.execute(
+                "UPDATE runwatch_meta SET value = ? WHERE key = 'schema_version'",
+                (str(DATABASE_SCHEMA_VERSION),),
+            )
+            self._connection.commit()
+        except Exception:
+            self._connection.rollback()
+            raise
 
     def _create_schema(self) -> None:
         self._connection.executescript("""
@@ -209,6 +566,8 @@ class RunStore:
                 updated_at TEXT NOT NULL,
                 started_at TEXT,
                 ended_at TEXT,
+                finalization_complete INTEGER NOT NULL DEFAULT 0,
+                finalized_at TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
 
@@ -360,7 +719,7 @@ class RunStore:
             """)
         self._connection.execute(
             "INSERT INTO runwatch_meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
+            (str(DATABASE_SCHEMA_VERSION),),
         )
         self._connection.commit()
 
@@ -492,6 +851,8 @@ class RunStore:
         started: bool = False,
         ended: bool = False,
     ) -> None:
+        if status.terminal:
+            raise ValueError("Terminal run states must be committed with finish_run")
         fields = ["status = ?", "updated_at = ?"]
         values: list[Any] = [status.value, utc_now().isoformat()]
         if message is not None:
@@ -511,12 +872,161 @@ class RunStore:
         if ended:
             fields.append("ended_at = ?")
             values.append(utc_now().isoformat())
+        if status in {RunStatus.STARTING, RunStatus.RESTARTING}:
+            fields.extend(
+                ["finalization_complete = 0", "finalized_at = NULL", "ended_at = NULL"]
+            )
         values.append(run_id)
         with self._lock:
             self._connection.execute(
                 f"UPDATE runs SET {', '.join(fields)} WHERE run_id = ?", values
             )
             self._connection.commit()
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: RunStatus,
+        *,
+        message: str,
+        event_type: str,
+        event_payload: dict[str, Any],
+        current_cell_index: int | None | object = ...,
+        failed_cell_index: int | None | object = ...,
+        failed_attempt: int | None | object = ...,
+    ) -> dict[str, Any]:
+        """Atomically commit one terminal run transition and its domain event."""
+
+        if not status.terminal:
+            raise ValueError("finish_run requires a terminal status")
+        now = utc_now().isoformat()
+        message = _bounded_utf8_text(message, _RUN_MESSAGE_MAX_BYTES)
+        event_payload = self._terminal_event_payload(event_type, event_payload)
+        fields = [
+            "status = ?",
+            "message = ?",
+            "updated_at = ?",
+            "ended_at = ?",
+            "finalization_complete = 0",
+            "finalized_at = NULL",
+        ]
+        values: list[Any] = [status.value, message, now, now]
+        for name, value in (
+            ("current_cell_index", current_cell_index),
+            ("failed_cell_index", failed_cell_index),
+            ("failed_attempt", failed_attempt),
+        ):
+            if value is not ...:
+                fields.append(f"{name} = ?")
+                values.append(value)
+        terminal_values = tuple(item.value for item in RunStatus if item.terminal)
+        terminal_placeholders = ", ".join("?" for _ in terminal_values)
+        values.extend([run_id, *terminal_values])
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated = self._connection.execute(
+                    f"UPDATE runs SET {', '.join(fields)} "
+                    f"WHERE run_id = ? AND status NOT IN ({terminal_placeholders})",
+                    values,
+                )
+                if updated.rowcount != 1:
+                    row = self._connection.execute(
+                        "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                    if row is None:
+                        raise KeyError(run_id)
+                    raise RuntimeError(
+                        f"Run {run_id} is already terminal with status {row['status']}"
+                    )
+                event = self._append_event_uncommitted(
+                    run_id, event_type, event_payload, timestamp=now
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return event
+
+    @staticmethod
+    def _terminal_event_payload(
+        event_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Project essential terminal events into the configured minimum cap."""
+
+        projector = _TERMINAL_EVENT_PROJECTORS.get(event_type)
+        if projector is None:
+            return payload
+        kernel_epoch, kernel_epoch_truncated = _terminal_event_kernel_epoch(payload)
+        return projector(payload, kernel_epoch, kernel_epoch_truncated)
+
+    def mark_run_finalized(self, run_id: str, expected_status: RunStatus) -> None:
+        """Record that the runner and supervisor post-run work returned normally."""
+
+        if not expected_status.terminal:
+            raise ValueError("Only a terminal run can be finalized")
+        now = utc_now().isoformat()
+        with self._lock:
+            updated = self._connection.execute(
+                """
+                UPDATE runs SET finalization_complete = 1, finalized_at = ?, updated_at = ?
+                WHERE run_id = ? AND status = ? AND ended_at IS NOT NULL
+                """,
+                (now, now, run_id, expected_status.value),
+            )
+            self._connection.commit()
+        if updated.rowcount != 1:
+            raise RuntimeError(
+                f"Run {run_id} is not terminal as {expected_status.value}"
+            )
+
+    def request_run_cancellation(
+        self,
+        run_id: str,
+        *,
+        message: str,
+        event_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Atomically persist a first cancellation request and its event."""
+
+        now = utc_now().isoformat()
+        terminal_values = tuple(item.value for item in RunStatus if item.terminal)
+        terminal_placeholders = ", ".join("?" for _ in terminal_values)
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                current = RunStatus(row["status"])
+                if current.terminal or current is RunStatus.CANCELLING:
+                    self._connection.commit()
+                    return None
+                updated = self._connection.execute(
+                    f"""
+                    UPDATE runs SET status = ?, message = ?, updated_at = ?
+                    WHERE run_id = ? AND status NOT IN ({terminal_placeholders})
+                    """,
+                    (
+                        RunStatus.CANCELLING.value,
+                        message,
+                        now,
+                        run_id,
+                        *terminal_values,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(f"Run {run_id} changed while cancellation began")
+                event = self._append_event_uncommitted(
+                    run_id, "run.cancel_requested", event_payload, timestamp=now
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return event
 
     def update_process(
         self,
@@ -566,7 +1076,11 @@ class RunStore:
     def begin_kernel_epoch(self, run_id: str) -> int:
         with self._lock:
             self._connection.execute(
-                "UPDATE runs SET kernel_epoch = kernel_epoch + 1, updated_at = ? WHERE run_id = ?",
+                """
+                UPDATE runs SET kernel_epoch = kernel_epoch + 1, updated_at = ?,
+                    finalization_complete = 0, finalized_at = NULL, ended_at = NULL
+                WHERE run_id = ?
+                """,
                 (utc_now().isoformat(), run_id),
             )
             row = self._connection.execute(
@@ -712,6 +1226,135 @@ class RunStore:
             )
             self._connection.commit()
 
+    def pause_failed_cell(
+        self,
+        run_id: str,
+        cell_index: int,
+        *,
+        attempt: int,
+        kernel_epoch: int,
+        elapsed_seconds: float,
+        error_name: str,
+        error_value: str,
+        traceback: list[str],
+        kernel_dead: bool,
+    ) -> dict[str, Any]:
+        """Atomically persist a failed cell, paused run, and failure event."""
+
+        now = utc_now().isoformat()
+        persisted_error_name = _bounded_utf8_text(
+            error_name, _CELL_ERROR_NAME_MAX_BYTES
+        )
+        persisted_error_value = _bounded_utf8_text(
+            error_value, _CELL_ERROR_VALUE_MAX_BYTES
+        )
+        selected_traceback = traceback[-_CELL_TRACEBACK_MAX_LINES:]
+        persisted_traceback = [
+            _bounded_json_text(line, _CELL_TRACEBACK_LINE_JSON_BYTES)
+            for line in selected_traceback
+        ]
+        persisted_details_truncated = (
+            persisted_error_name != error_name
+            or persisted_error_value != error_value
+            or len(selected_traceback) != len(traceback)
+            or persisted_traceback != selected_traceback
+        )
+        event_error_name = _bounded_json_text(
+            persisted_error_name, _CELL_EVENT_ERROR_NAME_JSON_BYTES
+        )
+        event_error_value = _bounded_json_text(
+            persisted_error_value, _CELL_EVENT_ERROR_VALUE_JSON_BYTES
+        )
+        event_traceback_source = persisted_traceback[-_CELL_EVENT_TRACEBACK_LINES:]
+        event_traceback = [
+            _bounded_json_text(line, _CELL_EVENT_TRACEBACK_LINE_JSON_BYTES)
+            for line in event_traceback_source
+        ]
+        message = _bounded_utf8_text(
+            f"Cell {cell_index + 1} failed: "
+            f"{persisted_error_name}: {persisted_error_value}",
+            _RUN_MESSAGE_MAX_BYTES,
+        )
+        terminal_values = tuple(item.value for item in RunStatus if item.terminal)
+        terminal_placeholders = ", ".join("?" for _ in terminal_values)
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                cell = self._connection.execute(
+                    """
+                    UPDATE cells SET status = ?, ended_at = ?, elapsed_seconds = ?,
+                        error_name = ?, error_value = ?, traceback_json = ?
+                    WHERE run_id = ? AND cell_index = ? AND attempt = ?
+                        AND kernel_epoch = ?
+                    """,
+                    (
+                        CellStatus.FAILED.value,
+                        now,
+                        elapsed_seconds,
+                        persisted_error_name,
+                        persisted_error_value,
+                        json_dumps(persisted_traceback),
+                        run_id,
+                        cell_index,
+                        attempt,
+                        kernel_epoch,
+                    ),
+                )
+                if cell.rowcount != 1:
+                    raise RuntimeError(
+                        f"Cell {cell_index} attempt changed before failure persistence"
+                    )
+                run = self._connection.execute(
+                    f"""
+                    UPDATE runs SET status = ?, message = ?, current_cell_index = ?,
+                        failed_cell_index = ?, failed_attempt = ?, updated_at = ?
+                    WHERE run_id = ? AND status NOT IN ({terminal_placeholders})
+                    """,
+                    (
+                        RunStatus.PAUSED.value,
+                        message,
+                        cell_index,
+                        cell_index,
+                        attempt,
+                        now,
+                        run_id,
+                        *terminal_values,
+                    ),
+                )
+                if run.rowcount != 1:
+                    raise RuntimeError(
+                        f"Run {run_id} became terminal before cell failure persistence"
+                    )
+                event = self._append_event_uncommitted(
+                    run_id,
+                    "cell.failed",
+                    {
+                        "cell_index": _bounded_event_index(cell_index),
+                        "attempt": _bounded_event_index(attempt),
+                        "kernel_epoch": _bounded_event_index(kernel_epoch),
+                        "error_name": event_error_name,
+                        "error_value": event_error_value,
+                        "traceback": event_traceback,
+                        "kernel_dead": kernel_dead,
+                        "projection_truncated": (
+                            persisted_details_truncated
+                            or event_error_name != persisted_error_name
+                            or event_error_value != persisted_error_value
+                            or len(event_traceback_source) != len(persisted_traceback)
+                            or event_traceback != event_traceback_source
+                            or _bounded_event_index(cell_index) != cell_index
+                            or _bounded_event_index(attempt) != attempt
+                            or _bounded_event_index(kernel_epoch) != kernel_epoch
+                        ),
+                    },
+                    timestamp=now,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return event
+
     def append_cell_output(
         self,
         run_id: str,
@@ -745,47 +1388,99 @@ class RunStore:
         kernel_epoch: int | None,
         supports_stop: bool,
     ) -> tuple[str, bool]:
+        """Persist a resource without publishing its domain event.
+
+        Runtime registration uses :meth:`register_resource_with_event`. This two-value
+        helper remains available for low-level state construction and migrations.
+        """
+
+        internal_id, created, _event = self._register_resource(
+            run_id=run_id,
+            event=event,
+            cell_index=cell_index,
+            attempt=attempt,
+            kernel_epoch=kernel_epoch,
+            supports_stop=supports_stop,
+            append_domain_event=False,
+        )
+        return internal_id, created
+
+    def register_resource_with_event(
+        self,
+        *,
+        run_id: str,
+        event: ResourceEvent,
+        cell_index: int | None,
+        attempt: int | None,
+        kernel_epoch: int | None,
+        supports_stop: bool,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        """Atomically persist a resource transition and its bounded domain event."""
+
+        internal_id, created, persisted_event = self._register_resource(
+            run_id=run_id,
+            event=event,
+            cell_index=cell_index,
+            attempt=attempt,
+            kernel_epoch=kernel_epoch,
+            supports_stop=supports_stop,
+            append_domain_event=True,
+        )
+        assert persisted_event is not None
+        return internal_id, created, persisted_event
+
+    def _register_resource(
+        self,
+        *,
+        run_id: str,
+        event: ResourceEvent,
+        cell_index: int | None,
+        attempt: int | None,
+        kernel_epoch: int | None,
+        supports_stop: bool,
+        append_domain_event: bool,
+    ) -> tuple[str, bool, dict[str, Any] | None]:
         self._validate_resource_payload_size(
-            {
-                "lifecycle": event.lifecycle.model_dump(mode="json"),
-                "metadata": event.resource.metadata,
-            }
+            event.model_dump(mode="json"), record_type="registration"
         )
         with self._lock:
-            duplicate = self._connection.execute(
-                "SELECT * FROM resources WHERE run_id = ? AND event_id = ?",
-                (run_id, event.event_id),
-            ).fetchone()
-            if duplicate is not None:
-                expected_identity = (
-                    event.resource.provider,
-                    event.resource.type,
-                    event.resource.id,
-                    event.resource.logical_key,
-                    event.resource.region,
-                    event.resource.account_id,
-                    event.resource.ownership.value,
-                    event.lifecycle.model_dump(mode="json"),
-                    event.resource.metadata,
-                )
-                stored_identity = (
-                    duplicate["provider"],
-                    duplicate["resource_type"],
-                    duplicate["external_id"],
-                    duplicate["logical_key"],
-                    duplicate["region"],
-                    duplicate["account_id"],
-                    duplicate["ownership"],
-                    json_loads(duplicate["lifecycle_json"], {}),
-                    json_loads(duplicate["metadata_json"], {}),
-                )
-                if stored_identity != expected_identity:
-                    raise ResourceEventConflict(
-                        f"Resource event {event.event_id} was reused with a different identity"
-                    )
-                return str(duplicate["internal_id"]), False
             try:
-                if event.resource.logical_key:
+                self._connection.execute("BEGIN IMMEDIATE")
+                duplicate = self._connection.execute(
+                    "SELECT * FROM resources WHERE run_id = ? AND event_id = ?",
+                    (run_id, event.event_id),
+                ).fetchone()
+                superseded_internal_id: str | None = None
+                if duplicate is not None:
+                    expected_identity = (
+                        event.resource.provider,
+                        event.resource.type,
+                        event.resource.id,
+                        event.resource.logical_key,
+                        event.resource.region,
+                        event.resource.account_id,
+                        event.resource.ownership.value,
+                        event.lifecycle.model_dump(mode="json"),
+                        event.resource.metadata,
+                    )
+                    stored_identity = (
+                        duplicate["provider"],
+                        duplicate["resource_type"],
+                        duplicate["external_id"],
+                        duplicate["logical_key"],
+                        duplicate["region"],
+                        duplicate["account_id"],
+                        duplicate["ownership"],
+                        json_loads(duplicate["lifecycle_json"], {}),
+                        json_loads(duplicate["metadata_json"], {}),
+                    )
+                    if stored_identity != expected_identity:
+                        raise ResourceEventConflict(
+                            f"Resource event {event.event_id} was reused with a different identity"
+                        )
+                    internal_id = str(duplicate["internal_id"])
+                    created = False
+                elif event.resource.logical_key:
                     existing = self._connection.execute(
                         """
                         SELECT * FROM resources
@@ -800,70 +1495,190 @@ class RunStore:
                             ResourceDisposition.ACTIVE.value,
                         ),
                     ).fetchone()
-                    if existing is not None:
-                        if existing["external_id"] == event.resource.id:
-                            self._refresh_reconciled_resource(
-                                existing["internal_id"],
-                                event=event,
-                                cell_index=cell_index,
-                                attempt=attempt,
-                                kernel_epoch=kernel_epoch,
-                                supports_stop=supports_stop,
-                            )
-                            self._connection.commit()
-                            return str(existing["internal_id"]), False
-                        self._connection.execute(
-                            """
-                            UPDATE resources
-                            SET disposition = ?, monitor_closed = 1, updated_at = ?,
-                                version = version + 1
-                            WHERE internal_id = ?
-                            """,
-                            (
-                                ResourceDisposition.SUPERSEDED.value,
-                                utc_now().isoformat(),
-                                existing["internal_id"],
-                            ),
+                    if (
+                        existing is not None
+                        and existing["external_id"] == event.resource.id
+                    ):
+                        internal_id = str(existing["internal_id"])
+                        self._refresh_reconciled_resource(
+                            internal_id,
+                            event=event,
+                            cell_index=cell_index,
+                            attempt=attempt,
+                            kernel_epoch=kernel_epoch,
+                            supports_stop=supports_stop,
                         )
-                internal_id = str(uuid4())
-                now = utc_now().isoformat()
-                self._connection.execute(
-                    """
-                    INSERT INTO resources (
-                        internal_id, run_id, event_id, logical_key, cell_index, attempt,
-                        kernel_epoch, provider, resource_type, external_id, region, account_id,
-                        ownership, lifecycle_json, metadata_json, supports_stop, status,
-                        disposition, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        internal_id,
+                        created = False
+                    else:
+                        if existing is not None:
+                            superseded_internal_id = str(existing["internal_id"])
+                            self._connection.execute(
+                                """
+                                UPDATE resources
+                                SET disposition = ?, monitor_closed = 1, updated_at = ?,
+                                    version = version + 1
+                                WHERE internal_id = ?
+                                """,
+                                (
+                                    ResourceDisposition.SUPERSEDED.value,
+                                    utc_now().isoformat(),
+                                    superseded_internal_id,
+                                ),
+                            )
+                        internal_id = self._insert_resource(
+                            run_id=run_id,
+                            event=event,
+                            cell_index=cell_index,
+                            attempt=attempt,
+                            kernel_epoch=kernel_epoch,
+                            supports_stop=supports_stop,
+                        )
+                        created = True
+                else:
+                    internal_id = self._insert_resource(
+                        run_id=run_id,
+                        event=event,
+                        cell_index=cell_index,
+                        attempt=attempt,
+                        kernel_epoch=kernel_epoch,
+                        supports_stop=supports_stop,
+                    )
+                    created = True
+
+                persisted_event = None
+                if append_domain_event:
+                    persisted_event = self._append_event_uncommitted(
                         run_id,
-                        event.event_id,
-                        event.resource.logical_key,
-                        cell_index,
-                        attempt,
-                        kernel_epoch,
-                        event.resource.provider,
-                        event.resource.type,
-                        event.resource.id,
-                        event.resource.region,
-                        event.resource.account_id,
-                        event.resource.ownership.value,
-                        json_dumps(event.lifecycle),
-                        json_dumps(event.resource.metadata),
-                        int(supports_stop),
-                        ResourceStatus.REGISTERED.value,
-                        ResourceDisposition.ACTIVE.value,
-                        now,
-                        now,
-                    ),
-                )
+                        "resource.registered" if created else "resource.reconciled",
+                        self._resource_domain_event_payload(
+                            internal_id=internal_id,
+                            event=event,
+                            cell_index=cell_index,
+                            attempt=attempt,
+                            kernel_epoch=kernel_epoch,
+                            supports_stop=supports_stop,
+                            superseded_internal_id=superseded_internal_id,
+                        ),
+                        timestamp=utc_now().isoformat(),
+                    )
                 self._connection.commit()
-                return internal_id, True
+                return internal_id, created, persisted_event
             except Exception:
                 self._connection.rollback()
                 raise
+
+    def _insert_resource(
+        self,
+        *,
+        run_id: str,
+        event: ResourceEvent,
+        cell_index: int | None,
+        attempt: int | None,
+        kernel_epoch: int | None,
+        supports_stop: bool,
+    ) -> str:
+        internal_id = str(uuid4())
+        now = utc_now().isoformat()
+        self._connection.execute(
+            """
+            INSERT INTO resources (
+                internal_id, run_id, event_id, logical_key, cell_index, attempt,
+                kernel_epoch, provider, resource_type, external_id, region, account_id,
+                ownership, lifecycle_json, metadata_json, supports_stop, status,
+                disposition, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                internal_id,
+                run_id,
+                event.event_id,
+                event.resource.logical_key,
+                cell_index,
+                attempt,
+                kernel_epoch,
+                event.resource.provider,
+                event.resource.type,
+                event.resource.id,
+                event.resource.region,
+                event.resource.account_id,
+                event.resource.ownership.value,
+                json_dumps(event.lifecycle),
+                json_dumps(event.resource.metadata),
+                int(supports_stop),
+                ResourceStatus.REGISTERED.value,
+                ResourceDisposition.ACTIVE.value,
+                now,
+                now,
+            ),
+        )
+        return internal_id
+
+    @staticmethod
+    def _bounded_resource_domain_event_index(value: int | None) -> int | None:
+        return _bounded_event_index(value)
+
+    @classmethod
+    def _resource_domain_event_payload(
+        cls,
+        *,
+        internal_id: str,
+        event: ResourceEvent,
+        cell_index: int | None,
+        attempt: int | None,
+        kernel_epoch: int | None,
+        supports_stop: bool,
+        superseded_internal_id: str | None,
+    ) -> dict[str, Any]:
+        text = {
+            "event_id": event.event_id,
+            "provider": event.resource.provider,
+            "type": event.resource.type,
+            "id": event.resource.id,
+            "logical_key": event.resource.logical_key,
+        }
+        bounded_text = {
+            key: (
+                _bounded_utf8_text(value, _RESOURCE_DOMAIN_EVENT_TEXT_MAX_BYTES)
+                if value is not None
+                else None
+            )
+            for key, value in text.items()
+        }
+        indices = {
+            "cell_index": cell_index,
+            "attempt": attempt,
+            "kernel_epoch": kernel_epoch,
+        }
+        bounded_indices = {
+            key: cls._bounded_resource_domain_event_index(value)
+            for key, value in indices.items()
+        }
+        return {
+            "internal_id": internal_id,
+            "event_id": bounded_text["event_id"],
+            "cell_index": bounded_indices["cell_index"],
+            "attempt": bounded_indices["attempt"],
+            "kernel_epoch": bounded_indices["kernel_epoch"],
+            "resource": {
+                "provider": bounded_text["provider"],
+                "type": bounded_text["type"],
+                "id": bounded_text["id"],
+                "logical_key": bounded_text["logical_key"],
+                "ownership": event.resource.ownership.value,
+            },
+            "lifecycle": {
+                "monitor": event.lifecycle.monitor,
+                "blocking": event.lifecycle.blocking,
+                "stop_on_cancel": event.lifecycle.stop_on_cancel,
+                "retain_logs": event.lifecycle.retain_logs,
+            },
+            "supports_stop": supports_stop,
+            "superseded_internal_id": superseded_internal_id,
+            "projection_truncated": (
+                bounded_text != text
+                or any(bounded_indices[key] != value for key, value in indices.items())
+            ),
+        }
 
     def _refresh_reconciled_resource(
         self,
@@ -920,6 +1735,7 @@ class RunStore:
         return dict(resource.get("cursor", {})) if resource else {}
 
     def save_resource_cursor(self, internal_id: str, cursor: dict[str, Any]) -> None:
+        self._validate_resource_payload_size(cursor, record_type="cursor")
         with self._lock:
             self._connection.execute(
                 "UPDATE resources SET cursor_json = ?, updated_at = ? WHERE internal_id = ?",
@@ -929,8 +1745,8 @@ class RunStore:
 
     def update_resource_observation(
         self, run_id: str, internal_id: str, observation: ResourceObservation
-    ) -> None:
-        self._update_resource_observation(
+    ) -> dict[str, Any]:
+        return self._update_resource_observation(
             run_id,
             internal_id,
             observation,
@@ -944,10 +1760,10 @@ class RunStore:
         internal_id: str,
         observation: ResourceObservation,
         cursor: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Atomically commit an adapter cursor and everything it observed."""
 
-        self._update_resource_observation(
+        return self._update_resource_observation(
             run_id,
             internal_id,
             observation,
@@ -962,10 +1778,10 @@ class RunStore:
         observation: ResourceObservation,
         cursor: dict[str, Any],
         disposition: ResourceDisposition,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Atomically commit stop inspection state and its terminal disposition."""
 
-        self._update_resource_observation(
+        return self._update_resource_observation(
             run_id,
             internal_id,
             observation,
@@ -981,23 +1797,35 @@ class RunStore:
         *,
         cursor: dict[str, Any] | None,
         terminal_disposition: ResourceDisposition | None,
-    ) -> None:
+    ) -> dict[str, Any]:
         now = utc_now().isoformat()
         with self._lock:
             try:
+                self._connection.execute("BEGIN IMMEDIATE")
                 row = self._resource_persistence_row(internal_id)
                 if row is None:
-                    return
+                    raise KeyError(internal_id)
                 log_tail = self._updated_log_tail(row, observation)
                 cursor_json = (
                     row["cursor_json"] if cursor is None else json_dumps(cursor)
                 )
+                cursor_value = json_loads(cursor_json, {})
+                self._validate_resource_payload_size(cursor_value, record_type="cursor")
+                history_metrics = (
+                    observation.metrics
+                    if observation.history_metrics is None
+                    else observation.history_metrics
+                )
                 self._validate_resource_payload_size(
                     {
-                        "cursor": json_loads(cursor_json, {}),
-                        "metrics": observation.metrics,
+                        "message": observation.message,
+                        "current_metrics": observation.metrics,
+                        "history_metrics": history_metrics,
                         "raw": observation.raw,
-                    }
+                        "log_lines": observation.log_lines,
+                        "persisted_log_tail": log_tail,
+                    },
+                    record_type="observation",
                 )
                 self._update_resource_from_observation(
                     internal_id,
@@ -1011,10 +1839,24 @@ class RunStore:
                     run_id, internal_id, observation, now=now
                 )
                 self._prune_resource_observations(internal_id)
+                event = self._append_event_uncommitted(
+                    run_id,
+                    "resource.observed",
+                    {
+                        "internal_id": internal_id,
+                        "status": observation.status.value,
+                        "terminal": observation.terminal,
+                        "message": observation.message,
+                        "metrics": observation.metrics,
+                        "new_log_lines": observation.log_lines[-30:],
+                    },
+                    timestamp=now,
+                )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
                 raise
+        return event
 
     def _resource_persistence_row(self, internal_id: str) -> sqlite3.Row | None:
         return self._connection.execute(
@@ -1041,21 +1883,35 @@ class RunStore:
                 break
             if len(encoded) > remaining:
                 if not selected:
-                    selected.append(
-                        encoded[-remaining:].decode("utf-8", errors="replace")
-                    )
+                    selected.append(_utf8_suffix(line, remaining))
                 break
             selected.append(line)
             used += len(encoded)
         return list(reversed(selected))
 
-    def _validate_resource_payload_size(self, value: Any) -> None:
-        size = len(json_dumps(value).encode("utf-8"))
-        if size > self.max_resource_payload_bytes:
+    def _validate_resource_payload_size(self, value: Any, *, record_type: str) -> None:
+        self._validated_json_payload(
+            value,
+            max_bytes=self.max_resource_payload_bytes,
+            setting="max_resource_payload_bytes",
+            record_type=f"Resource {record_type}",
+        )
+
+    @staticmethod
+    def _validated_json_payload(
+        value: Any,
+        *,
+        max_bytes: int,
+        setting: str,
+        record_type: str,
+    ) -> str:
+        serialized = json_dumps(value)
+        size = len(serialized.encode("utf-8"))
+        if size > max_bytes:
             raise ValueError(
-                "Resource payload exceeds storage.max_resource_payload_bytes "
-                f"({size} > {self.max_resource_payload_bytes})"
+                f"{record_type} exceeds storage.{setting} ({size} > {max_bytes})"
             )
+        return serialized
 
     def _update_resource_from_observation(
         self,
@@ -1081,7 +1937,7 @@ class RunStore:
                 metrics_json = ?, log_tail_json = ?, raw_json = ?, updated_at = ?,
                 terminal_at = CASE WHEN ? THEN COALESCE(terminal_at, ?) ELSE terminal_at END,
                 disposition = CASE WHEN ? THEN ? ELSE disposition END,
-                monitor_closed = CASE WHEN ? THEN 1 ELSE monitor_closed END,
+                monitor_closed = CASE WHEN ? THEN 0 ELSE monitor_closed END,
                 version = version + CASE
                     WHEN status != ? OR terminal != ?
                         OR (? AND disposition != ?) THEN 1 ELSE 0 END
@@ -1098,7 +1954,7 @@ class RunStore:
                 now,
                 int(observation.terminal),
                 now,
-                apply_disposition,
+                int(observation.terminal),
                 disposition,
                 apply_disposition,
                 observation.status.value,
@@ -1310,17 +2166,34 @@ class RunStore:
     def request_resource_stop(
         self, internal_id: str, disposition: ResourceDisposition
     ) -> dict[str, Any]:
+        resource, _event = self.request_resource_stop_with_event(
+            internal_id, disposition
+        )
+        return resource
+
+    def request_resource_stop_with_event(
+        self, internal_id: str, disposition: ResourceDisposition
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Persist stop intent, atomically confirming a resource already terminal."""
 
         now = utc_now().isoformat()
         with self._lock:
             try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                previous = self._connection.execute(
+                    "SELECT * FROM resources WHERE internal_id = ?", (internal_id,)
+                ).fetchone()
+                if previous is None:
+                    raise KeyError(internal_id)
+                already_stopping = bool(
+                    not previous["terminal"]
+                    and previous["status"] == ResourceStatus.STOPPING.value
+                )
                 self._connection.execute(
                     """
                     UPDATE resources
                     SET status = CASE WHEN terminal THEN status ELSE ? END,
                         disposition = CASE WHEN terminal THEN ? ELSE disposition END,
-                        monitor_closed = CASE WHEN terminal THEN 1 ELSE monitor_closed END,
                         updated_at = ?,
                         version = version + CASE
                             WHEN (NOT terminal AND status != ?)
@@ -1341,11 +2214,23 @@ class RunStore:
                 ).fetchone()
                 if row is None:
                     raise KeyError(internal_id)
+                event = None
+                if not already_stopping:
+                    event = self._append_event_uncommitted(
+                        str(row["run_id"]),
+                        "resource.stop_requested",
+                        {
+                            "internal_id": internal_id,
+                            "external_id": str(row["external_id"]),
+                            "already_terminal": bool(row["terminal"]),
+                        },
+                        timestamp=now,
+                    )
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
                 raise
-        return self._decode_resource(row)
+        return self._decode_resource(row), event
 
     def set_resource_disposition(
         self, internal_id: str, disposition: ResourceDisposition
@@ -1554,12 +2439,36 @@ class RunStore:
     ) -> dict[str, Any]:
         timestamp = utc_now().isoformat()
         with self._lock:
-            cursor = self._connection.execute(
-                "INSERT INTO events (run_id, timestamp, type, payload_json) VALUES (?, ?, ?, ?)",
-                (run_id, timestamp, event_type, json_dumps(payload)),
-            )
-            self._prune_events(run_id)
-            self._connection.commit()
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                event = self._append_event_uncommitted(
+                    run_id, event_type, payload, timestamp=timestamp
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return event
+
+    def _append_event_uncommitted(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        timestamp: str,
+    ) -> dict[str, Any]:
+        payload_json = self._validated_json_payload(
+            payload,
+            max_bytes=self.max_event_payload_bytes,
+            setting="max_event_payload_bytes",
+            record_type="Event payload",
+        )
+        cursor = self._connection.execute(
+            "INSERT INTO events (run_id, timestamp, type, payload_json) VALUES (?, ?, ?, ?)",
+            (run_id, timestamp, event_type, payload_json),
+        )
+        self._prune_events(run_id)
         sequence = cursor.lastrowid
         if sequence is None:
             raise RuntimeError("SQLite did not return an event sequence")
@@ -1765,6 +2674,518 @@ class RunStore:
             (json_dumps(metadata), utc_now().isoformat(), run_id),
         )
 
+    def notification_run_summary(self, run_id: str) -> dict[str, Any]:
+        """Return the small state projection needed by periodic notifications."""
+
+        with self._lock:
+            run = self._connection.execute(
+                """
+                SELECT name, status, current_cell_index, started_at, updated_at
+                FROM runs WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            resources = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM resources
+                WHERE run_id = ? AND terminal = 0 AND disposition = ?
+                """,
+                (run_id, ResourceDisposition.ACTIVE.value),
+            ).fetchone()
+        if run is None:
+            raise KeyError(f"Unknown run {run_id}")
+        elapsed_seconds: float | None = None
+        if run["started_at"] and run["updated_at"]:
+            try:
+                elapsed_seconds = max(
+                    0.0,
+                    (
+                        datetime.fromisoformat(str(run["updated_at"]))
+                        - datetime.fromisoformat(str(run["started_at"]))
+                    ).total_seconds(),
+                )
+            except ValueError:
+                elapsed_seconds = None
+        return {
+            "name": str(run["name"]),
+            "status": str(run["status"]),
+            "current_cell_index": run["current_cell_index"],
+            "active_resource_count": int(resources["count"] if resources else 0),
+            "elapsed_seconds": elapsed_seconds,
+        }
+
+    def notification_configuration(self, run_id: str) -> dict[str, Any] | None:
+        """Return the notification config last reconciled into durable state."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown run {run_id}")
+        metadata, _cursor = self._notification_metadata(row)
+        config = metadata.get("config")
+        if not isinstance(config, dict):
+            return None
+        notifications = cast(dict[str, Any], config).get("notifications", {})
+        if not isinstance(notifications, dict):
+            raise CorruptRunState("Persisted notification config must be an object")
+        return dict(cast(dict[str, Any], notifications))
+
+    def existing_notification_dedup_key(
+        self, run_id: str, dedup_keys: Iterable[str]
+    ) -> str | None:
+        """Return the first requested canonical or legacy key already persisted."""
+
+        ordered = list(dict.fromkeys(key for key in dedup_keys if key))
+        if not ordered:
+            return None
+        placeholders = ",".join("?" for _key in ordered)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT dedup_key, status FROM notification_intents
+                WHERE run_id = ? AND dedup_key IN ({placeholders})
+                """,
+                (run_id, *ordered),
+            ).fetchall()
+        succeeded = {
+            str(row["dedup_key"]) for row in rows if row["status"] == "succeeded"
+        }
+        if succeeded:
+            return next(key for key in ordered if key in succeeded)
+        existing = {str(row["dedup_key"]) for row in rows}
+        return next((key for key in ordered if key in existing), None)
+
+    def notification_delivery_topology(
+        self, run_id: str
+    ) -> tuple[tuple[str, int], ...]:
+        """Return persisted destination-kind counts without exposing credentials."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT kind, COUNT(DISTINCT destination) AS count
+                FROM notification_deliveries WHERE run_id = ? GROUP BY kind
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(sorted((str(row["kind"]), int(row["count"])) for row in rows))
+
+    def reconcile_notification_configuration(
+        self,
+        run_id: str,
+        *,
+        current_destinations: Iterable[tuple[str, str]] | None,
+        desired_destinations: Iterable[tuple[str, str]],
+        desired_configuration: dict[str, Any],
+    ) -> dict[str, int]:
+        """Atomically rotate same-topology destinations and scrub legacy records."""
+
+        current = (
+            None
+            if current_destinations is None
+            else _unique_notification_destinations(current_destinations)
+        )
+        desired = _unique_notification_destinations(desired_destinations)
+        self._validated_json_payload(
+            [
+                {"kind": kind, "destination": destination}
+                for kind, destination in desired
+            ],
+            max_bytes=self.max_notification_record_bytes,
+            setting="max_notification_record_bytes",
+            record_type="Notification rotation destinations",
+        )
+        if not desired:
+            return self.purge_notification_state(
+                run_id, desired_configuration=desired_configuration
+            )
+        now = utc_now().isoformat()
+        with self._lock:
+            try:
+                self._connection.execute("PRAGMA secure_delete=ON")
+                self._connection.execute("BEGIN IMMEDIATE")
+                consolidated = self._consolidate_terminal_notification_aliases(
+                    run_id, now
+                )
+                actual = self._actual_notification_destinations(run_id)
+                pairs = _notification_rotation_pairs(actual, current, desired)
+                changed = self._rewrite_notification_destinations(run_id, pairs)
+                configuration_changed = current is not None and current != desired
+                migration_required = self._notification_egress_migration_required(
+                    run_id
+                )
+                if changed or configuration_changed:
+                    self._reset_rotated_notification_deliveries(run_id, now)
+                elif migration_required:
+                    self._clear_notification_delivery_errors(run_id, now)
+                if changed or configuration_changed or migration_required:
+                    self._recompute_notification_intents(run_id, now)
+                sanitized = self._sanitize_legacy_notification_intents(run_id, now)
+                scrubbed = 0
+                if changed or configuration_changed or migration_required:
+                    scrubbed = self._scrub_notification_diagnostic_events(run_id)
+                self._write_notification_configuration_metadata(
+                    run_id,
+                    desired_configuration=desired_configuration,
+                    routing_required=True,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            if (
+                changed
+                or configuration_changed
+                or migration_required
+                or consolidated
+                or sanitized
+                or scrubbed
+            ):
+                self._compact_notification_credentials_best_effort()
+        return {
+            "rotated_destinations": changed,
+            "consolidated_intents": consolidated,
+            "sanitized_intents": sanitized,
+            "scrubbed_events": scrubbed,
+        }
+
+    def purge_notification_state(
+        self,
+        run_id: str,
+        *,
+        desired_configuration: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Delete notification outbox state and disable event replay routing."""
+
+        configuration = desired_configuration or {}
+        with self._lock:
+            try:
+                self._connection.execute("PRAGMA secure_delete=ON")
+                self._connection.execute("BEGIN IMMEDIATE")
+                counts = self._notification_purge_counts(run_id)
+                maximum = self._notification_event_high_water(run_id)
+                self._connection.execute(
+                    "DELETE FROM notification_intents WHERE run_id = ?", (run_id,)
+                )
+                scrubbed = self._scrub_notification_diagnostic_events(run_id)
+                self._write_notification_configuration_metadata(
+                    run_id,
+                    desired_configuration=configuration,
+                    routing_required=False,
+                    event_cursor=maximum,
+                    purge_keys=True,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            self._compact_notification_credentials_best_effort()
+        return {
+            **counts,
+            "scrubbed_events": scrubbed,
+        }
+
+    def _consolidate_terminal_notification_aliases(self, run_id: str, now: str) -> int:
+        rows = self._connection.execute(
+            """
+            SELECT intent_id, dedup_key, status, created_at
+            FROM notification_intents
+            WHERE run_id = ? AND dedup_key IS NOT NULL
+            """,
+            (run_id,),
+        ).fetchall()
+        groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            group = _terminal_notification_alias_group(row["dedup_key"])
+            if group is not None:
+                groups.setdefault(group, []).append(row)
+        removed = 0
+        for aliases in groups.values():
+            if len(aliases) < 2:
+                continue
+            authoritative = min(aliases, key=self._notification_alias_priority)
+            authoritative_id = str(authoritative["intent_id"])
+            for alias in aliases:
+                alias_id = str(alias["intent_id"])
+                if alias_id == authoritative_id:
+                    continue
+                self._merge_succeeded_notification_deliveries(
+                    authoritative_id, alias_id, now
+                )
+                self._connection.execute(
+                    "DELETE FROM notification_intents WHERE intent_id = ?",
+                    (alias_id,),
+                )
+                removed += 1
+            self._recompute_one_notification_intent(authoritative_id, now)
+        return removed
+
+    @staticmethod
+    def _notification_alias_priority(row: sqlite3.Row) -> tuple[bool, bool, str, str]:
+        dedup_key = str(row["dedup_key"])
+        return (
+            row["status"] != "succeeded",
+            not dedup_key.startswith("run-terminal:"),
+            str(row["created_at"]),
+            str(row["intent_id"]),
+        )
+
+    def _merge_succeeded_notification_deliveries(
+        self, authoritative_id: str, alias_id: str, now: str
+    ) -> None:
+        deliveries = self._connection.execute(
+            """
+            SELECT kind, destination, delivered_at
+            FROM notification_deliveries
+            WHERE intent_id = ? AND status = 'succeeded'
+            """,
+            (alias_id,),
+        ).fetchall()
+        for delivery in deliveries:
+            self._connection.execute(
+                """
+                UPDATE notification_deliveries
+                SET status = 'succeeded', last_error = NULL,
+                    delivered_at = COALESCE(delivered_at, ?), updated_at = ?
+                WHERE intent_id = ? AND kind = ? AND destination = ?
+                """,
+                (
+                    delivery["delivered_at"],
+                    now,
+                    authoritative_id,
+                    delivery["kind"],
+                    delivery["destination"],
+                ),
+            )
+
+    def _recompute_one_notification_intent(self, intent_id: str, now: str) -> None:
+        status, completed_at = self._notification_intent_state(intent_id, now)
+        self._connection.execute(
+            """
+            UPDATE notification_intents
+            SET status = ?, completed_at = ?,
+                last_reported_status = CASE
+                    WHEN status = ? THEN last_reported_status ELSE NULL END,
+                updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (status, completed_at, status, now, intent_id),
+        )
+
+    def _actual_notification_destinations(self, run_id: str) -> list[tuple[str, str]]:
+        rows = self._connection.execute(
+            """
+            SELECT DISTINCT kind, destination FROM notification_deliveries
+            WHERE run_id = ? ORDER BY kind, destination
+            """,
+            (run_id,),
+        ).fetchall()
+        return [(str(row["kind"]), str(row["destination"])) for row in rows]
+
+    def _rewrite_notification_destinations(
+        self,
+        run_id: str,
+        pairs: list[tuple[str, str, str]],
+    ) -> int:
+        replacements = [pair for pair in pairs if pair[1] != pair[2]]
+        temporary: list[tuple[str, str, str]] = []
+        for index, (kind, old, new) in enumerate(replacements):
+            placeholder = f"runwatch-rotation:{uuid4().hex}:{index}"
+            self._connection.execute(
+                """
+                UPDATE notification_deliveries SET destination = ?
+                WHERE run_id = ? AND kind = ? AND destination = ?
+                """,
+                (placeholder, run_id, kind, old),
+            )
+            temporary.append((kind, placeholder, new))
+        for kind, placeholder, new in temporary:
+            self._connection.execute(
+                """
+                UPDATE notification_deliveries SET destination = ?
+                WHERE run_id = ? AND kind = ? AND destination = ?
+                """,
+                (new, run_id, kind, placeholder),
+            )
+        return len(replacements)
+
+    def _reset_rotated_notification_deliveries(self, run_id: str, now: str) -> None:
+        self._connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = CASE WHEN status = 'succeeded' THEN status ELSE 'pending' END,
+                attempt_count = CASE WHEN status = 'succeeded' THEN attempt_count ELSE 0 END,
+                next_attempt_at = CASE WHEN status = 'succeeded' THEN next_attempt_at ELSE ? END,
+                last_error = NULL,
+                delivered_at = CASE WHEN status = 'succeeded' THEN delivered_at ELSE NULL END,
+                updated_at = ?
+            WHERE run_id = ?
+            """,
+            (now, now, run_id),
+        )
+
+    def _clear_notification_delivery_errors(self, run_id: str, now: str) -> None:
+        self._connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET last_error = NULL, updated_at = ?
+            WHERE run_id = ? AND last_error IS NOT NULL
+            """,
+            (now, run_id),
+        )
+
+    def _recompute_notification_intents(self, run_id: str, now: str) -> None:
+        rows = self._connection.execute(
+            "SELECT intent_id, status FROM notification_intents WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        for row in rows:
+            status, completed_at = self._notification_intent_state(
+                str(row["intent_id"]), now
+            )
+            self._connection.execute(
+                """
+                UPDATE notification_intents
+                SET status = ?, completed_at = ?,
+                    last_reported_status = CASE
+                        WHEN status = ? THEN last_reported_status ELSE NULL END,
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (status, completed_at, status, now, row["intent_id"]),
+            )
+
+    def _sanitize_legacy_notification_intents(self, run_id: str, now: str) -> int:
+        rows = self._connection.execute(
+            "SELECT intent_id, data_json FROM notification_intents WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        sanitized = 0
+        for row in rows:
+            if _current_notification_data(row["data_json"]):
+                continue
+            self._connection.execute(
+                """
+                UPDATE notification_intents
+                SET title = 'Runwatch notification',
+                    message = 'A retained Runwatch notification is ready.',
+                    data_json = ?, updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (json_dumps(_SAFE_LEGACY_NOTIFICATION_DATA), now, row["intent_id"]),
+            )
+            sanitized += 1
+        return sanitized
+
+    def _scrub_notification_diagnostic_events(self, run_id: str) -> int:
+        updated = self._connection.execute(
+            """
+            UPDATE events SET payload_json = '{}'
+            WHERE run_id = ? AND type LIKE 'notification.%'
+            """,
+            (run_id,),
+        )
+        return int(updated.rowcount)
+
+    def _write_notification_configuration_metadata(
+        self,
+        run_id: str,
+        *,
+        desired_configuration: dict[str, Any],
+        routing_required: bool,
+        event_cursor: int | None = None,
+        purge_keys: bool = False,
+    ) -> None:
+        row = self._connection.execute(
+            "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown run {run_id}")
+        metadata, _cursor = self._notification_metadata(row)
+        if purge_keys:
+            for key in list(metadata):
+                if key.startswith("_notification_"):
+                    metadata.pop(key)
+        config_value = metadata.get("config")
+        config = (
+            dict(cast(dict[str, Any], config_value))
+            if isinstance(config_value, dict)
+            else {}
+        )
+        config["notifications"] = desired_configuration
+        metadata["config"] = config
+        metadata[_NOTIFICATION_ROUTING_REQUIRED_KEY] = routing_required
+        metadata[_NOTIFICATION_EGRESS_SCHEMA_KEY] = _NOTIFICATION_EGRESS_SCHEMA_VERSION
+        if event_cursor is not None:
+            metadata[_NOTIFICATION_EVENT_CURSOR_KEY] = event_cursor
+        self._update_run_metadata(run_id, metadata)
+
+    def _notification_egress_migration_required(self, run_id: str) -> bool:
+        row = self._connection.execute(
+            "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown run {run_id}")
+        metadata, _cursor = self._notification_metadata(row)
+        return metadata.get(_NOTIFICATION_EGRESS_SCHEMA_KEY) != (
+            _NOTIFICATION_EGRESS_SCHEMA_VERSION
+        )
+
+    def _notification_purge_counts(self, run_id: str) -> dict[str, int]:
+        row = self._connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM notification_intents WHERE run_id = ?) AS intents,
+                (SELECT COUNT(*) FROM notification_deliveries WHERE run_id = ?) AS deliveries
+            """,
+            (run_id, run_id),
+        ).fetchone()
+        return {
+            "deleted_intents": int(row["intents"] if row else 0),
+            "deleted_deliveries": int(row["deliveries"] if row else 0),
+        }
+
+    def _notification_event_high_water(self, run_id: str) -> int:
+        row = self._connection.execute(
+            "SELECT MAX(seq) AS maximum FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return int(row["maximum"] or 0) if row else 0
+
+    def _compact_notification_credentials_best_effort(self) -> None:
+        try:
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.DatabaseError:
+            pass
+        try:
+            self._connection.execute("VACUUM")
+            self._connection.commit()
+        except sqlite3.DatabaseError:
+            self._connection.rollback()
+
+    def enqueue_rolling_notification(
+        self,
+        *,
+        run_id: str,
+        title: str,
+        message: str,
+        data: dict[str, Any],
+        dedup_key: str,
+        destinations: Iterable[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Keep one reported-or-active intent for a rolling notification slot."""
+
+        return self.enqueue_notification(
+            run_id=run_id,
+            title=title,
+            message=message,
+            data=data,
+            dedup_key=dedup_key,
+            destinations=destinations,
+            rolling=True,
+        )
+
     def enqueue_notification(
         self,
         *,
@@ -1774,6 +3195,7 @@ class RunStore:
         data: dict[str, Any],
         dedup_key: str | None,
         destinations: Iterable[tuple[str, str]],
+        rolling: bool = False,
     ) -> dict[str, Any]:
         """Persist one notification intent and its independent destinations.
 
@@ -1784,6 +3206,23 @@ class RunStore:
         unique_destinations = list(dict.fromkeys(destinations))
         if not unique_destinations:
             raise ValueError("A notification requires at least one destination")
+        self._validated_json_payload(
+            {
+                "title": title,
+                "message": message,
+                "data": data,
+                "dedup_key": dedup_key,
+                "rolling": rolling,
+                "destinations": [
+                    {"kind": kind, "destination": destination}
+                    for kind, destination in unique_destinations
+                ],
+            },
+            max_bytes=self.max_notification_record_bytes,
+            setting="max_notification_record_bytes",
+            record_type="Notification record",
+        )
+        data_json = json_dumps(data)
         now = utc_now().isoformat()
         created = False
         rearmed = False
@@ -1798,6 +3237,9 @@ class RunStore:
                         """,
                         (run_id, dedup_key),
                     ).fetchone()
+                row, rolling_result = self._prepare_rolling_notification(row, rolling)
+                if rolling_result is not None:
+                    return rolling_result
                 if row is not None and row["status"] == "succeeded":
                     result = self._decode_notification_intent(row)
                     result.update({"created": False, "rearmed": False})
@@ -1817,7 +3259,7 @@ class RunStore:
                             dedup_key,
                             title,
                             message,
-                            json_dumps(data),
+                            data_json,
                             now,
                             now,
                         ),
@@ -1834,7 +3276,7 @@ class RunStore:
                                 updated_at = ?
                             WHERE intent_id = ?
                             """,
-                            (title, message, json_dumps(data), now, intent_id),
+                            (title, message, data_json, now, intent_id),
                         )
                         self._connection.execute(
                             """
@@ -1880,9 +3322,35 @@ class RunStore:
         result.update({"created": created, "rearmed": rearmed})
         return result
 
-    def recover_notification_deliveries(self, run_id: str) -> int:
-        """Make crash-interrupted deliveries eligible for another attempt."""
+    def _prepare_rolling_notification(
+        self, row: sqlite3.Row | None, rolling: bool
+    ) -> tuple[sqlite3.Row | None, dict[str, Any] | None]:
+        if row is None or not rolling:
+            return row, None
+        terminal = row["status"] in {"succeeded", "failed"}
+        reported = row["last_reported_status"] == row["status"]
+        if terminal and reported:
+            self._connection.execute(
+                "DELETE FROM notification_intents WHERE intent_id = ?",
+                (row["intent_id"],),
+            )
+            return None, None
+        result = self._decode_notification_intent(row)
+        result.update({"created": False, "rearmed": False})
+        return row, result
 
+    def recover_notification_deliveries(
+        self,
+        run_id: str,
+        *,
+        max_attempts: int,
+        error: str,
+    ) -> int:
+        """Recover ambiguous interrupted attempts without refunding retry budget."""
+
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        error = _bounded_utf8_text(error, self.max_delivery_error_bytes)
         now = utc_now().isoformat()
         with self._lock:
             try:
@@ -1896,22 +3364,30 @@ class RunStore:
                 updated = self._connection.execute(
                     """
                     UPDATE notification_deliveries
-                    SET status = 'pending',
-                        attempt_count = CASE
-                            WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
-                        next_attempt_at = ?, updated_at = ?
+                    SET status = CASE
+                            WHEN attempt_count >= ? THEN 'failed' ELSE 'pending' END,
+                        last_error = ?,
+                        next_attempt_at = CASE
+                            WHEN attempt_count >= ? THEN next_attempt_at ELSE ? END,
+                        updated_at = ?
                     WHERE run_id = ? AND status = 'sending'
                     """,
-                    (now, now, run_id),
+                    (max_attempts, error, max_attempts, now, now, run_id),
                 )
                 for intent_row in intent_rows:
+                    intent_id = str(intent_row["intent_id"])
+                    intent_status, completed_at = self._notification_intent_state(
+                        intent_id, now
+                    )
                     self._connection.execute(
                         """
-                        UPDATE notification_intents
-                        SET status = 'pending', completed_at = NULL, updated_at = ?
+                        UPDATE notification_intents SET status = ?, completed_at = ?,
+                            last_reported_status = CASE
+                                WHEN status = ? THEN last_reported_status ELSE NULL END,
+                            updated_at = ?
                         WHERE intent_id = ?
                         """,
-                        (now, intent_row["intent_id"]),
+                        (intent_status, completed_at, intent_status, now, intent_id),
                     )
                 self._connection.commit()
             except Exception:
@@ -1935,6 +3411,7 @@ class RunStore:
         terminally instead of remaining stuck in ``sending``.
         """
 
+        error = _bounded_utf8_text(error, self.max_delivery_error_bytes)
         now_value = utc_now()
         now = now_value.isoformat()
         with self._lock:
@@ -2065,6 +3542,11 @@ class RunStore:
     ) -> dict[str, Any]:
         """Record one attempt and recompute its notification intent state."""
 
+        error = (
+            _bounded_utf8_text(error, self.max_delivery_error_bytes)
+            if error is not None
+            else None
+        )
         now_value = utc_now()
         now = now_value.isoformat()
         with self._lock:
@@ -2237,7 +3719,7 @@ class RunStore:
                 str(resource["internal_id"]), []
             )
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": RUN_SNAPSHOT_SCHEMA_VERSION,
             "run": run,
             "cells": [self._decode_cell(row) for row in cell_rows],
             "resources": resources,
@@ -2249,6 +3731,7 @@ class RunStore:
     def _decode_run(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         value["metadata"] = json_loads(value.pop("metadata_json"), {})
+        value["finalization_complete"] = bool(value["finalization_complete"])
         return value
 
     @staticmethod

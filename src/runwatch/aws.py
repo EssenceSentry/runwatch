@@ -5,9 +5,11 @@ from typing import Any, Literal
 
 from .emit import emit_resource
 from .models import Ownership, ResourceEvent, ResourceLifecycle, ResourceSpec
-from .resources.cloudwatch import validate_cloudwatch_metric_configuration
-from .resources.cloudwatch_logs import validate_cloudwatch_logs_configuration
-from .resources.s3 import parse_s3_uri
+from .protocol_validation import (
+    parse_s3_uri,
+    validate_cloudwatch_logs_configuration,
+    validate_cloudwatch_metric_configuration,
+)
 
 _S3_PREFIX_RESERVED_METADATA = {
     "expected_count",
@@ -21,7 +23,7 @@ _SAGEMAKER_RESERVED_METADATA = {"output_prefixes", "log_group"}
 def _validate_s3_uri(uri: str) -> None:
     try:
         parse_s3_uri(uri)
-    except RuntimeError as error:
+    except ValueError as error:
         raise ValueError(str(error)) from error
 
 
@@ -230,10 +232,7 @@ def emit_cloudwatch_metric(
         "period_seconds": period_seconds,
         "lookback_seconds": lookback_seconds,
     }
-    try:
-        validate_cloudwatch_metric_configuration(metric_metadata)
-    except RuntimeError as error:
-        raise ValueError(str(error)) from error
+    validate_cloudwatch_metric_configuration(metric_metadata)
     event = ResourceEvent(
         resource=ResourceSpec(
             provider="aws",
@@ -268,10 +267,7 @@ def emit_cloudwatch_logs(
         "stream_prefix": stream_prefix,
         "max_streams": max_streams,
     }
-    try:
-        validate_cloudwatch_logs_configuration(logs_metadata)
-    except RuntimeError as error:
-        raise ValueError(str(error)) from error
+    validate_cloudwatch_logs_configuration(logs_metadata)
     event = ResourceEvent(
         resource=ResourceSpec(
             provider="aws",

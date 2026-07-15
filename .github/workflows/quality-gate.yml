@@ -26,7 +26,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test --extra dev --extra docs
+        run: uv sync --locked --extra supervisor --extra test --extra dev --extra docs
       - name: Lockfile
         run: uv lock --check
       - name: File Hygiene
@@ -51,7 +51,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test --extra dev --extra docs
+        run: uv sync --locked --extra supervisor --extra test --extra dev --extra docs
       - name: Ruff
         run: >
           uv run ruff check
@@ -75,7 +75,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test --extra dev --extra docs
+        run: uv sync --locked --extra supervisor --extra test --extra dev --extra docs
       - name: Black
         run: >
           uv run black --check
@@ -99,7 +99,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test --extra dev --extra docs
+        run: uv sync --locked --extra supervisor --extra test --extra dev --extra docs
       - name: Pyright
         run: >
           uv run pyright --project pyrightconfig.json
@@ -163,7 +163,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra test --extra dev
+        run: uv sync --locked --extra supervisor --extra test --extra dev
       - name: Validate Skill
         run: uv run python scripts/check_skill.py
       - name: Forward Probe
@@ -199,9 +199,46 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra docs
+        run: uv sync --locked --extra supervisor --extra docs
       - name: Sphinx
         run: uv run sphinx-build -W --keep-going -n docs .build/sphinx
+
+  compatibility:
+    name: compatibility-${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimum-direct
+            python-version: "3.10"
+            resolution: lowest-direct
+          - name: latest
+            python-version: "3.13"
+            resolution: highest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Create isolated environment
+        run: uv venv --python ${{ matrix.python-version }} .compat-venv
+      - name: Resolve unpinned dependency set
+        run: >
+          uv pip install
+          --python .compat-venv/bin/python
+          --resolution ${{ matrix.resolution }}
+          ".[supervisor,test]"
+      - name: Exercise nbclient compatibility boundary
+        run: >
+          .compat-venv/bin/python -m pytest -q
+          tests/test_notebook_runner.py
+          -k "nbclient_private_hook_signatures or
+          monitored_client_serializes_concurrent_kernel_cleanup or
+          fallback_event_is_processed_but_not_written_to_notebook"
 
   quality-gate:
     name: quality-gate
@@ -216,6 +253,7 @@ jobs:
       - agent-skill
       - wheel
       - docs
+      - compatibility
     runs-on: ubuntu-latest
     steps:
       - name: Require all gates
@@ -229,3 +267,4 @@ jobs:
           test "${{ needs.agent-skill.result }}" = success
           test "${{ needs.wheel.result }}" = success
           test "${{ needs.docs.result }}" = success
+          test "${{ needs.compatibility.result }}" = success

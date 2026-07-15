@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from botocore.exceptions import ClientError
 
 from ..models import ResourceEvent, ResourceObservation, ResourceStatus
-from .base import ResourceAdapter, ResourceOperationError
+from .base import AwsResourceAdapter, ResourceOperationError
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -82,7 +82,7 @@ def _timestamp_iso(value: Any) -> str | None:
     return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
 
 
-class S3PrefixAdapter(ResourceAdapter):
+class S3PrefixAdapter(AwsResourceAdapter):
     provider = "aws"
     resource_type = "s3_prefix"
 

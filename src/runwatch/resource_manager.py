@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._compat import timeout
+from .adapters import AdapterRegistry, default_adapter_registry
 from .events import EventBus
 from .models import (
     AwsSettings,
@@ -18,10 +19,9 @@ from .models import (
     ResourceStatus,
 )
 from .resources import (
-    BUILTIN_ADAPTERS,
+    AdapterContext,
     AwsClientProvider,
     ResourceAdapter,
-    validate_resource_event,
 )
 from .storage import RunStore
 
@@ -53,20 +53,24 @@ class ResourceManager:
         working_dir: Path,
         aws_settings: AwsSettings,
         aws_provider: AwsClientProvider | None = None,
+        adapter_registry: AdapterRegistry | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
         self.run_id = run_id
         self.working_dir = working_dir
         self.aws_settings = aws_settings
-        self.aws = aws_provider or AwsClientProvider(aws_settings)
-        self._adapter_types: dict[tuple[str, str], type[ResourceAdapter]] = {
-            (adapter.provider, adapter.resource_type): adapter
-            for adapter in BUILTIN_ADAPTERS
-        }
+        self._adapter_registry = (adapter_registry or default_adapter_registry()).copy()
+        self._adapter_context = AdapterContext(
+            working_dir=working_dir,
+            settings={"aws": aws_settings},
+        )
+        if aws_provider is not None:
+            self._adapter_context.register_service("aws.client_provider", aws_provider)
         self._adapters: dict[str, ResourceAdapter] = {}
         self._monitor_tasks: dict[str, asyncio.Task[None]] = {}
         self._inspect_locks: dict[str, asyncio.Lock] = {}
+        self._finalize_locks: dict[str, asyncio.Lock] = {}
         self._stop_locks: dict[str, asyncio.Lock] = {}
         self._stop_dispositions: dict[str, ResourceDisposition] = {}
         self._dashboard_links: DashboardLinkManager | None = None
@@ -79,21 +83,24 @@ class ResourceManager:
         self._dashboard_links = manager
 
     def register_adapter(self, adapter_type: type[ResourceAdapter]) -> None:
-        self._adapter_types[(adapter_type.provider, adapter_type.resource_type)] = (
-            adapter_type
-        )
+        self._adapter_registry.register(adapter_type)
 
     async def restore_monitors(self) -> None:
         resources = self.store.list_resources(self.run_id)
         if self._dashboard_links is not None:
             await self._dashboard_links.reconcile(resources)
         for resource in resources:
-            if (
-                resource.get("lifecycle", {}).get("monitor", True)
+            lifecycle = resource.get("lifecycle", {})
+            terminal_finalization_pending = bool(
+                resource["terminal"] and not resource["monitor_closed"]
+            )
+            active_monitor_pending = bool(
+                lifecycle.get("monitor", True)
                 and resource["disposition"] == ResourceDisposition.ACTIVE.value
                 and not resource["terminal"]
                 and resource["status"] != ResourceStatus.STOPPING.value
-            ):
+            )
+            if terminal_finalization_pending or active_monitor_pending:
                 self._start_monitor(resource["internal_id"])
 
     async def register(
@@ -104,14 +111,8 @@ class ResourceManager:
         attempt: int | None,
         kernel_epoch: int | None,
     ) -> str:
-        adapter_type = self._adapter_types.get(
-            (event.resource.provider, event.resource.type)
-        )
         try:
-            if adapter_type is None:
-                validate_resource_event(event)
-            else:
-                adapter_type.validate_registration(event)
+            adapter_type = self._adapter_registry.validate(event)
         except Exception as error:
             await self.bus.publish(
                 "resource.rejected",
@@ -123,8 +124,8 @@ class ResourceManager:
                 },
             )
             raise
-        supports_stop = bool(adapter_type and adapter_type.supports_stop)
-        internal_id, created = self.store.register_resource(
+        supports_stop = adapter_type.supports_stop
+        internal_id, created, persisted_event = self.store.register_resource_with_event(
             run_id=self.run_id,
             event=event,
             cell_index=cell_index,
@@ -132,35 +133,13 @@ class ResourceManager:
             kernel_epoch=kernel_epoch,
             supports_stop=supports_stop,
         )
+        self.bus.fan_out_persisted(persisted_event)
         if not created:
-            await self.bus.publish(
-                "resource.reconciled",
-                {
-                    "internal_id": internal_id,
-                    "logical_key": event.resource.logical_key,
-                    "cell_index": cell_index,
-                    "attempt": attempt,
-                    "kernel_epoch": kernel_epoch,
-                },
-            )
             if self._dashboard_links is not None:
                 await self._dashboard_links.reconcile(
                     self.store.list_resources(self.run_id)
                 )
             return internal_id
-        await self.bus.publish(
-            "resource.registered",
-            {
-                "internal_id": internal_id,
-                "event_id": event.event_id,
-                "cell_index": cell_index,
-                "attempt": attempt,
-                "kernel_epoch": kernel_epoch,
-                "resource": event.resource.model_dump(mode="json"),
-                "lifecycle": event.lifecycle.model_dump(mode="json"),
-                "supports_stop": supports_stop,
-            },
-        )
         if event.lifecycle.monitor:
             self._start_monitor(internal_id)
         else:
@@ -175,16 +154,12 @@ class ResourceManager:
         internal_id = resource["internal_id"]
         if internal_id in self._adapters:
             return self._adapters[internal_id]
-        adapter_type = self._adapter_types.get(
-            (resource["provider"], resource["resource_type"])
+        adapter_type = self._adapter_registry.resolve(
+            str(resource["provider"]), str(resource["resource_type"])
         )
         if adapter_type is None:
             return None
-        adapter = adapter_type(
-            aws=self.aws,
-            aws_settings=self.aws_settings,
-            working_dir=self.working_dir,
-        )
+        adapter = adapter_type(self._adapter_context)
         self._adapters[internal_id] = adapter
         return adapter
 
@@ -204,7 +179,10 @@ class ResourceManager:
             terminal=True,
             message=f"No adapter for {resource['provider']}.{resource['resource_type']}",
         )
-        self.store.update_resource_observation(self.run_id, internal_id, observation)
+        observed = self.store.update_resource_observation(
+            self.run_id, internal_id, observation
+        )
+        self.bus.fan_out_persisted(observed)
         await self.bus.publish(
             "resource.unsupported",
             {"internal_id": internal_id, "message": observation.message},
@@ -217,16 +195,16 @@ class ResourceManager:
         candidate_cursor: dict[str, Any],
         active_cursor: dict[str, Any] | None,
         terminal_disposition: ResourceDisposition | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         if terminal_disposition is None:
-            self.store.record_resource_inspection(
+            event = self.store.record_resource_inspection(
                 self.run_id,
                 internal_id,
                 observation,
                 candidate_cursor,
             )
         else:
-            self.store.record_resource_stop_inspection(
+            event = self.store.record_resource_stop_inspection(
                 self.run_id,
                 internal_id,
                 observation,
@@ -236,21 +214,10 @@ class ResourceManager:
         if active_cursor is not None:
             active_cursor.clear()
             active_cursor.update(copy.deepcopy(candidate_cursor))
+        return event
 
-    async def _publish_observation(
-        self, internal_id: str, observation: ResourceObservation
-    ) -> None:
-        await self.bus.publish(
-            "resource.observed",
-            {
-                "internal_id": internal_id,
-                "status": observation.status.value,
-                "terminal": observation.terminal,
-                "message": observation.message,
-                "metrics": observation.metrics,
-                "new_log_lines": observation.log_lines[-30:],
-            },
-        )
+    def _publish_observation(self, event: dict[str, Any]) -> None:
+        self.bus.fan_out_persisted(event)
 
     async def _record_monitor_error(
         self,
@@ -306,10 +273,13 @@ class ResourceManager:
             message=message,
             metrics={"consecutive_monitor_errors": consecutive_errors},
         )
-        self.store.update_resource_observation(self.run_id, internal_id, observation)
+        observed = self.store.update_resource_observation(
+            self.run_id, internal_id, observation
+        )
         cursor.clear()
         cursor.update(self.store.resource_cursor(internal_id))
-        await self._publish_observation(internal_id, observation)
+        self._publish_observation(observed)
+        self.store.mark_resource_monitor_closed(internal_id)
         await self.bus.publish(
             "resource.monitor_failed",
             {
@@ -338,15 +308,70 @@ class ResourceManager:
             return None
         return resource
 
-    def _close_terminal_monitor(self, internal_id: str) -> None:
-        resource = self.store.get_resource(internal_id)
-        if resource and resource.get("terminal"):
-            self.store.mark_resource_monitor_closed(internal_id)
+    @staticmethod
+    def _monitor_failure_detail(error: Exception) -> str:
+        try:
+            detail = str(error)
+        except Exception:
+            detail = "<error detail unavailable>"
+        return f"{type(error).__name__}: {detail}"[:1_024]
+
+    async def _terminalize_unexpected_monitor_failure(
+        self, internal_id: str, error: Exception
+    ) -> None:
+        resource = self._active_resource(internal_id)
+        if resource is None or resource["terminal"]:
+            return
+        if resource["status"] == ResourceStatus.STOPPING.value:
+            # A failed monitor cannot prove that the provider honored a stop request.
+            # Leave STOPPING retryable for the dedicated stop-confirmation path and
+            # let wait_for_blocking_resources surface the failed task if necessary.
+            raise RuntimeError(
+                f"Resource monitor for {internal_id} failed while stop confirmation "
+                "was still pending"
+            ) from error
+
+        detail = self._monitor_failure_detail(error)
+        observed = self.store.update_resource_observation(
+            self.run_id,
+            internal_id,
+            ResourceObservation(
+                status=ResourceStatus.FAILED,
+                terminal=True,
+                message=f"Resource monitor stopped unexpectedly: {detail}",
+                metrics={"monitor_task_error": type(error).__name__},
+            ),
+        )
+        self.store.mark_resource_monitor_closed(internal_id)
+        try:
+            self._publish_observation(observed)
+        except Exception:
+            # The state transition and event are already durable. In-memory SSE
+            # fan-out must not turn a terminal resource back into an endless wait.
+            pass
+        try:
+            await self.bus.publish(
+                "resource.monitor_task_failed",
+                {
+                    "internal_id": internal_id,
+                    "error_type": type(error).__name__,
+                    "error": detail,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The atomic resource.observed event above remains the durable diagnostic.
+            pass
 
     async def _monitor(self, internal_id: str) -> None:
         cursor = self.store.resource_cursor(internal_id)
         consecutive_errors = 0
         try:
+            restored = self.store.get_resource(internal_id)
+            if restored and restored["terminal"] and not restored["monitor_closed"]:
+                await self.finalize_terminal_resource(internal_id)
+                return
             while not self._closing:
                 next_error_count = await self._monitor_cycle(
                     internal_id, cursor, consecutive_errors
@@ -354,8 +379,11 @@ class ResourceManager:
                 if next_error_count is None:
                     return
                 consecutive_errors = next_error_count
-        finally:
-            self._close_terminal_monitor(internal_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._terminalize_unexpected_monitor_failure(internal_id, error)
+            await self.finalize_terminal_resource(internal_id)
 
     async def _monitor_cycle(
         self,
@@ -369,18 +397,13 @@ class ResourceManager:
         adapter = self._adapter_for(resource)
         if adapter is None:
             await self._record_unsupported(internal_id, resource)
+            await self.finalize_terminal_resource(internal_id)
             return None
         try:
-            observation = await self._inspect_and_persist(
+            observation, observed = await self._inspect_and_persist(
                 internal_id, adapter, resource, cursor
             )
             consecutive_errors = 0
-            await self._publish_observation(internal_id, observation)
-            if observation.terminal:
-                await self._finalize_terminal_resource(
-                    internal_id, resource, adapter, cursor
-                )
-                return None
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -394,6 +417,16 @@ class ResourceManager:
                 consecutive_errors,
             )
             if failed:
+                await self._finalize_terminal_resource(
+                    internal_id, resource, adapter, cursor
+                )
+                return None
+        else:
+            self._publish_observation(observed)
+            if observation.terminal:
+                await self._finalize_terminal_resource(
+                    internal_id, resource, adapter, cursor
+                )
                 return None
         latest = self.store.get_resource(internal_id)
         if latest is None:
@@ -408,13 +441,27 @@ class ResourceManager:
         resource: dict[str, Any],
         active_cursor: dict[str, Any] | None,
         terminal_disposition: ResourceDisposition | None = None,
-    ) -> ResourceObservation:
+        preserve_terminal: bool = False,
+    ) -> tuple[ResourceObservation, dict[str, Any]]:
         lock = self._inspect_locks.setdefault(internal_id, asyncio.Lock())
         async with lock:
             committed_cursor = self.store.resource_cursor(internal_id)
             candidate_cursor = copy.deepcopy(committed_cursor)
             observation = await adapter.inspect(resource, candidate_cursor)
             latest = self.store.get_resource(internal_id)
+            if (
+                preserve_terminal
+                and latest is not None
+                and latest["terminal"]
+                and not observation.terminal
+            ):
+                observation = observation.model_copy(
+                    update={
+                        "status": ResourceStatus(latest["status"]),
+                        "terminal": True,
+                        "message": latest.get("message") or observation.message,
+                    }
+                )
             if (
                 latest is not None
                 and latest["status"] == ResourceStatus.STOPPING.value
@@ -430,14 +477,14 @@ class ResourceManager:
             stop_disposition = terminal_disposition or self._stop_dispositions.get(
                 internal_id
             )
-            self._persist_observation(
+            event = self._persist_observation(
                 internal_id,
                 observation,
                 candidate_cursor,
                 active_cursor,
                 stop_disposition,
             )
-            return observation
+            return observation, event
 
     async def _finalize_terminal_resource(
         self,
@@ -446,46 +493,113 @@ class ResourceManager:
         adapter: ResourceAdapter,
         cursor: dict[str, Any],
     ) -> None:
-        lifecycle = resource.get("lifecycle", {})
-        drain = lifecycle.get("final_log_drain_seconds")
-        if drain is None:
-            drain = self.aws_settings.final_log_drain_seconds
-        if lifecycle.get("retain_logs", True) and float(drain) > 0:
-            await asyncio.sleep(float(drain))
-            latest = self.store.get_resource(internal_id)
-            if latest is not None:
-                try:
-                    final = await self._inspect_and_persist(
-                        internal_id, adapter, latest, cursor
-                    )
-                    await self._publish_observation(internal_id, final)
-                    await self.bus.publish(
-                        "resource.finalized",
-                        {
+        lock = self._finalize_locks.setdefault(internal_id, asyncio.Lock())
+        async with lock:
+            current = self.store.get_resource(internal_id)
+            if current is None or not current["terminal"] or current["monitor_closed"]:
+                return
+            lifecycle = current.get("lifecycle", resource.get("lifecycle", {}))
+            drain = lifecycle.get("final_log_drain_seconds")
+            if drain is None:
+                drain = self.aws_settings.final_log_drain_seconds
+            finalization_payload: dict[str, Any] | None = None
+            warning: str | None = None
+            if lifecycle.get("retain_logs", True) and float(drain) > 0:
+                await asyncio.sleep(float(drain))
+                latest = self.store.get_resource(internal_id)
+                if latest is not None:
+                    try:
+                        final, observed = await self._inspect_and_persist(
+                            internal_id,
+                            adapter,
+                            latest,
+                            cursor,
+                            preserve_terminal=True,
+                        )
+                        self._publish_observation(observed)
+                        finalization_payload = {
                             "internal_id": internal_id,
                             "status": final.status.value,
-                            "metrics": final.metrics,
-                            "new_log_lines": final.log_lines[-30:],
-                        },
-                    )
-                    if final.metrics.get("log_drain_truncated"):
-                        await self.bus.publish(
-                            "resource.finalization_warning",
-                            {
-                                "internal_id": internal_id,
-                                "error": "Terminal log catch-up reached its configured bound; logs may be incomplete",
-                            },
-                        )
-                except Exception as error:
-                    await self.bus.publish(
-                        "resource.finalization_warning",
-                        {"internal_id": internal_id, "error": str(error)},
-                    )
-        self.store.mark_resource_monitor_closed(internal_id)
-        await self.bus.publish(
-            "resource.monitor_closed",
-            {"internal_id": internal_id, "reason": "terminal"},
+                            "metric_count": len(final.metrics),
+                            "new_log_line_count": len(final.log_lines),
+                            "log_drain_truncated": bool(
+                                final.metrics.get("log_drain_truncated")
+                            ),
+                        }
+                        if final.metrics.get("log_drain_truncated"):
+                            warning = (
+                                "Terminal log catch-up reached its configured bound; "
+                                "logs may be incomplete"
+                            )
+                    except Exception as error:
+                        warning = self._monitor_failure_detail(error)
+            self.store.mark_resource_monitor_closed(internal_id)
+            if finalization_payload is not None:
+                await self._publish_finalization_diagnostic_safely(
+                    "resource.finalized", finalization_payload
+                )
+            if warning is not None:
+                await self._publish_finalization_diagnostic_safely(
+                    "resource.finalization_warning",
+                    {"internal_id": internal_id, "error": warning},
+                )
+            await self._publish_finalization_diagnostic_safely(
+                "resource.monitor_closed",
+                {"internal_id": internal_id, "reason": "terminal"},
+            )
+
+    async def _publish_finalization_diagnostic_safely(
+        self, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        try:
+            await self.bus.publish(event_type, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Resource state and resource.observed are authoritative. Optional
+            # diagnostics must not reopen a completed finalization transaction.
+            return
+
+    async def finalize_terminal_resource(self, internal_id: str) -> dict[str, Any]:
+        """Finish a durable terminal resource before considering it settled."""
+
+        resource = self.store.get_resource(internal_id)
+        if resource is None:
+            raise KeyError(internal_id)
+        if not resource["terminal"] or resource["monitor_closed"]:
+            return resource
+        adapter = self._adapter_for(resource)
+        if adapter is None:
+            lock = self._finalize_locks.setdefault(internal_id, asyncio.Lock())
+            async with lock:
+                current = self.store.get_resource(internal_id)
+                if current is None:
+                    raise KeyError(internal_id)
+                if not current["terminal"] or current["monitor_closed"]:
+                    return current
+                self.store.mark_resource_monitor_closed(internal_id)
+            await self._publish_finalization_diagnostic_safely(
+                "resource.finalization_warning",
+                {
+                    "internal_id": internal_id,
+                    "error": (
+                        "Terminal resource finalization could not inspect the provider "
+                        "because no adapter is available"
+                    ),
+                },
+            )
+            await self._publish_finalization_diagnostic_safely(
+                "resource.monitor_closed",
+                {"internal_id": internal_id, "reason": "terminal"},
+            )
+            return self.store.get_resource(internal_id) or resource
+        await self._finalize_terminal_resource(
+            internal_id,
+            resource,
+            adapter,
+            self.store.resource_cursor(internal_id),
         )
+        return self.store.get_resource(internal_id) or resource
 
     async def stop_resource(
         self,
@@ -549,16 +663,9 @@ class ResourceManager:
         confirmation: _StopConfirmation,
     ) -> None:
         already_stopping = resource["status"] == ResourceStatus.STOPPING.value
-        requested = self.store.request_resource_stop(internal_id, disposition)
-        if not already_stopping:
-            await self.bus.publish(
-                "resource.stop_requested",
-                {
-                    "internal_id": internal_id,
-                    "external_id": resource["external_id"],
-                    "already_terminal": requested["terminal"],
-                },
-            )
+        requested, stop_event = self.store.request_resource_stop_with_event(
+            internal_id, disposition
+        )
         terminal_confirmed = bool(requested["terminal"])
         if already_stopping and not terminal_confirmed:
             terminal_confirmed = await self._inspect_stopping_resource(
@@ -580,6 +687,8 @@ class ResourceManager:
                     message=f"Stop request failed: {type(error).__name__}: {error}",
                 )
             raise
+        if stop_event is not None:
+            self.bus.fan_out_persisted(stop_event)
         if on_stop_accepted is not None:
             await on_stop_accepted()
         if not terminal_confirmed:
@@ -597,6 +706,7 @@ class ResourceManager:
             if latest is None:
                 raise KeyError(internal_id)
             if latest["terminal"]:
+                latest = await self.finalize_terminal_resource(internal_id)
                 return await self._confirm_resource_stop(
                     internal_id, latest, disposition
                 )
@@ -611,6 +721,7 @@ class ResourceManager:
                 confirmed = self.store.get_resource(internal_id)
                 if confirmed is None:
                     raise KeyError(internal_id)
+                confirmed = await self.finalize_terminal_resource(internal_id)
                 return await self._confirm_resource_stop(
                     internal_id, confirmed, disposition
                 )
@@ -681,13 +792,14 @@ class ResourceManager:
         confirmation: _StopConfirmation,
     ) -> bool:
         try:
-            observation = await self._inspect_and_persist(
+            observation, observed = await self._inspect_and_persist(
                 internal_id,
                 adapter,
                 resource,
                 None,
                 disposition,
             )
+            self._publish_observation(observed)
             confirmation.last_error = None
             return observation.terminal
         except Exception as error:
@@ -759,12 +871,16 @@ class ResourceManager:
                 resource["disposition"] == ResourceDisposition.ACTIVE.value
                 and lifecycle.get("stop_on_cancel", False)
                 and not resource["terminal"]
-                and resource["status"] != ResourceStatus.STOPPING.value
                 and resource["ownership"] == Ownership.EXCLUSIVE.value
                 and resource["supports_stop"]
             ):
                 try:
-                    await self.stop_resource(resource["internal_id"])
+                    await self.stop_resource(
+                        resource["internal_id"],
+                        allow_stopping=(
+                            resource["status"] == ResourceStatus.STOPPING.value
+                        ),
+                    )
                     stopped.append(resource["internal_id"])
                 except Exception as error:
                     await self.bus.publish(
@@ -782,13 +898,42 @@ class ResourceManager:
                 continue
             if resource["disposition"] != ResourceDisposition.ACTIVE.value:
                 continue
-            if not resource["terminal"]:
+            if not resource["terminal"] or not resource["monitor_closed"]:
                 active.append(resource)
             elif resource["status"] == ResourceStatus.COMPLETED.value:
                 successful.append(resource)
             else:
                 failures.append(resource)
         return {"active": active, "failures": failures, "successful": successful}
+
+    def _raise_for_stopped_blocking_monitors(self, summary: dict[str, Any]) -> None:
+        for resource in summary["active"]:
+            internal_id = str(resource["internal_id"])
+            latest = self.store.get_resource(internal_id)
+            if latest is None:
+                continue
+            if latest["terminal"] and latest["monitor_closed"]:
+                continue
+            task = self._monitor_tasks.get(internal_id)
+            if task is None:
+                raise RuntimeError(
+                    f"Blocking resource {internal_id} has no active monitor task"
+                )
+            if not task.done():
+                continue
+            if task.cancelled():
+                raise RuntimeError(
+                    f"Blocking resource monitor {internal_id} was cancelled unexpectedly"
+                )
+            error = task.exception()
+            if error is not None:
+                raise RuntimeError(
+                    f"Blocking resource monitor {internal_id} stopped unexpectedly"
+                ) from error
+            raise RuntimeError(
+                f"Blocking resource monitor {internal_id} exited before the resource "
+                "became terminal"
+            )
 
     async def wait_for_blocking_resources(
         self,
@@ -802,6 +947,7 @@ class ResourceManager:
                 summary = self.blocking_summary()
                 if not summary["active"]:
                     return summary
+                self._raise_for_stopped_blocking_monitors(summary)
                 await asyncio.sleep(0.5)
 
         if timeout_seconds is None:

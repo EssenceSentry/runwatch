@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Callable, Coroutine
 from pathlib import Path
@@ -11,12 +12,28 @@ import httpx
 import pytest
 
 from runwatch.events import EventBus
-from runwatch.models import NotificationSettings
+from runwatch.models import (
+    NotificationSettings,
+    ResourceEvent,
+    ResourceObservation,
+    ResourceSpec,
+    ResourceStatus,
+    RunStatus,
+    RunwatchConfig,
+)
+from runwatch.notification_config import notification_destinations
+from runwatch.notification_presentation import (
+    NotificationEnvelope,
+    NotificationLegacy,
+    PresentedNotification,
+)
 from runwatch.notifications import NotificationManager
 from runwatch.storage import RunStore
 
 
-def notification_store(root: Path) -> RunStore:
+def notification_store(
+    root: Path, *, settings: NotificationSettings | None = None
+) -> RunStore:
     source = root / "source.ipynb"
     source.write_text("{}", encoding="utf-8")
     store = RunStore(root / "state.sqlite3")
@@ -29,6 +46,15 @@ def notification_store(root: Path) -> RunStore:
         working_dir=root,
         run_dir=root,
         source_digest="digest",
+        metadata=(
+            {
+                "config": RunwatchConfig(
+                    notifications=settings or NotificationSettings()
+                ).model_dump(mode="json")
+            }
+            if settings is not None
+            else None
+        ),
     )
     return store
 
@@ -75,6 +101,20 @@ def cell_failure(*, kernel_epoch: int, cell_index: int = 1, attempt: int = 1) ->
         "error_name": "ValueError",
         "error_value": "bad input",
     }
+
+
+def presented_notification(
+    message: str, *, dedup_key: str | None = None
+) -> PresentedNotification:
+    return PresentedNotification(
+        envelope=NotificationEnvelope(
+            kind="legacy",
+            title="Runwatch",
+            message=message,
+            data=NotificationLegacy(),
+        ),
+        dedup_key=dedup_key,
+    )
 
 
 @pytest.mark.asyncio
@@ -213,7 +253,7 @@ async def test_failed_delivery_retries_then_deduplicates_only_after_success(
     await manager.start()
 
     intent = await manager.send(
-        title="Runwatch", message="recoverable", dedup_key="retry-me"
+        presented_notification("recoverable", dedup_key="retry-me")
     )
     assert intent is not None
     drained = await manager.drain(1)
@@ -223,7 +263,7 @@ async def test_failed_delivery_retries_then_deduplicates_only_after_success(
     assert delivery["attempt_count"] == 3
 
     duplicate = await manager.send(
-        title="Runwatch", message="recoverable", dedup_key="retry-me"
+        presented_notification("recoverable", dedup_key="retry-me")
     )
     assert duplicate is not None
     assert duplicate["created"] is False
@@ -256,7 +296,7 @@ async def test_delivery_failures_are_bounded_and_persisted(tmp_path: Path) -> No
     await manager._client.aclose()
     replace_client(manager, handler)
     await manager.start()
-    intent = await manager.send(title="Runwatch", message="still running")
+    intent = await manager.send(presented_notification("still running"))
     assert intent is not None
     await wait_until(
         lambda: notification_intent_has_status(store, intent["intent_id"], "failed")
@@ -270,7 +310,7 @@ async def test_delivery_failures_are_bounded_and_persisted(tmp_path: Path) -> No
     failed = next(
         event for event in reversed(events) if event["type"] == "notification.failed"
     )
-    assert "500" in failed["payload"]["errors"][0]
+    assert failed["payload"]["errors"][0]["status_code"] == 500
     await manager.close()
     store.close()
 
@@ -343,7 +383,7 @@ async def test_slow_failing_destination_does_not_block_fast_destination(
     await manager._client.aclose()
     replace_client(manager, handler)
     await manager.start()
-    intent = await manager.send(title="Runwatch", message="fan out")
+    intent = await manager.send(presented_notification("fan out"))
     assert intent is not None
     drain_task = asyncio.create_task(manager.drain(1))
 
@@ -411,7 +451,7 @@ async def test_post_http_persistence_failure_is_requeued_and_diagnosed(
 
     monkeypatch.setattr(store, "finish_notification_delivery", fail_first_persistence)
     await manager.start()
-    intent = await manager.send(title="Runwatch", message="persist me")
+    intent = await manager.send(presented_notification("persist me"))
     assert intent is not None
 
     drained = await manager.drain(1)
@@ -430,7 +470,7 @@ async def test_post_http_persistence_failure_is_requeued_and_diagnosed(
         if event["type"] == "notification.delivery_recovered"
     ]
     assert recovered[-1]["payload"]["outcome"] == "pending"
-    assert "OperationalError" in recovered[-1]["payload"]["error"]
+    assert "OperationalError" in recovered[-1]["payload"]["error"]["message"]
     await manager.close()
     store.close()
 
@@ -472,7 +512,7 @@ async def test_repeated_post_http_persistence_failure_is_terminally_bounded(
 
     monkeypatch.setattr(store, "finish_notification_delivery", fail_persistence)
     await manager.start()
-    intent = await manager.send(title="Runwatch", message="bounded failure")
+    intent = await manager.send(presented_notification("bounded failure"))
     assert intent is not None
 
     drained = await manager.drain(1)
@@ -514,7 +554,7 @@ async def test_drain_timeout_reports_and_close_restores_sending_delivery(
     await manager._client.aclose()
     replace_client(manager, handler)
     await manager.start()
-    intent = await manager.send(title="Runwatch", message="retain me")
+    intent = await manager.send(presented_notification("retain me"))
     assert intent is not None
     await asyncio.wait_for(started.wait(), timeout=1)
 
@@ -527,11 +567,77 @@ async def test_drain_timeout_reports_and_close_restores_sending_delivery(
     await manager.close()
     delivery = store.notification_deliveries(intent["intent_id"])[0]
     assert delivery["status"] == "pending"
-    assert delivery["attempt_count"] == 0
+    assert delivery["attempt_count"] == 1
     assert any(
         event["type"] == "notification.deliveries_recovered"
         for event in store.recent_events("run", limit=1_000)
     )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_close_terminalizes_ambiguous_delivery_at_retry_limit(
+    tmp_path: Path,
+) -> None:
+    accepted = asyncio.Event()
+    never_release = asyncio.Event()
+    requests: list[tuple[str, str]] = []
+
+    async def ambiguous_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (
+                request.headers["Idempotency-Key"],
+                request.headers["X-Runwatch-Intent-ID"],
+            )
+        )
+        accepted.set()
+        await never_release.wait()
+        return httpx.Response(204)
+
+    settings = NotificationSettings(
+        webhook_urls=["https://hooks.example/ambiguous"],
+        max_delivery_attempts=1,
+    )
+    store = notification_store(tmp_path, settings=settings)
+    first = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await first._client.aclose()
+    replace_client(first, ambiguous_handler)
+    await first.start()
+    intent = await first.send(
+        presented_notification("accepted before shutdown", dedup_key="ambiguous")
+    )
+    assert intent is not None
+    await asyncio.wait_for(accepted.wait(), timeout=1)
+
+    await first.close()
+
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    assert delivery["status"] == "failed"
+    assert delivery["attempt_count"] == 1
+    assert requests == [(delivery["delivery_id"], intent["intent_id"])]
+
+    def unexpected_retry(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (
+                request.headers["Idempotency-Key"],
+                request.headers["X-Runwatch-Intent-ID"],
+            )
+        )
+        return httpx.Response(204)
+
+    second = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await second._client.aclose()
+    replace_client(second, unexpected_retry)
+    await second.start()
+    await asyncio.sleep(0.05)
+
+    assert len(requests) == 1
+    assert store.notification_deliveries(intent["intent_id"])[0]["status"] == "failed"
+    await second.close()
     store.close()
 
 
@@ -565,7 +671,7 @@ async def test_interrupted_delivery_is_recovered_after_manager_restart(
     replace_client(first, interrupted_handler)
     await first.start()
     intent = await first.send(
-        title="Runwatch", message="survive restart", dedup_key="durable"
+        presented_notification("survive restart", dedup_key="durable")
     )
     assert intent is not None
     await asyncio.wait_for(first_started.wait(), timeout=1)
@@ -605,7 +711,7 @@ async def test_interrupted_delivery_is_recovered_after_manager_restart(
 
     assert request_count == 2
     delivery = reopened.notification_deliveries(intent["intent_id"])[0]
-    assert delivery["attempt_count"] == 1
+    assert delivery["attempt_count"] == 2
     assert idempotency_headers == [
         (delivery["delivery_id"], intent["intent_id"]),
         (delivery["delivery_id"], intent["intent_id"]),
@@ -995,13 +1101,682 @@ async def test_terminal_notification_deduplication_includes_kernel_epoch(
     }
     intents = [store.notification_intent(intent_id) for intent_id in intent_ids]
     assert {intent["dedup_key"] for intent in intents if intent is not None} == {
-        "run-succeeded:11",
-        "run-succeeded:12",
-        "run-cancelled:11",
-        "run-cancelled:12",
-        "run-failed:run.runner_error:11",
-        "run-failed:run.runner_error:12",
+        "run-terminal:succeeded:11",
+        "run-terminal:succeeded:12",
+        "run-terminal:cancelled:11",
+        "run-terminal:cancelled:12",
+        "run-terminal:failed:11",
+        "run-terminal:failed:12",
     }
 
     await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_presentations_exclude_internal_and_canary_payloads(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    bus = EventBus(store, "run")
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=[
+                "https://one.example/hook?token=WEBHOOK_ONE_SECRET",
+                "https://two.example/hook?signature=WEBHOOK_TWO_SECRET",
+            ],
+            ntfy_base_url="https://ntfy.example",
+            ntfy_topic="NTFY_TOPIC_SECRET",
+        ),
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await bus.publish(
+        "cell.failed",
+        {
+            **cell_failure(kernel_epoch=2),
+            "error_value": "TRACE_SECRET",
+            "traceback": ["TRACEBACK_SECRET"],
+            "metrics": {"credential": "METRIC_SECRET"},
+        },
+    )
+    await bus.publish(
+        "resource.observed",
+        {
+            "internal_id": "resource-id",
+            "status": "failed",
+            "message": "PROVIDER_SECRET",
+            "new_log_lines": ["LOG_SECRET"],
+            "raw": {"credential": "RAW_SECRET"},
+        },
+    )
+    await wait_until(lambda: len(requests) == 6)
+
+    serialized = b" ".join(request.content for request in requests)
+    for secret in (
+        b"WEBHOOK_ONE_SECRET",
+        b"WEBHOOK_TWO_SECRET",
+        b"NTFY_TOPIC_SECRET",
+        b"TRACE_SECRET",
+        b"TRACEBACK_SECRET",
+        b"METRIC_SECRET",
+        b"PROVIDER_SECRET",
+        b"LOG_SECRET",
+        b"RAW_SECRET",
+    ):
+        assert secret not in serialized
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_resource_presentation_omits_local_and_s3_identifiers(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    bus = EventBus(store, "run")
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/resource-failures"]
+        ),
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+
+    identifiers = (
+        ("local", "line_count", "/private/CLIENT_PATH_SECRET/output.jsonl"),
+        ("aws", "s3_prefix", "s3://CLIENT_BUCKET_SECRET/private/prefix"),
+    )
+    for provider, resource_type, identifier in identifiers:
+        internal_id, _created = store.register_resource(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(
+                    provider=provider,
+                    type=resource_type,
+                    id=identifier,
+                    logical_key=identifier,
+                )
+            ),
+            cell_index=0,
+            attempt=1,
+            kernel_epoch=1,
+            supports_stop=False,
+        )
+        observed = store.update_resource_observation(
+            "run",
+            internal_id,
+            ResourceObservation(
+                status=ResourceStatus.FAILED,
+                terminal=True,
+                message=f"Failure at {identifier}",
+            ),
+        )
+        bus.fan_out_persisted(observed)
+
+    await wait_until(lambda: len(requests) == len(identifiers))
+
+    payloads = [json.loads(request.content) for request in requests]
+    assert all(payload["data"]["display_id"] is None for payload in payloads)
+    serialized = b" ".join(request.content for request in requests)
+    assert b"CLIENT_PATH_SECRET" not in serialized
+    assert b"CLIENT_BUCKET_SECRET" not in serialized
+
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_error_omits_destination_and_response_body(
+    tmp_path: Path,
+) -> None:
+    class UnreadBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError("notification response bodies must not be consumed")
+            yield b"BODY_SECRET"  # pragma: no cover
+
+        async def aclose(self) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, stream=UnreadBody())
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/fail?token=DESTINATION_SECRET"],
+            max_delivery_attempts=1,
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    intent = await manager.send(presented_notification("bounded response"))
+    assert intent is not None
+    await wait_until(
+        lambda: notification_intent_has_status(store, intent["intent_id"], "failed")
+    )
+
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    events = store.recent_events("run", limit=1_000)
+    diagnostics = json.dumps(
+        {
+            "last_error": delivery["last_error"],
+            "notification_events": [
+                event for event in events if event["type"].startswith("notification.")
+            ],
+        }
+    )
+    assert "HTTP 500" in diagnostics
+    assert "DESTINATION_SECRET" not in diagnostics
+    assert "BODY_SECRET" not in diagnostics
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_delivery_does_not_follow_redirects(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            302,
+            headers={"Location": "https://redirect.example/hook?token=REDIRECT_SECRET"},
+        )
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/original"], max_delivery_attempts=1
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    intent = await manager.send(presented_notification("do not redirect"))
+    assert intent is not None
+    await wait_until(
+        lambda: notification_intent_has_status(store, intent["intent_id"], "failed")
+    )
+
+    assert len(requests) == 1
+    error = store.notification_deliveries(intent["intent_id"])[0]["last_error"]
+    assert '"status_code":302' in error
+    assert "REDIRECT_SECRET" not in error
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_periodic_notification_is_lightweight_and_rolling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(webhook_urls=["https://hooks.example/periodic"]),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    monkeypatch.setattr(
+        store,
+        "snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("periodic notification loaded the full snapshot")
+        ),
+    )
+
+    def notification_reported(intent_id: str) -> bool:
+        stored = store.notification_intent(intent_id)
+        return bool(
+            stored is not None
+            and stored["status"] == "succeeded"
+            and stored["last_reported_status"] == "succeeded"
+        )
+
+    intent_ids: list[str] = []
+    for _index in range(5):
+        notification = manager._presenter.periodic()
+        assert notification is not None
+        intent = await manager.send(notification)
+        assert intent is not None
+        intent_id = str(intent["intent_id"])
+        intent_ids.append(intent_id)
+        await wait_until(lambda: notification_reported(intent_id))
+
+    assert len(set(intent_ids)) == 5
+    with store._lock:
+        count = store._connection.execute(
+            "SELECT COUNT(*) FROM notification_intents WHERE run_id = ? "
+            "AND dedup_key = 'periodic-status'",
+            ("run",),
+        ).fetchone()[0]
+    assert count == 1
+    assert len(requests) == 5
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_terminal_state_to_one_stable_intent(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    with store._lock:
+        store._connection.execute(
+            "UPDATE runs SET status = ?, ended_at = updated_at WHERE run_id = ?",
+            (RunStatus.SUCCEEDED.value, "run"),
+        )
+        store._connection.commit()
+    settings = NotificationSettings(webhook_urls=["https://hooks.example/reconcile"])
+    bus = EventBus(store, "run")
+    first = NotificationManager(settings=settings, store=store, bus=bus, run_id="run")
+    await first._client.aclose()
+    replace_client(first, handler)
+    await first.start()
+    await wait_until(lambda: len(requests) == 1)
+    await first.close()
+
+    second = NotificationManager(settings=settings, store=store, bus=bus, run_id="run")
+    await second._client.aclose()
+    replace_client(second, handler)
+    await second.start()
+    await asyncio.sleep(0.05)
+    assert len(requests) == 1
+    await second.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_status", ["pending", "failed"])
+async def test_terminal_alias_consolidation_prefers_delivered_legacy_intent(
+    tmp_path: Path, canonical_status: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    settings = NotificationSettings(webhook_urls=["https://hooks.example/terminal"])
+    store = notification_store(tmp_path, settings=settings)
+    legacy = store.enqueue_notification(
+        run_id="run",
+        title="legacy",
+        message="legacy",
+        data={},
+        dedup_key="run-succeeded:7",
+        destinations=notification_destinations(settings),
+    )
+    canonical = store.enqueue_notification(
+        run_id="run",
+        title="canonical",
+        message="canonical",
+        data={},
+        dedup_key="run-terminal:succeeded:7",
+        destinations=notification_destinations(settings),
+    )
+    with store._lock:
+        store._connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'succeeded', delivered_at = updated_at
+            WHERE intent_id = ?
+            """,
+            (legacy["intent_id"],),
+        )
+        store._connection.execute(
+            """
+            UPDATE notification_intents
+            SET status = 'succeeded', completed_at = updated_at,
+                last_reported_status = 'succeeded'
+            WHERE intent_id = ?
+            """,
+            (legacy["intent_id"],),
+        )
+        store._connection.execute(
+            "UPDATE notification_intents SET status = ? WHERE intent_id = ?",
+            (canonical_status, canonical["intent_id"]),
+        )
+        store._connection.execute(
+            "UPDATE notification_deliveries SET status = ? WHERE intent_id = ?",
+            (canonical_status, canonical["intent_id"]),
+        )
+        store._connection.execute("""
+            UPDATE runs SET status = 'succeeded', kernel_epoch = 7,
+                ended_at = updated_at WHERE run_id = 'run'
+            """)
+        store._connection.commit()
+
+    manager = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await asyncio.sleep(0.05)
+
+    with store._lock:
+        remaining = store._connection.execute("""
+            SELECT dedup_key, status FROM notification_intents
+            WHERE run_id = 'run' AND dedup_key LIKE 'run-%succeeded%'
+            """).fetchall()
+    assert [(row["dedup_key"], row["status"]) for row in remaining] == [
+        ("run-succeeded:7", "succeeded")
+    ]
+    assert requests == []
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_terminal_aliases_consolidate_before_delivery(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    settings = NotificationSettings(webhook_urls=["https://hooks.example/terminal"])
+    store = notification_store(tmp_path, settings=settings)
+    for dedup_key in ("run-succeeded:4", "run-terminal:succeeded:4"):
+        store.enqueue_notification(
+            run_id="run",
+            title="terminal",
+            message="terminal",
+            data={},
+            dedup_key=dedup_key,
+            destinations=notification_destinations(settings),
+        )
+    with store._lock:
+        store._connection.execute("""
+            UPDATE runs SET status = 'succeeded', kernel_epoch = 4,
+                ended_at = updated_at WHERE run_id = 'run'
+            """)
+        store._connection.commit()
+
+    manager = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await wait_until(lambda: len(requests) == 1)
+    await manager.drain(1)
+
+    with store._lock:
+        remaining = store._connection.execute("""
+            SELECT dedup_key FROM notification_intents
+            WHERE run_id = 'run' AND dedup_key LIKE 'run-%succeeded%'
+            """).fetchall()
+    assert [row["dedup_key"] for row in remaining] == ["run-terminal:succeeded:4"]
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_alias_consolidation_merges_partial_delivery_success(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    settings = NotificationSettings(
+        webhook_urls=["https://one.example/hook", "https://two.example/hook"]
+    )
+    store = notification_store(tmp_path, settings=settings)
+    legacy = store.enqueue_notification(
+        run_id="run",
+        title="legacy",
+        message="legacy",
+        data={},
+        dedup_key="run-succeeded:9",
+        destinations=notification_destinations(settings),
+    )
+    canonical = store.enqueue_notification(
+        run_id="run",
+        title="canonical",
+        message="canonical",
+        data={},
+        dedup_key="run-terminal:succeeded:9",
+        destinations=notification_destinations(settings),
+    )
+    with store._lock:
+        store._connection.execute(
+            """
+            UPDATE notification_deliveries SET status = 'succeeded'
+            WHERE intent_id = ? AND destination LIKE 'https://one.%'
+            """,
+            (legacy["intent_id"],),
+        )
+        store._connection.execute(
+            """
+            UPDATE notification_deliveries SET status = 'succeeded'
+            WHERE intent_id = ? AND destination LIKE 'https://two.%'
+            """,
+            (canonical["intent_id"],),
+        )
+        store._connection.execute(
+            "UPDATE notification_intents SET status = 'partial' WHERE run_id = 'run'"
+        )
+        store._connection.execute("""
+            UPDATE runs SET status = 'succeeded', kernel_epoch = 9,
+                ended_at = updated_at WHERE run_id = 'run'
+            """)
+        store._connection.commit()
+
+    manager = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await asyncio.sleep(0.05)
+
+    with store._lock:
+        intents = store._connection.execute(
+            "SELECT intent_id, status FROM notification_intents WHERE run_id = 'run'"
+        ).fetchall()
+        deliveries = store._connection.execute(
+            "SELECT status FROM notification_deliveries WHERE run_id = 'run'"
+        ).fetchall()
+    assert len(intents) == 1
+    assert intents[0]["status"] == "succeeded"
+    assert {row["status"] for row in deliveries} == {"succeeded"}
+    assert requests == []
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_manifest_first_credential_rotation(
+    tmp_path: Path,
+) -> None:
+    old = NotificationSettings(
+        webhook_urls=["https://old.example/hook?token=OLD_WEBHOOK_SECRET"],
+        ntfy_base_url="https://old-ntfy.example",
+        ntfy_topic="OLD_TOPIC_SECRET",
+    )
+    desired = NotificationSettings(
+        webhook_urls=["https://new.example/hook?token=NEW_WEBHOOK_SECRET"],
+        ntfy_base_url="https://new-ntfy.example",
+        ntfy_topic="NEW_TOPIC_SECRET",
+    )
+    store = notification_store(tmp_path, settings=old)
+    intent = store.enqueue_notification(
+        run_id="run",
+        title="OLD_TITLE_SECRET",
+        message="OLD_MESSAGE_SECRET",
+        data={"legacy": "OLD_DATA_SECRET"},
+        dedup_key="legacy-rotation",
+        destinations=notification_destinations(old),
+    )
+    store.append_event(
+        "run",
+        "notification.failed",
+        {"error": "https://old.example/hook?token=OLD_EVENT_SECRET BODY_SECRET"},
+    )
+    with store._lock:
+        store._connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = 'failed', last_error = ? WHERE intent_id = ?
+            """,
+            (
+                "https://old.example/hook?token=OLD_ERROR_SECRET RESPONSE_SECRET",
+                intent["intent_id"],
+            ),
+        )
+        store._connection.execute(
+            "UPDATE notification_intents SET status = 'failed' WHERE intent_id = ?",
+            (intent["intent_id"],),
+        )
+        store._connection.commit()
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    manager = NotificationManager(
+        settings=desired, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await wait_until(lambda: len(requests) == 2)
+    await manager.drain(1)
+    await manager.close()
+
+    request_text = "\n".join(
+        f"{request.url}\n{request.content.decode(errors='replace')}"
+        for request in requests
+    )
+    assert "new.example" in request_text
+    assert "new-ntfy.example" in request_text
+    with store._lock:
+        dump = "\n".join(store._connection.iterdump())
+    for secret in (
+        "OLD_WEBHOOK_SECRET",
+        "OLD_TOPIC_SECRET",
+        "OLD_TITLE_SECRET",
+        "OLD_MESSAGE_SECRET",
+        "OLD_DATA_SECRET",
+        "OLD_EVENT_SECRET",
+        "OLD_ERROR_SECRET",
+        "BODY_SECRET",
+        "RESPONSE_SECRET",
+    ):
+        assert secret not in request_text
+        assert secret not in dump
+    store.close()
+    for path in (tmp_path / "state.sqlite3", tmp_path / "state.sqlite3-wal"):
+        if path.exists():
+            raw = path.read_bytes()
+            assert b"OLD_WEBHOOK_SECRET" not in raw
+            assert b"OLD_ERROR_SECRET" not in raw
+
+
+@pytest.mark.asyncio
+async def test_same_config_upgrade_scrubs_legacy_diagnostics_once(
+    tmp_path: Path,
+) -> None:
+    settings = NotificationSettings(webhook_urls=["https://hooks.example/same"])
+    store = notification_store(tmp_path, settings=settings)
+    intent = store.enqueue_notification(
+        run_id="run",
+        title="legacy",
+        message="legacy",
+        data={},
+        dedup_key="same-config",
+        destinations=notification_destinations(settings),
+    )
+    with store._lock:
+        store._connection.execute(
+            "UPDATE notification_deliveries SET status = 'succeeded', last_error = ?",
+            ("https://hooks.example/same?token=LEGACY_ERROR_SECRET BODY_SECRET",),
+        )
+        store._connection.execute(
+            "UPDATE notification_intents SET status = 'succeeded' WHERE intent_id = ?",
+            (intent["intent_id"],),
+        )
+        store._connection.commit()
+    store.append_event("run", "notification.failed", {"error": "LEGACY_EVENT_SECRET"})
+
+    first = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await first.start()
+    await asyncio.sleep(0.02)
+    await first.close()
+    assert store.notification_deliveries(intent["intent_id"])[0]["last_error"] is None
+    migrated = [
+        event
+        for event in store.recent_events("run", limit=100)
+        if event["type"] == "notification.failed"
+    ][0]
+    assert migrated["payload"] == {}
+
+    store.append_event("run", "notification.sent", {"intent_id": "safe-new-event"})
+    second = NotificationManager(
+        settings=settings, store=store, bus=EventBus(store, "run"), run_id="run"
+    )
+    await second.start()
+    await asyncio.sleep(0.02)
+    await second.close()
+    safe = [
+        event
+        for event in store.recent_events("run", limit=100)
+        if event["type"] == "notification.sent"
+        and event["payload"].get("intent_id") == "safe-new-event"
+    ]
+    assert len(safe) == 1
     store.close()

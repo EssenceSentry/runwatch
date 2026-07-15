@@ -13,7 +13,7 @@ const mascotState = {
 };
 
 const RUN_TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
-const RUN_LIVE = new Set(['starting', 'running', 'waiting_external', 'restarting', 'cancelling']);
+const RUN_LIVE = new Set(['starting', 'running', 'waiting_external', 'finalizing', 'restarting', 'cancelling']);
 const RESOURCE_ERRORS = new Set(['failed', 'monitor_error']);
 const MASCOT_MINIMUM_SECONDS = 24;
 const MASCOT_VISIBLE_SECONDS = 7;
@@ -27,6 +27,7 @@ const MASCOT_SHOWCASE_STATUSES = [
   'paused',
   'restarting',
   'waiting_external',
+  'finalizing',
   'succeeded',
   'failed',
   'cancelling',
@@ -348,6 +349,7 @@ function renderProgress(run, cells, events) {
       failed: 'Run failed',
       cancelled: 'Run cancelled',
       waiting_external: 'Notebook complete · waiting on remote work',
+      finalizing: 'Finalizing notebook and run state',
       paused: 'Paused for repair',
       starting: 'Starting notebook',
     };

@@ -31,11 +31,18 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
   per-destination retry outbox. Delivery is at least once; retries carry stable
   `Idempotency-Key` and `X-Runwatch-Intent-ID` headers so receivers can deduplicate a
   request accepted immediately before a Runwatch crash.
+- Versioned notification presentations exclude resolved configuration and raw
+  operational payloads. Response bodies are not read, redirects are not followed,
+  periodic reminders use one rolling intent, and network plain HTTP requires an
+  explicit opt-in.
 - Notification-aware removal of successful run state after the dashboard closes, with
   incomplete outboxes retained for `runwatch open` recovery and `--keep-run` available
   for retained provenance.
 
-Runwatch uses state schema version 2 and intentionally does not migrate 0.1 run
+Runwatch versions its persisted and wire contracts independently. New run manifests
+and SQLite databases use schema version 3; configuration and kernel resource events use
+schema version 2; S3 progress manifests use schema version 1. Legacy schema-version-2
+run directories reopen conservatively. Runwatch intentionally does not migrate 0.1 run
 directories.
 
 ## Installation
@@ -47,24 +54,32 @@ filesystems are not currently supported execution targets.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[supervisor]'
 ```
+
+Notebook kernels that only emit generic Runwatch protocol events can use the
+Pydantic-only base install. The CLI, notebook runner, dashboard, notifications, and
+built-in AWS/local adapters require the `supervisor` extra shown above.
 
 Install optional NVIDIA monitoring support with:
 
 ```bash
-python -m pip install -e '.[gpu]'
+python -m pip install -e '.[supervisor,gpu]'
 ```
 
 For development:
 
 ```bash
-uv sync --extra test --extra dev --extra docs
+uv sync --extra supervisor --extra test --extra dev --extra docs
 uv run pytest tests
 uv run ruff check src tests
 ```
 
 The selected notebook kernel must be able to import `runwatch` when cells emit resources.
+
+Third-party supervisor adapters can extend Runwatch without adding provider-specific
+code to this package. See [Third-party resource adapters](docs/resource-events.md#third-party-resource-adapters)
+for the entry-point contract and adapter API.
 
 ## First run
 
@@ -87,11 +102,12 @@ notifications are configured, cleanup first waits up to
 `notifications.terminal_drain_timeout_seconds` for terminal event routing and delivery
 attempts. If the outbox is still nonterminal, the successful run is retained and the CLI
 prints a reason plus `runwatch open RUN_DIR`; opening it restarts notification delivery
-without rerunning the notebook. Once recovered delivery settles, closing that dashboard
-applies the persisted cleanup policy, so the successful state is removed unless the
-original execution used `--keep-run`. Set `server.linger_seconds: 0` to close
-immediately, set it to `null` to keep the dashboard open until Ctrl+C, or use
-`--keep-run` to retain successful state after the dashboard closes.
+without rerunning the notebook. The recovery controller conservatively retains the run
+when that dashboard closes because it did not itself observe normal notebook
+finalization. After confirming delivery, remove the retained state explicitly if it is
+no longer needed. Set `server.linger_seconds: 0` to close immediately, set it to `null`
+to keep the dashboard open until Ctrl+C, or use `--keep-run` to retain successful state
+after the original execution's dashboard closes.
 
 For a no-AWS replay with live progress, local metrics, file monitoring, log tailing,
 and final notebook results, use the repository's
@@ -412,12 +428,29 @@ runwatch status RUN_DIR [--json]
 runwatch validate NOTEBOOK [--config PATH] [--json]
 runwatch events RUN_DIR [--follow] [--json]
 runwatch open RUN_DIR
+runwatch notifications rotate RUN_DIR --config PATH
+runwatch notifications purge RUN_DIR --yes
 runwatch version
 ```
 
-`open` serves persisted state without starting notebook execution, retries durable
-notification delivery, and applies the run's persisted successful-cleanup policy when
-the dashboard closes.
+`open` serves persisted state without starting notebook execution and retries durable
+notification delivery. It conservatively retains the run when the dashboard closes:
+only the controller that observed normal notebook finalization may authorize automatic
+successful-run cleanup.
+
+`status`, `context`, and `events` emit bounded presentation schema version 1 in JSON
+mode. They expose recovery-relevant lifecycle fields and safe summaries, not the raw
+SQLite snapshot, resolved notification configuration, controller credentials, or raw
+event payloads.
+
+Notification credential maintenance is offline and lock-fenced. `notifications
+rotate` reads only the notification settings from `--config`, atomically records them
+as desired state in the run manifest, then rewrites every persisted delivery for the
+same webhook/ntfy topology. It also rearms failed deliveries, clears legacy transport
+errors, and sanitizes pre-presentation intents. To change topology, purge the old
+outbox first; a subsequent rotate may enable the new topology because no old delivery
+rows remain. `notifications purge --yes` disables routing without replay, removes the
+outbox, scrubs notification diagnostics, and best-effort compacts SQLite.
 
 Runwatch validates resource lifecycle semantics at every entry point—not just in the
 convenience emitters. Metrics, logs, and system monitors are always nonblocking;

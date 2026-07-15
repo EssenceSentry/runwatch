@@ -8,7 +8,7 @@ from typing import Any, ClassVar, cast
 from botocore.exceptions import ClientError
 
 from ..models import ResourceEvent, ResourceObservation, ResourceStatus
-from .base import ResourceAdapter, ResourceOperationError
+from .base import AwsResourceAdapter, ResourceOperationError
 from .cloudwatch_logs import LogStreamDiscovery, discover_log_streams_with_cursor
 
 
@@ -54,7 +54,7 @@ class _LogDrainState:
     drain_truncated: bool = False
 
 
-class SageMakerProcessingAdapter(ResourceAdapter):
+class SageMakerProcessingAdapter(AwsResourceAdapter):
     provider = "aws"
     resource_type = "sagemaker_processing_job"
     supports_stop = True

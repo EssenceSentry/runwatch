@@ -103,6 +103,42 @@ def test_config_rejects_non_http_notification_destinations(
         RunwatchConfig.model_validate({"notifications": {field: value}})
 
 
+@pytest.mark.parametrize(
+    "url",
+    ["http://localhost:8080/hook", "http://127.0.0.1/hook", "http://[::1]/hook"],
+)
+def test_notification_config_accepts_plain_http_only_for_loopback_by_default(
+    url: str,
+) -> None:
+    config = RunwatchConfig.model_validate({"notifications": {"webhook_urls": [url]}})
+    assert config.notifications.webhook_urls == [url]
+
+
+def test_notification_config_requires_explicit_plain_http_for_network_hosts() -> None:
+    with pytest.raises(ValueError, match="allow_insecure_http"):
+        RunwatchConfig.model_validate(
+            {"notifications": {"webhook_urls": ["http://192.168.1.4/hook"]}}
+        )
+    config = RunwatchConfig.model_validate(
+        {
+            "notifications": {
+                "webhook_urls": ["http://192.168.1.4/hook"],
+                "allow_insecure_http": True,
+            }
+        }
+    )
+    assert config.notifications.allow_insecure_http
+
+
+def test_notification_config_bounds_periodic_interval_and_rejects_fragments() -> None:
+    with pytest.raises(ValueError):
+        RunwatchConfig.model_validate({"notifications": {"periodic_seconds": 59}})
+    with pytest.raises(ValueError, match="fragments"):
+        RunwatchConfig.model_validate(
+            {"notifications": {"webhook_urls": ["https://hooks.example/hook#secret"]}}
+        )
+
+
 def test_config_rejects_nonterminal_blocking_resource(tmp_path: Path) -> None:
     path = tmp_path / "runwatch.yaml"
     path.write_text(
@@ -165,6 +201,20 @@ def test_config_defaults_and_rejects_non_mapping(tmp_path: Path) -> None:
 def test_config_rejects_nonpositive_tqdm_interval() -> None:
     with pytest.raises(ValueError, match="tqdm_min_interval_seconds"):
         RunwatchConfig.model_validate({"notebook": {"tqdm_min_interval_seconds": 0}})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_event_payload_bytes", 1_023),
+        ("max_resource_payload_bytes", 1_023),
+        ("max_notification_record_bytes", 1_023),
+        ("max_delivery_error_bytes", 255),
+    ],
+)
+def test_config_rejects_unsafe_per_record_storage_caps(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field):
+        RunwatchConfig.model_validate({"storage": {field: value}})
 
 
 def test_preflight_collects_notebook_workdir_kernel_resource_and_lan_issues(

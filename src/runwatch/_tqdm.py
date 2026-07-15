@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from textwrap import dedent
 
+from .schema_versions import RESOURCE_EVENT_SCHEMA_VERSION
+
 _TQDM_BOOTSTRAP = dedent("""
     import math as _runwatch_math
     import time as _runwatch_time
@@ -71,7 +73,7 @@ _TQDM_BOOTSTRAP = dedent("""
 
             unit = values.get("unit", getattr(bar, "unit", None))
             return {
-                "schema_version": 2,
+                "schema_version": __RUNWATCH_RESOURCE_EVENT_SCHEMA_VERSION__,
                 "event_id": str(_runwatch_uuid.uuid4()),
                 "event": "progress",
                 "completed": completed,
@@ -169,5 +171,9 @@ def tqdm_bootstrap_code(min_interval_seconds: float) -> str:
     payload = _TQDM_BOOTSTRAP.replace(
         "__RUNWATCH_TQDM_MIN_INTERVAL_SECONDS__",
         repr(float(min_interval_seconds)),
+    )
+    payload = payload.replace(
+        "__RUNWATCH_RESOURCE_EVENT_SCHEMA_VERSION__",
+        repr(RESOURCE_EVENT_SCHEMA_VERSION),
     )
     return f"exec({payload!r}, {{}})"

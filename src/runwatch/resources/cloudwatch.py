@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from ..models import ResourceEvent, ResourceObservation, ResourceStatus
-from .base import ResourceAdapter, ResourceOperationError
+from .base import AwsResourceAdapter, ResourceOperationError
 
 _STATISTICS = {"Average", "Sum", "Minimum", "Maximum", "SampleCount"}
 _MAX_TRACKED_METRIC_SAMPLES = 1_440
@@ -152,7 +152,7 @@ def _metric_payload(
     }
 
 
-class CloudWatchMetricAdapter(ResourceAdapter):
+class CloudWatchMetricAdapter(AwsResourceAdapter):
     provider = "aws"
     resource_type = "cloudwatch_metric"
 

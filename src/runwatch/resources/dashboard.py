@@ -9,7 +9,12 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from ..models import AwsSettings, ResourceEvent, ResourceObservation, ResourceStatus
-from .base import AwsClientProvider, ResourceAdapter, ResourceConfigurationError
+from .base import (
+    AdapterContext,
+    AwsClientProvider,
+    ResourceAdapter,
+    ResourceConfigurationError,
+)
 
 
 def validate_dashboard_url(value: str) -> str:
@@ -68,12 +73,14 @@ class DashboardAdapter(ResourceAdapter):
 
     def __init__(
         self,
+        context: AdapterContext | None = None,
         *,
-        aws: AwsClientProvider,
-        aws_settings: AwsSettings,
-        working_dir: Path,
+        aws: AwsClientProvider | None = None,
+        aws_settings: AwsSettings | None = None,
+        working_dir: Path | None = None,
     ) -> None:
         super().__init__(
+            context,
             aws=aws,
             aws_settings=aws_settings,
             working_dir=working_dir,

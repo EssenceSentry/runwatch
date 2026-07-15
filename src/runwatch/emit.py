@@ -33,6 +33,21 @@ def _display_payload(mime_type: str, payload: dict[str, Any], text: str) -> None
 def emit_event(
     event: BaseModel | dict[str, Any], *, text: str | None = None
 ) -> dict[str, Any]:
+    """Emit a structured Runwatch event from a notebook kernel.
+
+    Parameters
+    ----------
+    event:
+        Pydantic model or JSON-compatible event dictionary.
+    text:
+        Optional plain-text representation for notebook frontends.
+
+    Returns
+    -------
+    dict[str, Any]
+        The event payload written to rich display output or the fallback stream.
+    """
+
     payload = event.model_dump(mode="json") if isinstance(event, BaseModel) else event
     mime_type = (
         RESOURCE_MIME_TYPE
@@ -46,9 +61,21 @@ def emit_event(
 
 
 def emit_resource(event: ResourceEvent, *, text: str) -> dict[str, Any]:
-    from .resources import validate_resource_event
+    """Emit one generic resource registration event.
 
-    validate_resource_event(event)
+    Parameters
+    ----------
+    event:
+        Provider-neutral resource registration.
+    text:
+        Plain-text representation for notebook frontends.
+
+    Returns
+    -------
+    dict[str, Any]
+        The resource event payload written to notebook output.
+    """
+
     return emit_event(event, text=text)
 
 

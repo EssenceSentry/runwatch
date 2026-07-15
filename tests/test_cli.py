@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -17,9 +18,11 @@ import runwatch.cli as cli
 from runwatch.models import (
     ActionKind,
     ActionStatus,
+    NotificationSettings,
     RunStatus,
     RunwatchConfig,
 )
+from runwatch.notification_config import notification_destinations
 from runwatch.storage import RunStore
 from runwatch.supervisor import RunSupervisor
 
@@ -122,6 +125,34 @@ def test_success_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
     assert not run_dir.exists()
     assert retained.is_dir()
     assert runs_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_success_cleanup_requires_normal_wait_and_durable_finalization(
+    tmp_path: Path,
+) -> None:
+    supervisor = _supervisor(tmp_path)
+    supervisor.cleanup_on_success = True
+    supervisor.store.finish_run(
+        supervisor.run_id,
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 0},
+    )
+
+    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+
+    supervisor._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
+    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+
+    supervisor.store.mark_run_finalized(supervisor.run_id, RunStatus.SUCCEEDED)
+    supervisor._wait_completed_normally = False  # noqa: SLF001 - cleanup gate probe
+    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+
+    supervisor._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
+    assert await cli._successful_cleanup_decision(supervisor) == (True, None)
+    await supervisor.close()
 
 
 def test_run_lock_is_atomically_published_and_release_is_token_fenced(
@@ -373,6 +404,9 @@ async def test_run_and_linger_uses_default_observation_grace(
         async def wait(self) -> RunStatus:
             return RunStatus.SUCCEEDED
 
+        async def wait_for_action_loop_failure(self) -> None:
+            await asyncio.Future()
+
     monkeypatch.setattr(cli.asyncio, "sleep", record_sleep)
 
     result = await cli._run_and_linger(
@@ -410,6 +444,9 @@ async def test_run_and_linger_allows_explicit_indefinite_linger(
         async def wait(self) -> RunStatus:
             return RunStatus.SUCCEEDED
 
+        async def wait_for_action_loop_failure(self) -> None:
+            await asyncio.Future()
+
     monkeypatch.setattr(cli.asyncio, "Event", ReturningEvent)
 
     result = await cli._run_and_linger(
@@ -422,6 +459,45 @@ async def test_run_and_linger_allows_explicit_indefinite_linger(
         "Dashboard remains available; press Ctrl+C to close it."
         in capsys.readouterr().out
     )
+
+
+@pytest.mark.parametrize("linger_seconds", [30.0, None], ids=["finite", "indefinite"])
+@pytest.mark.parametrize(
+    "failure_message",
+    [
+        "Runwatch action loop exited unexpectedly",
+        "Runwatch action loop failed unexpectedly (ValueError)",
+    ],
+    ids=["normal-exit", "exception"],
+)
+@pytest.mark.asyncio
+async def test_run_and_linger_aborts_when_action_loop_terminates(
+    tmp_path: Path,
+    linger_seconds: float | None,
+    failure_message: str,
+) -> None:
+    class FakeSupervisor:
+        notebook_path = tmp_path / "input.ipynb"
+        output_path = tmp_path / "out.ipynb"
+        config = RunwatchConfig.model_validate(
+            {"server": {"linger_seconds": linger_seconds}}
+        )
+
+        async def start(self) -> None:
+            return None
+
+        async def wait(self) -> RunStatus:
+            return RunStatus.SUCCEEDED
+
+        async def wait_for_action_loop_failure(self) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError(failure_message)
+
+    with pytest.raises(RuntimeError, match=re.escape(failure_message)):
+        await asyncio.wait_for(
+            cli._run_and_linger(cast(RunSupervisor, FakeSupervisor()), start_run=True),
+            timeout=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -464,6 +540,147 @@ async def test_serve_releases_lock_when_startup_fails(
     assert supervisor.closed
     assert not held_lock.held
     assert not held_lock.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_run", [True, False], ids=["execute", "open"])
+async def test_serve_stops_work_when_server_crashes_after_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_run: bool,
+) -> None:
+    class FakeServer:
+        def __init__(self, config: object) -> None:
+            self.started = False
+            self.should_exit = False
+            self.install_signal_handlers: object | None = None
+
+        async def serve(self) -> None:
+            self.started = True
+            await work_started.wait()
+            raise RuntimeError("post-start server crash")
+
+    class FakeSupervisor:
+        run_dir = tmp_path
+        controller_token = "controller-token"
+        bus = object()
+        config = RunwatchConfig.model_validate(
+            {"server": {"open_browser": False, "show_qr": False}}
+        )
+
+        def attach_dashboard_links(self, manager: object) -> None:
+            return None
+
+    work_started = asyncio.Event()
+    work_cancelled = asyncio.Event()
+    finish_called = asyncio.Event()
+
+    async def wait_for_server_failure(
+        supervisor: RunSupervisor, *, start_run: bool
+    ) -> int:
+        work_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            work_cancelled.set()
+        return 0
+
+    async def record_finish(supervisor: RunSupervisor, lock: cli.RunLock) -> None:
+        finish_called.set()
+        lock.release()
+
+    monkeypatch.setattr(cli, "_run_and_linger", wait_for_server_failure)
+    monkeypatch.setattr(cli, "_finish_serve", record_finish)
+    monkeypatch.setattr(cli, "_announce_run", lambda *args: None)
+    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli, "DashboardLinkManager", lambda **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+
+    with pytest.raises(RuntimeError, match="web server exited unexpectedly") as raised:
+        await cli._serve(cast(RunSupervisor, FakeSupervisor()), start_run=start_run)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "post-start server crash" in str(raised.value.__cause__)
+    assert work_started.is_set()
+    assert work_cancelled.is_set()
+    assert finish_called.is_set()
+    assert not (tmp_path / "runwatch.lock").exists()
+
+
+@pytest.mark.asyncio
+async def test_server_crash_pauses_real_supervisor_after_runner_is_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CrashingServer:
+        def __init__(self, config: object) -> None:
+            self.started = False
+            self.should_exit = False
+            self.install_signal_handlers: object | None = None
+
+        async def serve(self) -> None:
+            self.started = True
+            await runner_started.wait()
+            raise RuntimeError("injected post-start server crash")
+
+    notebook = tmp_path / "input.ipynb"
+    _notebook(notebook)
+    run_dir = tmp_path / ".runwatch" / "runs" / "server-crash"
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=run_dir / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        config=RunwatchConfig.model_validate(
+            {"server": {"open_browser": False, "show_qr": False}}
+        ),
+    )
+    run_id = supervisor.run_id
+    runner_started = asyncio.Event()
+    runner_cancelled = asyncio.Event()
+
+    async def run_until_server_crashes() -> RunStatus:
+        supervisor.store.update_run_status(
+            run_id,
+            RunStatus.RUNNING,
+            message="Notebook executing",
+            started=True,
+        )
+        runner_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            runner_cancelled.set()
+        return RunStatus.SUCCEEDED
+
+    monkeypatch.setattr(supervisor.runner, "run", run_until_server_crashes)
+    monkeypatch.setattr(cli, "_announce_run", lambda *args: None)
+    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", CrashingServer)
+
+    with pytest.raises(RuntimeError, match="web server exited unexpectedly") as raised:
+        await cli._serve(supervisor, start_run=True)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "injected post-start server crash" in str(raised.value.__cause__)
+    assert runner_cancelled.is_set()
+    assert not (run_dir / "runwatch.lock").exists()
+
+    reopened = RunStore(run_dir / "runwatch.sqlite3")
+    try:
+        run = reopened.get_run(run_id)
+        assert run["status"] == RunStatus.PAUSED.value
+        assert run["finalization_complete"] is False
+        assert run["process_pid"] is None
+        assert run["process_token"] is None
+        assert run["server_port"] is None
+        assert any(
+            event["type"] == "run.process_stopped"
+            for event in reopened.recent_events(run_id)
+        )
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio
@@ -592,8 +809,16 @@ async def test_success_cleanup_retains_state_when_terminal_notification_is_pendi
     async def finish_without_kernel(active: RunSupervisor, *, start_run: bool) -> int:
         assert start_run
         await active.notifications.start()
-        active.store.update_run_status(active.run_id, RunStatus.SUCCEEDED, ended=True)
-        await active.bus.publish("run.succeeded", {"kernel_epoch": 0})
+        event = active.store.finish_run(
+            active.run_id,
+            RunStatus.SUCCEEDED,
+            message="completed",
+            event_type="run.succeeded",
+            event_payload={"kernel_epoch": 0},
+        )
+        active.bus.fan_out_persisted(event)
+        active.store.mark_run_finalized(active.run_id, RunStatus.SUCCEEDED)
+        active._wait_completed_normally = True  # noqa: SLF001 - cleanup gate setup
         await asyncio.wait_for(delivery_started.wait(), timeout=1)
         return 0
 
@@ -644,8 +869,8 @@ async def test_success_cleanup_retains_state_when_terminal_notification_is_pendi
     await cli._finish_serve(recovery, recovery_lock)
 
     assert len(requests) == 1
-    assert not run_dir.exists()
-    assert not (tmp_path / ".runwatch").exists()
+    assert run_dir.exists()
+    assert (tmp_path / ".runwatch").exists()
 
 
 @pytest.mark.asyncio
@@ -661,8 +886,12 @@ async def test_open_preserves_successful_keep_run_state(tmp_path: Path) -> None:
         config=RunwatchConfig(),
         cleanup_on_success=False,
     )
-    supervisor.store.update_run_status(
-        supervisor.run_id, RunStatus.SUCCEEDED, ended=True
+    supervisor.store.finish_run(
+        supervisor.run_id,
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 0},
     )
     await supervisor.close()
 
@@ -709,10 +938,16 @@ async def test_cleanup_quiesces_producers_before_terminal_notification_drain(
         transport=httpx.MockTransport(notification_handler)
     )
     await supervisor.notifications.start()
-    supervisor.store.update_run_status(
-        supervisor.run_id, RunStatus.SUCCEEDED, ended=True
+    succeeded = supervisor.store.finish_run(
+        supervisor.run_id,
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 0},
     )
-    await supervisor.bus.publish("run.succeeded", {"kernel_epoch": 0})
+    supervisor.bus.fan_out_persisted(succeeded)
+    supervisor.store.mark_run_finalized(supervisor.run_id, RunStatus.SUCCEEDED)
+    supervisor._wait_completed_normally = True  # noqa: SLF001 - cleanup gate setup
     order: list[str] = []
     original_shutdown = supervisor.resources.shutdown
 
@@ -1021,8 +1256,12 @@ def test_dead_terminal_run_rejects_resume_but_restart_reruns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     supervisor = _supervisor(tmp_path)
-    supervisor.store.update_run_status(
-        supervisor.run_id, RunStatus.SUCCEEDED, ended=True
+    supervisor.store.finish_run(
+        supervisor.run_id,
+        RunStatus.SUCCEEDED,
+        message="completed",
+        event_type="run.succeeded",
+        event_payload={"kernel_epoch": 0},
     )
     run_dir = supervisor.run_dir
     supervisor.store.close()
@@ -1084,6 +1323,243 @@ def test_status_context_and_events_commands(tmp_path: Path) -> None:
     )
     events_text = runner.invoke(cli.app, ["events", str(supervisor.run_dir)])
     assert "probe.event" in events_text.stdout
+
+
+def test_status_context_and_events_exclude_internal_canaries(tmp_path: Path) -> None:
+    root = tmp_path / "canary"
+    root.mkdir()
+    notebook = root / "input.ipynb"
+    _notebook(notebook)
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=root / "executed.ipynb",
+        working_dir=root,
+        run_dir=root / "run",
+        config=RunwatchConfig(
+            notifications=NotificationSettings(
+                webhook_urls=["https://hooks.example/run?token=WEBHOOK_CONFIG_SECRET"],
+                ntfy_base_url="https://ntfy.example",
+                ntfy_topic="NTFY_CONFIG_SECRET",
+            )
+        ),
+        name="demo",
+    )
+    supervisor.store.update_process(
+        supervisor.run_id,
+        process_pid=os.getpid(),
+        process_started_at=cli.process_start_time(os.getpid()),
+        process_token="CONTROLLER_TOKEN_SECRET",
+        server_port=8765,
+    )
+    supervisor.store.update_run_status(
+        supervisor.run_id,
+        RunStatus.PAUSED,
+        message="Cell failed with CELL_ERROR_SECRET",
+        failed_cell_index=0,
+        failed_attempt=1,
+    )
+    asyncio.run(
+        supervisor.bus.publish(
+            "probe.event",
+            {
+                "credential": "EVENT_PAYLOAD_SECRET",
+                "message": "PROVIDER_MESSAGE_SECRET",
+            },
+        )
+    )
+    supervisor.store.close()
+
+    results = [
+        runner.invoke(cli.app, ["status", str(supervisor.run_dir), "--json"]),
+        runner.invoke(cli.app, ["status", str(supervisor.run_dir)]),
+        runner.invoke(
+            cli.app, ["context", str(supervisor.run_dir), "--format", "json"]
+        ),
+        runner.invoke(cli.app, ["context", str(supervisor.run_dir)]),
+        runner.invoke(cli.app, ["events", str(supervisor.run_dir), "--json"]),
+        runner.invoke(cli.app, ["events", str(supervisor.run_dir)]),
+    ]
+    assert all(result.exit_code == 0 for result in results)
+    serialized = "\n".join(result.stdout for result in results)
+    for secret in (
+        "WEBHOOK_CONFIG_SECRET",
+        "NTFY_CONFIG_SECRET",
+        "CONTROLLER_TOKEN_SECRET",
+        "CELL_ERROR_SECRET",
+        "EVENT_PAYLOAD_SECRET",
+        "PROVIDER_MESSAGE_SECRET",
+    ):
+        assert secret not in serialized
+    status_payload = json.loads(results[0].stdout)
+    assert status_payload["schema_version"] == 1
+    assert set(status_payload["run"]).isdisjoint(
+        {"metadata", "process_token", "kernel_id", "notebook_path", "working_dir"}
+    )
+    event_payload = json.loads(results[4].stdout.splitlines()[-1])
+    assert event_payload["data"] == {}
+
+
+def test_notification_rotate_and_purge_scrub_persisted_credentials(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "notification-maintenance"
+    root.mkdir()
+    notebook = root / "input.ipynb"
+    _notebook(notebook)
+    old = NotificationSettings(
+        webhook_urls=["https://old.example/hook?token=OLD_MANIFEST_SECRET"],
+        ntfy_base_url="https://old-ntfy.example",
+        ntfy_topic="OLD_TOPIC_SECRET",
+    )
+    supervisor = RunSupervisor(
+        notebook_path=notebook,
+        output_path=root / "executed.ipynb",
+        working_dir=root,
+        run_dir=root / "run",
+        config=RunwatchConfig(notifications=old),
+        name="demo",
+    )
+    intent = supervisor.store.enqueue_notification(
+        run_id=supervisor.run_id,
+        title="OLD_TITLE_SECRET",
+        message="OLD_MESSAGE_SECRET",
+        data={"legacy": "OLD_DATA_SECRET"},
+        dedup_key="credential-maintenance",
+        destinations=notification_destinations(old),
+    )
+    supervisor.store.append_event(
+        supervisor.run_id,
+        "notification.failed",
+        {"error": "OLD_EVENT_SECRET https://old.example/response"},
+    )
+    with supervisor.store._lock:
+        supervisor.store._connection.execute(
+            "UPDATE notification_deliveries SET last_error = ? WHERE intent_id = ?",
+            ("OLD_ERROR_SECRET response body", intent["intent_id"]),
+        )
+        supervisor.store._connection.commit()
+    asyncio.run(supervisor.notifications._client.aclose())
+    supervisor.store.close()
+
+    desired = NotificationSettings(
+        webhook_urls=["https://new.example/hook?token=NEW_MANIFEST_SECRET"],
+        ntfy_base_url="https://new-ntfy.example",
+        ntfy_topic="NEW_TOPIC_SECRET",
+    )
+    config_path = root / "rotated.json"
+    config_path.write_text(
+        json.dumps(RunwatchConfig(notifications=desired).model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    rotated = runner.invoke(
+        cli.app,
+        [
+            "notifications",
+            "rotate",
+            str(supervisor.run_dir),
+            "--config",
+            str(config_path),
+        ],
+    )
+    assert rotated.exit_code == 0, rotated.output
+    manifest_text = (supervisor.run_dir / "run-manifest.json").read_text(
+        encoding="utf-8"
+    )
+    assert "NEW_MANIFEST_SECRET" in manifest_text
+    for old_secret in (
+        "OLD_MANIFEST_SECRET",
+        "OLD_TOPIC_SECRET",
+        "OLD_TITLE_SECRET",
+        "OLD_MESSAGE_SECRET",
+        "OLD_DATA_SECRET",
+        "OLD_EVENT_SECRET",
+        "OLD_ERROR_SECRET",
+    ):
+        assert old_secret not in manifest_text
+
+    refused = runner.invoke(
+        cli.app, ["notifications", "purge", str(supervisor.run_dir)]
+    )
+    assert refused.exit_code != 0
+    purged = runner.invoke(
+        cli.app, ["notifications", "purge", str(supervisor.run_dir), "--yes"]
+    )
+    assert purged.exit_code == 0, purged.output
+
+    final_manifest = (supervisor.run_dir / "run-manifest.json").read_text(
+        encoding="utf-8"
+    )
+    for secret in (
+        "OLD_MANIFEST_SECRET",
+        "OLD_TOPIC_SECRET",
+        "NEW_MANIFEST_SECRET",
+        "NEW_TOPIC_SECRET",
+    ):
+        assert secret not in final_manifest
+    reopened = RunStore(supervisor.run_dir / "runwatch.sqlite3")
+    with reopened._lock:
+        dump = "\n".join(reopened._connection.iterdump())
+    assert reopened.notification_delivery_topology(supervisor.run_id) == ()
+    metadata = reopened.get_run(supervisor.run_id)["metadata"]
+    assert metadata["_notification_routing_required"] is False
+    assert metadata["_notification_event_cursor"] >= 1
+    diagnostics = [
+        event
+        for event in reopened.recent_events(supervisor.run_id, limit=100)
+        if event["type"].startswith("notification.")
+    ]
+    assert diagnostics and all(event["payload"] == {} for event in diagnostics)
+    reopened.close()
+    for secret in (
+        "OLD_MANIFEST_SECRET",
+        "OLD_TOPIC_SECRET",
+        "OLD_TITLE_SECRET",
+        "OLD_MESSAGE_SECRET",
+        "OLD_DATA_SECRET",
+        "OLD_EVENT_SECRET",
+        "OLD_ERROR_SECRET",
+        "NEW_MANIFEST_SECRET",
+        "NEW_TOPIC_SECRET",
+    ):
+        assert secret not in dump
+        for path in (
+            supervisor.run_dir / "runwatch.sqlite3",
+            supervisor.run_dir / "runwatch.sqlite3-wal",
+        ):
+            if path.exists():
+                assert secret.encode() not in path.read_bytes()
+
+
+def test_notification_maintenance_rejects_live_run_lock(tmp_path: Path) -> None:
+    supervisor = _supervisor(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(RunwatchConfig().model_dump(mode="json")), encoding="utf-8"
+    )
+    asyncio.run(supervisor.notifications._client.aclose())
+    supervisor.store.close()
+    owner = cli.RunLock(supervisor.run_dir)
+    owner.acquire()
+    try:
+        rotate = runner.invoke(
+            cli.app,
+            [
+                "notifications",
+                "rotate",
+                str(supervisor.run_dir),
+                "--config",
+                str(config_path),
+            ],
+        )
+        purge = runner.invoke(
+            cli.app,
+            ["notifications", "purge", str(supervisor.run_dir), "--yes"],
+        )
+        assert rotate.exit_code != 0
+        assert purge.exit_code != 0
+    finally:
+        owner.release()
 
 
 def test_live_recovery_queue_and_resource_stop_paths(
@@ -1429,7 +1905,11 @@ def test_crash_interrupted_offline_stop_is_recovered(
             for event in store.recent_events(manifest["run_id"], limit=20)
             if event["type"] == "run.cancelled"
         )
-        assert cancelled["payload"] == {"offline": True, "kernel_epoch": 0}
+        assert cancelled["payload"] == {
+            "offline": True,
+            "kernel_epoch": 0,
+            "projection_truncated": False,
+        }
         assert calls == ["restore", "resource", "cascade", "shutdown"]
     finally:
         store.close()

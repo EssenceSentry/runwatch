@@ -2273,21 +2273,7 @@ name = "runwatch-notebook"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "async-timeout" },
-    { name = "boto3" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "jinja2" },
-    { name = "jupyter-client" },
-    { name = "nbclient" },
-    { name = "nbformat" },
-    { name = "psutil" },
     { name = "pydantic" },
-    { name = "pyyaml" },
-    { name = "qrcode" },
-    { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -2298,6 +2284,7 @@ dev = [
     { name = "flake8-cognitive-complexity" },
     { name = "pre-commit" },
     { name = "pyright" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "types-pyyaml" },
 ]
@@ -2317,6 +2304,22 @@ docs = [
 gpu = [
     { name = "nvidia-ml-py" },
 ]
+supervisor = [
+    { name = "async-timeout" },
+    { name = "boto3" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "jinja2" },
+    { name = "jupyter-client" },
+    { name = "nbclient" },
+    { name = "nbformat" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "qrcode" },
+    { name = "typer" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
+]
 test = [
     { name = "ipykernel" },
     { name = "pytest" },
@@ -2327,42 +2330,43 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "async-timeout", specifier = ">=5" },
+    { name = "async-timeout", marker = "extra == 'supervisor'", specifier = ">=5" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=22" },
-    { name = "boto3", specifier = ">=1.34" },
+    { name = "boto3", marker = "extra == 'supervisor'", specifier = ">=1.34" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1" },
-    { name = "fastapi", specifier = ">=0.110" },
+    { name = "fastapi", marker = "extra == 'supervisor'", specifier = ">=0.110" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=7.1" },
     { name = "flake8-cognitive-complexity", marker = "extra == 'dev'", specifier = ">=0.1" },
-    { name = "httpx", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'supervisor'", specifier = ">=0.27" },
     { name = "ipykernel", marker = "extra == 'test'", specifier = ">=6" },
-    { name = "jinja2", specifier = ">=3.1" },
-    { name = "jupyter-client", specifier = ">=8" },
+    { name = "jinja2", marker = "extra == 'supervisor'", specifier = ">=3.1" },
+    { name = "jupyter-client", marker = "extra == 'supervisor'", specifier = ">=8" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=4" },
-    { name = "nbclient", specifier = ">=0.10,<1" },
-    { name = "nbformat", specifier = ">=5.10,<6" },
+    { name = "nbclient", marker = "extra == 'supervisor'", specifier = ">=0.10.4,<0.12" },
+    { name = "nbformat", marker = "extra == 'supervisor'", specifier = ">=5.10,<6" },
     { name = "nvidia-ml-py", marker = "extra == 'gpu'", specifier = ">=12" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=2.17" },
-    { name = "psutil", specifier = ">=5.9" },
+    { name = "psutil", marker = "extra == 'supervisor'", specifier = ">=5.9" },
     { name = "pydantic", specifier = ">=2.6,<3" },
     { name = "pydata-sphinx-theme", marker = "extra == 'docs'", specifier = ">=0.16" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.409,<2" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.21" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5" },
-    { name = "pyyaml", specifier = ">=6" },
-    { name = "qrcode", specifier = ">=7.4" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6" },
+    { name = "pyyaml", marker = "extra == 'supervisor'", specifier = ">=6" },
+    { name = "qrcode", marker = "extra == 'supervisor'", specifier = ">=7.4" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=8" },
     { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'", specifier = ">=3" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'", specifier = ">=0.5" },
     { name = "tqdm", marker = "extra == 'test'", specifier = ">=4.66,<5" },
-    { name = "typer", specifier = ">=0.12" },
+    { name = "typer", marker = "extra == 'supervisor'", specifier = ">=0.12" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.12,<7" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.27" },
-    { name = "websockets", specifier = ">=12" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'supervisor'", specifier = ">=0.27" },
+    { name = "websockets", marker = "extra == 'supervisor'", specifier = ">=12" },
 ]
-provides-extras = ["gpu", "test", "dev", "docs"]
+provides-extras = ["supervisor", "gpu", "test", "dev", "docs"]
 
 [[package]]
 name = "s3transfer"
