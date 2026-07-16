@@ -123,6 +123,20 @@ run `working_dir`, supervisor-owned namespaced `settings`, and
 instances. Provider packages own their dependencies and client setup; they should not
 place credentials or raw provider responses in observations.
 
+A service created by `service()` may supply a synchronous or asynchronous `close`
+callback. The context owns that service and closes it exactly once, after all adapters
+have closed. Values supplied with `register_service()` are borrowed by default; pass a
+closer there only when ownership is intentionally transferred to the context.
+An adapter constructed directly through the compatibility constructor owns its private
+context and releases it from `close()`; an override of `close()` must therefore await
+`super().close()`. Adapters created by `ResourceManager` borrow its shared context,
+which the manager closes only after every adapter.
+
+Terminal provider statuses (`completed`, `failed`, and `stopped`) are normalized to
+`terminal: true`. A nonterminal status cannot set `terminal: true`, except `unknown`,
+which remains the explicit escape hatch for providers that can establish finality
+without a more specific status.
+
 For a blocking resource, a provider terminal observation does not settle the resource
 until its configured final log drain finishes and Runwatch durably closes the monitor.
 If the controller stops in that interval, reopening the run restores the terminal

@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import pytest
 
+import runwatch.resources.base as resource_base
 from runwatch.events import EventBus
 from runwatch.models import (
     ActionKind,
@@ -25,7 +26,12 @@ from runwatch.resource_manager import (
     ResourceStopRejected,
     StaleResourceAction,
 )
-from runwatch.resources.base import ResourceAdapter
+from runwatch.resources.base import (
+    AdapterContext,
+    AwsClientProvider,
+    AwsResourceAdapter,
+    ResourceAdapter,
+)
 from runwatch.storage import RunStore
 from runwatch.supervisor import RunSupervisor
 
@@ -157,10 +163,13 @@ class DelayedFinalDrainAdapter(ResourceAdapter):
         )
 
 
-def build_store(root: Path) -> RunStore:
+def build_store(root: Path, *, max_event_payload_bytes: int = 2_097_152) -> RunStore:
     source = root / "source.ipynb"
     source.write_text("{}", encoding="utf-8")
-    store = RunStore(root / "state.sqlite3")
+    store = RunStore(
+        root / "state.sqlite3",
+        max_event_payload_bytes=max_event_payload_bytes,
+    )
     store.initialize_run(
         run_id="run",
         name="demo",
@@ -172,6 +181,212 @@ def build_store(root: Path) -> RunStore:
         source_digest="digest",
     )
     return store
+
+
+@pytest.mark.asyncio
+async def test_adapter_context_closes_only_owned_services_once(tmp_path: Path) -> None:
+    context = AdapterContext(working_dir=tmp_path, settings={})
+    sync_service = object()
+    async_service = object()
+    borrowed_service = object()
+    close_calls: list[tuple[str, object]] = []
+    factory_calls = 0
+
+    def factory() -> object:
+        nonlocal factory_calls
+        factory_calls += 1
+        return sync_service
+
+    def close_sync(value: object) -> None:
+        close_calls.append(("sync", value))
+
+    async def close_async(value: object) -> None:
+        close_calls.append(("async", value))
+
+    assert context.service("sync", factory, close=close_sync) is sync_service
+    assert context.service("sync", factory, close=close_sync) is sync_service
+    context.register_service("async", async_service, close=close_async)
+    context.register_service("borrowed", borrowed_service)
+    assert context.service("borrowed", object, close=close_sync) is borrowed_service
+
+    await context.aclose()
+    await context.aclose()
+
+    assert factory_calls == 1
+    assert close_calls == [("async", async_service), ("sync", sync_service)]
+    with pytest.raises(RuntimeError, match="closed"):
+        context.service("late", object)
+
+
+@pytest.mark.asyncio
+async def test_direct_aws_adapter_closes_its_factory_provider_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Provider:
+        instances: ClassVar[list[Provider]] = []
+
+        def __init__(self, settings: AwsSettings) -> None:
+            self.settings = settings
+            self.close_calls = 0
+            self.instances.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class DirectAwsAdapter(AwsResourceAdapter):
+        provider = "fake"
+        resource_type = "direct_aws"
+
+        async def inspect(
+            self, resource: dict[str, Any], cursor: dict[str, Any]
+        ) -> ResourceObservation:
+            return ResourceObservation(status=ResourceStatus.RUNNING)
+
+    monkeypatch.setattr(resource_base, "AwsClientProvider", Provider)
+    adapter = DirectAwsAdapter(working_dir=tmp_path, aws_settings=AwsSettings())
+
+    await adapter.close()
+    await adapter.close()
+
+    assert len(Provider.instances) == 1
+    assert Provider.instances[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_adapter_does_not_close_supplied_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Provider:
+        instances: ClassVar[list[Provider]] = []
+
+        def __init__(self, settings: AwsSettings) -> None:
+            self.settings = settings
+            self.close_calls = 0
+            self.instances.append(self)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class ContextAwsAdapter(AwsResourceAdapter):
+        provider = "fake"
+        resource_type = "context_aws"
+
+        async def inspect(
+            self, resource: dict[str, Any], cursor: dict[str, Any]
+        ) -> ResourceObservation:
+            return ResourceObservation(status=ResourceStatus.RUNNING)
+
+    monkeypatch.setattr(resource_base, "AwsClientProvider", Provider)
+    context = AdapterContext(
+        working_dir=tmp_path,
+        settings={"aws": AwsSettings()},
+    )
+    adapter = ContextAwsAdapter(context)
+
+    await adapter.close()
+    await adapter.close()
+
+    assert len(Provider.instances) == 1
+    assert Provider.instances[0].close_calls == 0
+
+    await context.aclose()
+    await context.aclose()
+
+    assert Provider.instances[0].close_calls == 1
+
+
+def test_aws_client_provider_closes_cached_clients_once() -> None:
+    class Client:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    first = Client()
+    second = Client()
+    provider = AwsClientProvider.__new__(AwsClientProvider)
+    provider.settings = AwsSettings()
+    provider._clients = {  # noqa: SLF001 - lifecycle unit test
+        ("s3", None): first,
+        ("logs", None): second,
+    }
+    provider._closed = False  # noqa: SLF001 - lifecycle unit test
+
+    provider.close()
+    provider.close()
+
+    assert first.close_calls == 1
+    assert second.close_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        provider.client("s3")
+
+
+@pytest.mark.asyncio
+async def test_manager_closes_services_after_adapters_and_aggregates_failures(
+    tmp_path: Path,
+) -> None:
+    close_order: list[str] = []
+
+    class Service:
+        pass
+
+    def close_service(_service: Service) -> None:
+        close_order.append("service")
+        raise RuntimeError("service close failed")
+
+    class FailingCloseAdapter(ResourceAdapter):
+        provider = "fake"
+        resource_type = "failing_close"
+
+        def __init__(self, context: AdapterContext) -> None:
+            super().__init__(context)
+            self.service = context.service(
+                "fake.shared",
+                Service,
+                close=close_service,
+            )
+
+        async def inspect(
+            self, resource: dict[str, Any], cursor: dict[str, Any]
+        ) -> ResourceObservation:
+            return ResourceObservation(status=ResourceStatus.RUNNING)
+
+        async def close(self) -> None:
+            close_order.append("adapter")
+            raise RuntimeError("adapter close failed")
+
+    store = build_store(tmp_path)
+    manager = ResourceManager(
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+        working_dir=tmp_path,
+        aws_settings=AwsSettings(poll_interval_seconds=60),
+    )
+    manager.register_adapter(FailingCloseAdapter)
+    internal_id = await manager.register(
+        ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="failing_close", id="resource")
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+    )
+    for _ in range(100):
+        if internal_id in manager._adapters:  # noqa: SLF001
+            break
+        await asyncio.sleep(0.001)
+
+    with pytest.raises(RuntimeError, match="Resource cleanup failed") as caught:
+        await manager.shutdown()
+
+    assert "adapter close failed" in str(caught.value)
+    assert "service close failed" in str(caught.value)
+    assert close_order == ["adapter", "service"]
+    with pytest.raises(RuntimeError, match="Resource cleanup failed"):
+        await manager.shutdown()
+    assert close_order == ["adapter", "service"]
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -619,6 +834,26 @@ async def test_logical_key_reconciles_replayed_emission(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_logical_key_supersedes_changed_provider_resource(tmp_path: Path) -> None:
+    class TrackingAdapter(ResourceAdapter):
+        provider = "fake"
+        resource_type = "superseded"
+        inspected = asyncio.Event()
+        closed: ClassVar[list[str]] = []
+
+        def __init__(self, context: AdapterContext) -> None:
+            super().__init__(context)
+            self.external_id = "uninspected"
+
+        async def inspect(
+            self, resource: dict[str, Any], cursor: dict[str, Any]
+        ) -> ResourceObservation:
+            self.external_id = str(resource["external_id"])
+            self.inspected.set()
+            return ResourceObservation(status=ResourceStatus.RUNNING)
+
+        async def close(self) -> None:
+            self.closed.append(self.external_id)
+
     store = build_store(tmp_path)
     manager = ResourceManager(
         store=store,
@@ -627,21 +862,28 @@ async def test_logical_key_supersedes_changed_provider_resource(tmp_path: Path) 
         working_dir=tmp_path,
         aws_settings=AwsSettings(),
     )
-    manager.register_adapter(FakeStoppableAdapter)
+    manager.register_adapter(TrackingAdapter)
     first = await manager.register(
         ResourceEvent(
             resource=ResourceSpec(
-                provider="fake", type="job", id="job-attempt-1", logical_key="build"
+                provider="fake",
+                type="superseded",
+                id="job-attempt-1",
+                logical_key="build",
             )
         ),
         cell_index=0,
         attempt=1,
         kernel_epoch=1,
     )
+    await asyncio.wait_for(TrackingAdapter.inspected.wait(), timeout=1)
     second = await manager.register(
         ResourceEvent(
             resource=ResourceSpec(
-                provider="fake", type="job", id="job-attempt-2", logical_key="build"
+                provider="fake",
+                type="superseded",
+                id="job-attempt-2",
+                logical_key="build",
             )
         ),
         cell_index=0,
@@ -655,6 +897,9 @@ async def test_logical_key_supersedes_changed_provider_resource(tmp_path: Path) 
     assert resources[second]["external_id"] == "job-attempt-2"
     assert resources[second]["attempt"] == 2
     assert resources[second]["kernel_epoch"] == 2
+    assert first not in manager._monitor_tasks  # noqa: SLF001
+    assert first not in manager._adapters  # noqa: SLF001
+    assert TrackingAdapter.closed == ["job-attempt-1"]
     await manager.shutdown()
     store.close()
 
@@ -1224,6 +1469,121 @@ async def test_blocking_monitor_fails_after_configured_error_limit(
     assert any(
         event["type"] == "resource.monitor_failed"
         for event in store.recent_events("run")
+    )
+    await manager.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_long_monitor_diagnostic_at_minimum_cap_preserves_retry_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class NoisyFailingAdapter(ResourceAdapter):
+        provider = "fake"
+        resource_type = "noisy_failure"
+        supports_blocking = True
+        calls = 0
+
+        async def inspect(
+            self, resource: dict[str, Any], cursor: dict[str, Any]
+        ) -> ResourceObservation:
+            self.__class__.calls += 1
+            raise RuntimeError("provider unavailable: " + ("x" * 4_000))
+
+    store = build_store(tmp_path, max_event_payload_bytes=1_024)
+    bus = EventBus(store, "run")
+    original_publish = bus.publish
+    rejected_first_diagnostic = False
+
+    async def reject_first_monitor_diagnostic(
+        event_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        nonlocal rejected_first_diagnostic
+        if event_type == "resource.monitor_error" and not rejected_first_diagnostic:
+            rejected_first_diagnostic = True
+            raise OSError("injected diagnostic persistence failure")
+        return await original_publish(event_type, payload)
+
+    monkeypatch.setattr(bus, "publish", reject_first_monitor_diagnostic)
+    manager = ResourceManager(
+        store=store,
+        bus=bus,
+        run_id="run",
+        working_dir=tmp_path,
+        aws_settings=AwsSettings(
+            poll_interval_seconds=0.001,
+            final_log_drain_seconds=0,
+        ),
+    )
+    manager.register_adapter(NoisyFailingAdapter)
+    internal_id = await manager.register(
+        ResourceEvent(
+            resource=ResourceSpec(provider="fake", type="noisy_failure", id="broken"),
+            lifecycle=ResourceLifecycle(
+                blocking=True,
+                poll_interval_seconds=0.001,
+                max_consecutive_monitor_errors=2,
+            ),
+        ),
+        cell_index=None,
+        attempt=None,
+        kernel_epoch=None,
+    )
+
+    for _ in range(100):
+        resource = store.get_resource(internal_id)
+        if resource and resource["terminal"]:
+            break
+        await asyncio.sleep(0.005)
+
+    resource = store.get_resource(internal_id)
+    assert rejected_first_diagnostic is True
+    assert NoisyFailingAdapter.calls == 2
+    assert resource is not None and resource["status"] == "failed"
+    assert resource["terminal"] is True
+    events = store.recent_events("run")
+    monitor_errors = [
+        event for event in events if event["type"] == "resource.monitor_error"
+    ]
+    assert len(monitor_errors) == 1
+    assert monitor_errors[0]["payload"]["consecutive_errors"] == 2
+    assert monitor_errors[0]["payload"]["error"].endswith("…")
+    assert any(event["type"] == "resource.monitor_failed" for event in events)
+    assert not any(event["type"] == "resource.monitor_task_failed" for event in events)
+    await manager.shutdown()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_monitor_error_backoff_never_accelerates_long_base_interval(
+    tmp_path: Path,
+) -> None:
+    store = build_store(tmp_path)
+    manager = ResourceManager(
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+        working_dir=tmp_path,
+        aws_settings=AwsSettings(poll_interval_seconds=300),
+    )
+
+    assert (
+        manager._poll_interval(  # noqa: SLF001
+            {"lifecycle": {"poll_interval_seconds": 300}}, 1
+        )
+        == 300
+    )
+    assert (
+        manager._poll_interval(  # noqa: SLF001
+            {"lifecycle": {"poll_interval_seconds": 15}}, 1
+        )
+        == 30
+    )
+    assert (
+        manager._poll_interval(  # noqa: SLF001
+            {"lifecycle": {"poll_interval_seconds": 15}}, 2
+        )
+        == 60
     )
     await manager.shutdown()
     store.close()

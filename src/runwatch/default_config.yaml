@@ -68,6 +68,8 @@ notifications:
   # Encoded webhook payload ceiling after presentation sanitization.
   max_payload_bytes: 16384
   max_delivery_attempts: 4
+  # Unexpected routing failures are dead-lettered after this many attempts.
+  max_routing_attempts: 4
   retry_initial_seconds: 1.0
   retry_max_seconds: 60.0
 

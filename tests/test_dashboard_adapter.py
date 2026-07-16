@@ -136,3 +136,35 @@ async def test_dashboard_adapter_degrades_cleanly_when_target_disappears(
     assert observation.metrics["reachable"] is False
     assert observation.metrics["healthy"] is False
     assert "unavailable" in (observation.message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_close_cleans_owned_context_after_client_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_order: list[str] = []
+
+    class FailingClient:
+        async def aclose(self) -> None:
+            close_order.append("client")
+            raise RuntimeError("client close failed")
+
+    monitor = DashboardAdapter(
+        aws=None,
+        aws_settings=AwsSettings(),
+        working_dir=tmp_path,
+    )
+    service = object()
+    monitor.context.service(
+        "test.owned",
+        lambda: service,
+        close=lambda _service: close_order.append("context"),
+    )
+    monkeypatch.setattr(monitor, "_client", FailingClient())
+
+    with pytest.raises(RuntimeError, match="client close failed"):
+        await monitor.close()
+    with pytest.raises(RuntimeError, match="client close failed"):
+        await monitor.close()
+
+    assert close_order == ["client", "context", "client"]

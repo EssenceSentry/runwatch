@@ -35,7 +35,9 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
 - Webhook and `ntfy` notifications backed by durable event replay and a
   per-destination retry outbox. Delivery is at least once; retries carry stable
   `Idempotency-Key` and `X-Runwatch-Intent-ID` headers so receivers can deduplicate a
-  request accepted immediately before a Runwatch crash.
+  request accepted immediately before a Runwatch crash. Unexpected event-routing
+  failures use bounded backoff and one durable dead-letter record instead of pinning
+  event retention indefinitely.
 - Versioned notification presentations exclude resolved configuration and raw
   operational payloads. Response bodies are not read, redirects are not followed,
   periodic reminders use one rolling intent, and network plain HTTP requires an

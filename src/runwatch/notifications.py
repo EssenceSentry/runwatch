@@ -34,6 +34,13 @@ class NotificationDrainResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _RoutingOutcome:
+    consumed: bool
+    cursor_advanced: bool = False
+    retry_delay_seconds: float = 0.0
+
+
 class NotificationManager:
     """Persist and deliver webhook/ntfy notifications without blocking run control."""
 
@@ -53,6 +60,7 @@ class NotificationManager:
         self._periodic_task: asyncio.Task[None] | None = None
         self._delivery_task: asyncio.Task[None] | None = None
         self._delivery_wake = asyncio.Event()
+        self._reported_rejection_sequence: int | None = None
         self._client = httpx.AsyncClient(
             timeout=settings.request_timeout_seconds, follow_redirects=False
         )
@@ -82,7 +90,7 @@ class NotificationManager:
             return
         self._recover_interrupted_deliveries()
         for notification in self._presenter.reconcile_state():
-            await self.send(notification)
+            await self.send(notification, rearm_failed=False)
         self._delivery_task = asyncio.create_task(
             self._deliver(), name=f"notification-delivery:{self.run_id}"
         )
@@ -200,6 +208,8 @@ class NotificationManager:
     async def send(
         self,
         notification: PresentedNotification,
+        *,
+        rearm_failed: bool = True,
     ) -> dict[str, Any] | None:
         """Durably enqueue a notification and wake the delivery worker.
 
@@ -235,6 +245,7 @@ class NotificationManager:
                 data=payload["data"],
                 dedup_key=notification.dedup_key,
                 destinations=destinations,
+                rearm_failed=rearm_failed,
             )
         self._delivery_wake.set()
         return intent
@@ -455,20 +466,25 @@ class NotificationManager:
             self.store.mark_notification_reported(intent["intent_id"], status)
 
     async def _listen(self) -> None:
+        consecutive_failures = 0
         async with self.bus.subscribe() as queue:
             while True:
                 try:
                     if await self._drain_persisted_events():
+                        consecutive_failures = 0
                         continue
+                    consecutive_failures = 0
                     await queue.get()
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    await self._publish_safely(
-                        "notification.listener_error",
-                        {"error": _error_payload(error)},
-                    )
-                    await asyncio.sleep(0.25)
+                    consecutive_failures += 1
+                    if consecutive_failures == 1:
+                        await self._publish_safely(
+                            "notification.listener_error",
+                            {"error": _error_payload(error)},
+                        )
+                    await asyncio.sleep(self._routing_retry_delay(consecutive_failures))
 
     async def _drain_persisted_events(self) -> bool:
         cursor, repaired = self.store.normalize_notification_event_cursor(self.run_id)
@@ -482,23 +498,50 @@ class NotificationManager:
             )
         events = self.store.events_after(self.run_id, cursor, limit=256)
         for event in events:
-            if not await self._consume_event(event):
-                await asyncio.sleep(0.25)
+            sequence = int(event["seq"])
+            outcome = await self._consume_event(event)
+            if not outcome.consumed:
+                await asyncio.sleep(outcome.retry_delay_seconds)
                 return True
-            self.store.advance_notification_event_cursor(self.run_id, int(event["seq"]))
+            if not outcome.cursor_advanced:
+                self.store.advance_notification_event_cursor(self.run_id, sequence)
+            if self._reported_rejection_sequence == sequence:
+                self._reported_rejection_sequence = None
         return bool(events)
 
-    async def _consume_event(self, event: dict[str, Any]) -> bool:
+    async def _consume_event(self, event: dict[str, Any]) -> _RoutingOutcome:
         try:
             await self._handle_event(event)
         except asyncio.CancelledError:
             raise
         except (IndexError, KeyError, TypeError, ValueError) as error:
-            await self._publish_event_error("notification.event_rejected", event, error)
+            sequence = int(event["seq"])
+            if self._reported_rejection_sequence != sequence:
+                await self._publish_event_error(
+                    "notification.event_rejected", event, error
+                )
+                self._reported_rejection_sequence = sequence
         except Exception as error:
-            await self._publish_event_error("notification.worker_error", event, error)
-            return False
-        return True
+            failure = self.store.record_notification_routing_failure(
+                self.run_id,
+                int(event["seq"]),
+                str(event.get("type", "<missing>")),
+                type(error).__name__,
+                self.settings.max_routing_attempts,
+            )
+            persisted_event = failure.get("event")
+            if isinstance(persisted_event, dict):
+                self.bus.fan_out_persisted(cast(dict[str, Any], persisted_event))
+            attempt = int(failure["attempt"])
+            if attempt == 0:
+                return _RoutingOutcome(consumed=True, cursor_advanced=True)
+            if bool(failure["dead_lettered"]):
+                return _RoutingOutcome(consumed=True, cursor_advanced=True)
+            return _RoutingOutcome(
+                consumed=False,
+                retry_delay_seconds=self._routing_retry_delay(attempt),
+            )
+        return _RoutingOutcome(consumed=True)
 
     async def _publish_event_error(
         self,
@@ -518,7 +561,13 @@ class NotificationManager:
     async def _handle_event(self, event: dict[str, Any]) -> None:
         notification = self._presenter.from_event(event)
         if notification is not None:
-            await self.send(notification)
+            await self.send(notification, rearm_failed=False)
+
+    def _routing_retry_delay(self, attempt: int) -> float:
+        return min(
+            self.settings.retry_initial_seconds * (2 ** min(max(attempt - 1, 0), 20)),
+            self.settings.retry_max_seconds,
+        )
 
     async def _periodic(self) -> None:
         assert self.settings.periodic_seconds is not None

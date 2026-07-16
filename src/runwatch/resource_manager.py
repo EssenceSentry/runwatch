@@ -5,7 +5,7 @@ import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ._compat import timeout
 from .adapters import AdapterRegistry, default_adapter_registry
@@ -23,7 +23,7 @@ from .resources import (
     AwsClientProvider,
     ResourceAdapter,
 )
-from .storage import RunStore
+from .storage import RunStore, json_dumps
 
 if TYPE_CHECKING:
     from .dashboard_links import DashboardLinkManager
@@ -35,6 +35,43 @@ class ResourceStopRejected(RuntimeError):
 
 class StaleResourceAction(ResourceStopRejected):
     """A stop request whose confirmed resource version is no longer current."""
+
+
+_DIAGNOSTIC_IDENTIFIER_JSON_BYTES = 128
+_DIAGNOSTIC_NAME_JSON_BYTES = 96
+_DIAGNOSTIC_ERROR_JSON_BYTES = 384
+_RESOURCE_MESSAGE_JSON_BYTES = 512
+
+
+def _bounded_json_text(value: str, max_bytes: int) -> str:
+    if len(json_dumps(value).encode("utf-8")) <= max_bytes:
+        return value
+    suffix = "…"
+    low = 0
+    high = len(value)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = value[:middle] + suffix
+        if len(json_dumps(candidate).encode("utf-8")) <= max_bytes:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _exception_parts(error: Exception) -> tuple[str, str]:
+    error_type = _bounded_json_text(type(error).__name__, _DIAGNOSTIC_NAME_JSON_BYTES)
+    try:
+        detail = str(error)
+    except Exception:
+        detail = "<error detail unavailable>"
+    return error_type, _bounded_json_text(detail, _DIAGNOSTIC_ERROR_JSON_BYTES)
+
+
+def _resource_message(value: str) -> str:
+    return _bounded_json_text(value, _RESOURCE_MESSAGE_JSON_BYTES)
 
 
 @dataclass
@@ -74,7 +111,11 @@ class ResourceManager:
         self._stop_locks: dict[str, asyncio.Lock] = {}
         self._stop_dispositions: dict[str, ResourceDisposition] = {}
         self._dashboard_links: DashboardLinkManager | None = None
+        self._retirement_failures: list[Exception] = []
         self._closing = False
+        self._shutdown_complete = False
+        self._shutdown_error: RuntimeError | None = None
+        self._shutdown_lock = asyncio.Lock()
 
     def attach_dashboard_links(self, manager: DashboardLinkManager) -> None:
         """Attach the runtime that exposes registered localhost dashboards."""
@@ -114,13 +155,20 @@ class ResourceManager:
         try:
             adapter_type = self._adapter_registry.validate(event)
         except Exception as error:
-            await self.bus.publish(
+            _, error_detail = _exception_parts(error)
+            await self._publish_diagnostic_safely(
                 "resource.rejected",
                 {
-                    "event_id": event.event_id,
-                    "provider": event.resource.provider,
-                    "resource_type": event.resource.type,
-                    "error": str(error),
+                    "event_id": _bounded_json_text(
+                        event.event_id, _DIAGNOSTIC_IDENTIFIER_JSON_BYTES
+                    ),
+                    "provider": _bounded_json_text(
+                        event.resource.provider, _DIAGNOSTIC_NAME_JSON_BYTES
+                    ),
+                    "resource_type": _bounded_json_text(
+                        event.resource.type, _DIAGNOSTIC_NAME_JSON_BYTES
+                    ),
+                    "error": error_detail,
                 },
             )
             raise
@@ -134,6 +182,15 @@ class ResourceManager:
             supports_stop=supports_stop,
         )
         self.bus.fan_out_persisted(persisted_event)
+        payload_value: object = persisted_event.get("payload")
+        payload = (
+            cast(dict[str, object], payload_value)
+            if isinstance(payload_value, dict)
+            else {}
+        )
+        superseded_internal_id = payload.get("superseded_internal_id")
+        if isinstance(superseded_internal_id, str):
+            await self._cancel_and_retire_resource(superseded_internal_id)
         if not created:
             if self._dashboard_links is not None:
                 await self._dashboard_links.reconcile(
@@ -171,19 +228,81 @@ class ResourceManager:
             self._monitor(internal_id), name=f"resource-monitor:{internal_id}"
         )
 
+    async def _cancel_and_retire_resource(self, internal_id: str) -> None:
+        task = self._monitor_tasks.get(internal_id)
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._retire_resource_if_settled(internal_id)
+
+    async def _retire_resource_if_settled(self, internal_id: str) -> None:
+        if self._resource_retirement_is_blocked(internal_id):
+            return
+        self._monitor_tasks.pop(internal_id, None)
+        await self._close_retired_adapter(internal_id)
+        self._prune_retired_resource_state(internal_id)
+
+    def _resource_retirement_is_blocked(self, internal_id: str) -> bool:
+        if self._closing:
+            return True
+        resource = self.store.get_resource(internal_id)
+        if resource is not None and not (
+            resource["monitor_closed"]
+            or resource["disposition"] != ResourceDisposition.ACTIVE.value
+        ):
+            return True
+        stop_lock = self._stop_locks.get(internal_id)
+        if stop_lock is not None and stop_lock.locked():
+            return True
+        task = self._monitor_tasks.get(internal_id)
+        current = asyncio.current_task()
+        return task is not None and task is not current and not task.done()
+
+    async def _close_retired_adapter(self, internal_id: str) -> None:
+        adapter = self._adapters.pop(internal_id, None)
+        if adapter is None:
+            return
+        try:
+            await adapter.close()
+        except Exception as error:
+            self._retirement_failures.append(error)
+            error_type, detail = _exception_parts(error)
+            await self._publish_diagnostic_safely(
+                "resource.adapter_close_error",
+                {
+                    "internal_id": internal_id,
+                    "error_type": error_type,
+                    "error": detail,
+                },
+            )
+
+    def _prune_retired_resource_state(self, internal_id: str) -> None:
+        inspect_lock = self._inspect_locks.get(internal_id)
+        if inspect_lock is None or not inspect_lock.locked():
+            self._inspect_locks.pop(internal_id, None)
+        finalize_lock = self._finalize_locks.get(internal_id)
+        if finalize_lock is None or not finalize_lock.locked():
+            self._finalize_locks.pop(internal_id, None)
+        self._stop_locks.pop(internal_id, None)
+        self._stop_dispositions.pop(internal_id, None)
+
     async def _record_unsupported(
         self, internal_id: str, resource: dict[str, Any]
     ) -> None:
+        message = _resource_message(
+            f"No adapter for {resource['provider']}.{resource['resource_type']}"
+        )
         observation = ResourceObservation(
             status=ResourceStatus.UNKNOWN,
             terminal=True,
-            message=f"No adapter for {resource['provider']}.{resource['resource_type']}",
+            message=message,
         )
         observed = self.store.update_resource_observation(
             self.run_id, internal_id, observation
         )
         self.bus.fan_out_persisted(observed)
-        await self.bus.publish(
+        await self._publish_diagnostic_safely(
             "resource.unsupported",
             {"internal_id": internal_id, "message": observation.message},
         )
@@ -225,6 +344,7 @@ class ResourceManager:
         error: Exception,
         consecutive_errors: int,
     ) -> None:
+        error_type, detail = _exception_parts(error)
         current = self.store.get_resource(internal_id)
         stop_intent_preserved = bool(
             current and current["status"] == ResourceStatus.STOPPING.value
@@ -233,14 +353,14 @@ class ResourceManager:
             self.store.set_resource_status(
                 internal_id,
                 ResourceStatus.MONITOR_ERROR,
-                message=f"{type(error).__name__}: {error}",
+                message=_resource_message(f"{error_type}: {detail}"),
             )
-        await self.bus.publish(
+        await self._publish_diagnostic_safely(
             "resource.monitor_error",
             {
                 "internal_id": internal_id,
-                "error_type": type(error).__name__,
-                "error": str(error),
+                "error_type": error_type,
+                "error": detail,
                 "consecutive_errors": consecutive_errors,
                 "stop_intent_preserved": stop_intent_preserved,
             },
@@ -263,9 +383,10 @@ class ResourceManager:
         current = self.store.get_resource(internal_id)
         if current and current["status"] == ResourceStatus.STOPPING.value:
             return False
-        message = (
+        error_type, detail = _exception_parts(error)
+        message = _resource_message(
             f"Resource monitoring failed {consecutive_errors} consecutive times; "
-            f"last error: {type(error).__name__}: {error}"
+            f"last error: {error_type}: {detail}"
         )
         observation = ResourceObservation(
             status=ResourceStatus.FAILED,
@@ -280,13 +401,13 @@ class ResourceManager:
         cursor.update(self.store.resource_cursor(internal_id))
         self._publish_observation(observed)
         self.store.mark_resource_monitor_closed(internal_id)
-        await self.bus.publish(
+        await self._publish_diagnostic_safely(
             "resource.monitor_failed",
             {
                 "internal_id": internal_id,
                 "consecutive_errors": consecutive_errors,
-                "error_type": type(error).__name__,
-                "error": str(error),
+                "error_type": error_type,
+                "error": detail,
             },
         )
         return True
@@ -297,7 +418,10 @@ class ResourceManager:
             or self.aws_settings.poll_interval_seconds
         )
         if error_count:
-            return min(60.0, interval * (2 ** min(error_count, 4)))
+            return max(
+                interval,
+                min(60.0, interval * (2 ** min(error_count, 4))),
+            )
         return interval
 
     def _active_resource(self, internal_id: str) -> dict[str, Any] | None:
@@ -310,11 +434,8 @@ class ResourceManager:
 
     @staticmethod
     def _monitor_failure_detail(error: Exception) -> str:
-        try:
-            detail = str(error)
-        except Exception:
-            detail = "<error detail unavailable>"
-        return f"{type(error).__name__}: {detail}"[:1_024]
+        error_type, detail = _exception_parts(error)
+        return _resource_message(f"{error_type}: {detail}")
 
     async def _terminalize_unexpected_monitor_failure(
         self, internal_id: str, error: Exception
@@ -331,15 +452,18 @@ class ResourceManager:
                 "was still pending"
             ) from error
 
-        detail = self._monitor_failure_detail(error)
+        error_type, detail = _exception_parts(error)
+        message = _resource_message(
+            f"Resource monitor stopped unexpectedly: {error_type}: {detail}"
+        )
         observed = self.store.update_resource_observation(
             self.run_id,
             internal_id,
             ResourceObservation(
                 status=ResourceStatus.FAILED,
                 terminal=True,
-                message=f"Resource monitor stopped unexpectedly: {detail}",
-                metrics={"monitor_task_error": type(error).__name__},
+                message=message,
+                metrics={"monitor_task_error": error_type},
             ),
         )
         self.store.mark_resource_monitor_closed(internal_id)
@@ -350,11 +474,11 @@ class ResourceManager:
             # fan-out must not turn a terminal resource back into an endless wait.
             pass
         try:
-            await self.bus.publish(
+            await self._publish_diagnostic_safely(
                 "resource.monitor_task_failed",
                 {
                     "internal_id": internal_id,
-                    "error_type": type(error).__name__,
+                    "error_type": error_type,
                     "error": detail,
                 },
             )
@@ -384,6 +508,8 @@ class ResourceManager:
         except Exception as error:
             await self._terminalize_unexpected_monitor_failure(internal_id, error)
             await self.finalize_terminal_resource(internal_id)
+        finally:
+            await self._retire_resource_if_settled(internal_id)
 
     async def _monitor_cycle(
         self,
@@ -535,20 +661,20 @@ class ResourceManager:
                         warning = self._monitor_failure_detail(error)
             self.store.mark_resource_monitor_closed(internal_id)
             if finalization_payload is not None:
-                await self._publish_finalization_diagnostic_safely(
+                await self._publish_diagnostic_safely(
                     "resource.finalized", finalization_payload
                 )
             if warning is not None:
-                await self._publish_finalization_diagnostic_safely(
+                await self._publish_diagnostic_safely(
                     "resource.finalization_warning",
                     {"internal_id": internal_id, "error": warning},
                 )
-            await self._publish_finalization_diagnostic_safely(
+            await self._publish_diagnostic_safely(
                 "resource.monitor_closed",
                 {"internal_id": internal_id, "reason": "terminal"},
             )
 
-    async def _publish_finalization_diagnostic_safely(
+    async def _publish_diagnostic_safely(
         self, event_type: str, payload: dict[str, Any]
     ) -> None:
         try:
@@ -556,8 +682,8 @@ class ResourceManager:
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Resource state and resource.observed are authoritative. Optional
-            # diagnostics must not reopen a completed finalization transaction.
+            # Authoritative state and control decisions already succeeded. Optional
+            # diagnostics must not rewrite their retry or finalization flow.
             return
 
     async def finalize_terminal_resource(self, internal_id: str) -> dict[str, Any]:
@@ -578,7 +704,7 @@ class ResourceManager:
                 if not current["terminal"] or current["monitor_closed"]:
                     return current
                 self.store.mark_resource_monitor_closed(internal_id)
-            await self._publish_finalization_diagnostic_safely(
+            await self._publish_diagnostic_safely(
                 "resource.finalization_warning",
                 {
                     "internal_id": internal_id,
@@ -588,7 +714,7 @@ class ResourceManager:
                     ),
                 },
             )
-            await self._publish_finalization_diagnostic_safely(
+            await self._publish_diagnostic_safely(
                 "resource.monitor_closed",
                 {"internal_id": internal_id, "reason": "terminal"},
             )
@@ -611,47 +737,50 @@ class ResourceManager:
         allow_stopping: bool = False,
     ) -> dict[str, Any]:
         lock = self._stop_locks.setdefault(internal_id, asyncio.Lock())
-        async with lock:
-            resource = self.validate_stop_eligibility(
-                internal_id,
-                expected_version=expected_version,
-                allow_stopping=allow_stopping,
-            )
-            adapter = self._adapter_for(resource)
-            assert adapter is not None and adapter.supports_stop
-            confirmation = _StopConfirmation()
-            deadline = timeout(self.aws_settings.stop_timeout_seconds)
-            self._stop_dispositions[internal_id] = disposition
-            try:
-                async with deadline:
-                    await self._request_resource_stop(
-                        internal_id,
-                        resource,
-                        adapter,
-                        on_stop_accepted,
-                        disposition,
-                        confirmation,
-                    )
-                    return await self._wait_for_resource_stop(
-                        internal_id,
-                        adapter,
-                        disposition,
-                        confirmation,
-                    )
-            except TimeoutError as error:
-                if not deadline.expired:
-                    raise
-                await self._record_stop_timeout(
+        try:
+            async with lock:
+                resource = self.validate_stop_eligibility(
                     internal_id,
-                    previous_status=str(resource["status"]),
-                    confirmation=confirmation,
+                    expected_version=expected_version,
+                    allow_stopping=allow_stopping,
                 )
-                detail = self._stop_timeout_detail(confirmation.last_error)
-                raise TimeoutError(
-                    f"Timed out waiting for resource {internal_id} to stop{detail}"
-                ) from (confirmation.last_error or error)
-            finally:
-                self._stop_dispositions.pop(internal_id, None)
+                adapter = self._adapter_for(resource)
+                assert adapter is not None and adapter.supports_stop
+                confirmation = _StopConfirmation()
+                deadline = timeout(self.aws_settings.stop_timeout_seconds)
+                self._stop_dispositions[internal_id] = disposition
+                try:
+                    async with deadline:
+                        await self._request_resource_stop(
+                            internal_id,
+                            resource,
+                            adapter,
+                            on_stop_accepted,
+                            disposition,
+                            confirmation,
+                        )
+                        return await self._wait_for_resource_stop(
+                            internal_id,
+                            adapter,
+                            disposition,
+                            confirmation,
+                        )
+                except TimeoutError as error:
+                    if not deadline.expired:
+                        raise
+                    await self._record_stop_timeout(
+                        internal_id,
+                        previous_status=str(resource["status"]),
+                        confirmation=confirmation,
+                    )
+                    detail = self._stop_timeout_detail(confirmation.last_error)
+                    raise TimeoutError(
+                        f"Timed out waiting for resource {internal_id} to stop{detail}"
+                    ) from (confirmation.last_error or error)
+                finally:
+                    self._stop_dispositions.pop(internal_id, None)
+        finally:
+            await self._retire_resource_if_settled(internal_id)
 
     async def _request_resource_stop(
         self,
@@ -681,10 +810,13 @@ class ResourceManager:
             confirmation.provider_acknowledged = True
         except Exception as error:
             if not already_stopping:
+                error_type, detail = _exception_parts(error)
                 self.store.set_resource_status(
                     internal_id,
                     ResourceStatus(resource["status"]),
-                    message=f"Stop request failed: {type(error).__name__}: {error}",
+                    message=_resource_message(
+                        f"Stop request failed: {error_type}: {detail}"
+                    ),
                 )
             raise
         if stop_event is not None:
@@ -753,13 +885,15 @@ class ResourceManager:
             if confirmation.provider_acknowledged
             else "before provider acknowledgement; provider outcome is unknown"
         )
-        message = f"Stop operation timed out {phase}; retry is allowed{detail}"
+        message = _resource_message(
+            f"Stop operation timed out {phase}; retry is allowed{detail}"
+        )
         self.store.set_resource_status(
             internal_id,
             retry_status,
             message=message,
         )
-        await self.bus.publish(
+        await self._publish_diagnostic_safely(
             "resource.stop_timeout",
             {
                 "internal_id": internal_id,
@@ -777,7 +911,7 @@ class ResourceManager:
     ) -> dict[str, Any]:
         if resource["disposition"] != disposition.value:
             self.store.set_resource_disposition(internal_id, disposition)
-        await self.bus.publish(
+        await self._publish_diagnostic_safely(
             "resource.stop_confirmed",
             {"internal_id": internal_id, "status": resource["status"]},
         )
@@ -804,18 +938,19 @@ class ResourceManager:
             return observation.terminal
         except Exception as error:
             confirmation.last_error = error
-            message = (
-                f"Stop confirmation inspection failed: {type(error).__name__}: {error}"
+            error_type, detail = _exception_parts(error)
+            message = _resource_message(
+                f"Stop confirmation inspection failed: {error_type}: {detail}"
             )
             self.store.set_resource_status(
                 internal_id, ResourceStatus.STOPPING, message=message
             )
-            await self.bus.publish(
+            await self._publish_diagnostic_safely(
                 "resource.stop_inspection_error",
                 {
                     "internal_id": internal_id,
-                    "error_type": type(error).__name__,
-                    "error": str(error),
+                    "error_type": error_type,
+                    "error": detail,
                 },
             )
             return False
@@ -824,7 +959,8 @@ class ResourceManager:
     def _stop_timeout_detail(error: Exception | None) -> str:
         if error is None:
             return ""
-        return f"; last inspection error: {type(error).__name__}: {error}"
+        error_type, detail = _exception_parts(error)
+        return _resource_message(f"; last inspection error: {error_type}: {detail}")
 
     def validate_stop_eligibility(
         self,
@@ -883,9 +1019,14 @@ class ResourceManager:
                     )
                     stopped.append(resource["internal_id"])
                 except Exception as error:
-                    await self.bus.publish(
+                    error_type, detail = _exception_parts(error)
+                    await self._publish_diagnostic_safely(
                         "resource.cancel_stop_failed",
-                        {"internal_id": resource["internal_id"], "error": str(error)},
+                        {
+                            "internal_id": resource["internal_id"],
+                            "error_type": error_type,
+                            "error": detail,
+                        },
                     )
         return stopped
 
@@ -959,31 +1100,73 @@ class ResourceManager:
         resources = {
             item["internal_id"]: item for item in self.store.list_resources(self.run_id)
         }
-        cancelled: list[asyncio.Task[None]] = []
+        cancelled: list[tuple[str, asyncio.Task[None]]] = []
         for internal_id, task in self._monitor_tasks.items():
             resource = resources.get(internal_id)
             if resource and not resource.get("lifecycle", {}).get("blocking", False):
                 if not task.done():
                     task.cancel()
-                    cancelled.append(task)
+                    cancelled.append((internal_id, task))
                 self.store.mark_resource_monitor_closed(internal_id)
         if cancelled:
-            await asyncio.gather(*cancelled, return_exceptions=True)
+            await asyncio.gather(
+                *(task for _internal_id, task in cancelled),
+                return_exceptions=True,
+            )
+        for internal_id, resource in resources.items():
+            if not resource.get("lifecycle", {}).get("blocking", False):
+                await self._retire_resource_if_settled(internal_id)
 
     async def shutdown(self) -> None:
-        self._closing = True
-        for task in self._monitor_tasks.values():
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*self._monitor_tasks.values(), return_exceptions=True)
-        cleanup: list[Awaitable[None]] = [
-            adapter.close() for adapter in self._adapters.values()
-        ]
-        if self._dashboard_links is not None:
-            cleanup.append(self._dashboard_links.close())
-        results = await asyncio.gather(*cleanup, return_exceptions=True)
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
-            raise RuntimeError(
-                "Resource cleanup failed: " + "; ".join(str(item) for item in failures)
-            ) from failures[0]
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                if self._shutdown_error is not None:
+                    raise self._shutdown_error
+                return
+            self._closing = True
+            tasks = list(self._monitor_tasks.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._monitor_tasks.clear()
+
+            adapters = list(self._adapters.values())
+            self._adapters.clear()
+            adapter_results = await asyncio.gather(
+                *(adapter.close() for adapter in adapters),
+                return_exceptions=True,
+            )
+            failures: list[BaseException] = [
+                *self._retirement_failures,
+                *(
+                    result
+                    for result in adapter_results
+                    if isinstance(result, BaseException)
+                ),
+            ]
+            self._retirement_failures.clear()
+
+            if self._dashboard_links is not None:
+                dashboard_result = await asyncio.gather(
+                    self._dashboard_links.close(), return_exceptions=True
+                )
+                failures.extend(
+                    result
+                    for result in dashboard_result
+                    if isinstance(result, BaseException)
+                )
+            service_result = await asyncio.gather(
+                self._adapter_context.aclose(), return_exceptions=True
+            )
+            failures.extend(
+                result for result in service_result if isinstance(result, BaseException)
+            )
+
+            self._shutdown_complete = True
+            if failures:
+                self._shutdown_error = RuntimeError(
+                    "Resource cleanup failed: "
+                    + "; ".join(str(item) for item in failures)
+                )
+                raise self._shutdown_error from failures[0]

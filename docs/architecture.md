@@ -92,6 +92,12 @@ exponential backoff, and an attempt interrupted by process shutdown returns to a
 recoverable state. Worker failures are collected and journaled during close rather than
 being discarded.
 
+Event-to-intent routing tracks unexpected failures durably by source event sequence.
+It retries with bounded exponential backoff, then atomically advances the routing
+cursor and appends one small `notification.event_dead_lettered` event. Ordinary replay
+does not rearm an outbox item that already exhausted its delivery budget; an explicit
+send may rearm it.
+
 The notification outbox stores a versioned presentation rather than an internal event
 or snapshot. Event-specific presenters allowlist small run, cell, and resource
 summaries before enqueueing. Delivery streams only response headers, does not follow
@@ -157,6 +163,9 @@ delivery diagnostics are truncated to valid UTF-8 within their own ceiling. Clou
 metric cards keep the full current lookback, while history
 persists only new or revised timestamp samples rather than duplicating the lookback on
 every poll. History is evenly downsampled across the retained range for mobile charts.
+The general `resource.observed` event contains only a bounded status projection and
+counts; complete metrics, raw provider data, and bounded log tails remain in the
+authoritative resource tables.
 The general event journal is likewise bounded by count and bytes; high-volume cell
 output uses coalesced transient refresh events instead of growing SQLite without limit.
 Aggregate byte settings are retention targets, while the per-record settings are hard

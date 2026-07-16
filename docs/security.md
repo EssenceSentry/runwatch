@@ -50,6 +50,9 @@ multi-user service.
   explicit `notifications.allow_insecure_http` opt-in.
 - Periodic notifications use a single rolling durable intent and a lightweight state
   summary, so long-running jobs do not accumulate successful reminder history.
+- Unexpected event-routing failures use a durable bounded retry counter and one
+  allowlisted dead-letter event. Replay cannot repeatedly reset a destination that has
+  already exhausted its delivery attempts.
 - Offline `runwatch notifications rotate` uses manifest-first desired state and a
   same-topology transaction to replace credentials in every pending and terminal
   delivery row. Startup finishes an interrupted rotation before recovery workers can

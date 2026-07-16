@@ -7,7 +7,12 @@ import nbformat
 import pytest
 
 from runwatch.config import dump_default_config, load_config
-from runwatch.models import RunwatchConfig
+from runwatch.models import (
+    NotificationSettings,
+    ResourceObservation,
+    ResourceStatus,
+    RunwatchConfig,
+)
 from runwatch.resources import ResourceConfigurationError
 from runwatch.validation import validate_execution
 
@@ -128,6 +133,35 @@ def test_notification_config_requires_explicit_plain_http_for_network_hosts() ->
         }
     )
     assert config.notifications.allow_insecure_http
+
+
+@pytest.mark.parametrize("attempts", [0, 21])
+def test_notification_config_bounds_routing_attempts(attempts: int) -> None:
+    with pytest.raises(ValueError):
+        NotificationSettings(max_routing_attempts=attempts)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ResourceStatus.COMPLETED, ResourceStatus.FAILED, ResourceStatus.STOPPED],
+)
+def test_resource_observation_normalizes_terminal_statuses(
+    status: ResourceStatus,
+) -> None:
+    observation = ResourceObservation(status=status)
+
+    assert observation.terminal is True
+
+
+def test_resource_observation_rejects_nonterminal_status_marked_terminal() -> None:
+    with pytest.raises(ValueError, match="cannot be terminal"):
+        ResourceObservation(status=ResourceStatus.RUNNING, terminal=True)
+
+
+def test_resource_observation_allows_terminal_unknown_status() -> None:
+    observation = ResourceObservation(status=ResourceStatus.UNKNOWN, terminal=True)
+
+    assert observation.terminal is True
 
 
 def test_notification_config_bounds_periodic_interval_and_rejects_fragments() -> None:

@@ -44,10 +44,17 @@ class ResourceEventConflict(RuntimeError):
 
 _NOTIFICATION_EVENT_CURSOR_KEY = "_notification_event_cursor"
 _NOTIFICATION_ROUTING_REQUIRED_KEY = "_notification_routing_required"
+_NOTIFICATION_ROUTING_FAILURE_KEY = "_notification_routing_failure"
 _NOTIFICATION_EGRESS_SCHEMA_KEY = "_notification_egress_schema_version"
 _NOTIFICATION_EGRESS_SCHEMA_VERSION = 1
+_TERMINAL_EVENT_KEY = "_terminal_event"
 _RESOURCE_DOMAIN_EVENT_TEXT_MAX_BYTES = 64
 _RESOURCE_DOMAIN_EVENT_INDEX_LIMIT = 2_147_483_647
+_SQLITE_INTEGER_MAX = 9_223_372_036_854_775_807
+_RESOURCE_OBSERVATION_EVENT_ID_JSON_BYTES = 48
+_RESOURCE_OBSERVATION_EVENT_MESSAGE_JSON_BYTES = 32
+_NOTIFICATION_ROUTING_EVENT_TYPE_JSON_BYTES = 64
+_NOTIFICATION_ROUTING_ERROR_TYPE_JSON_BYTES = 64
 _RUN_MESSAGE_MAX_BYTES = 16_384
 _CELL_ERROR_NAME_MAX_BYTES = 256
 _CELL_ERROR_VALUE_MAX_BYTES = 16_384
@@ -398,6 +405,13 @@ _TERMINAL_EVENT_PROJECTORS: dict[str, _TerminalEventProjector] = {
     "run.succeeded": _project_succeeded_terminal_event,
     "run.cancelled": _project_cancelled_terminal_event,
     "run.external_timeout": _project_external_timeout_terminal_event,
+}
+_ALLOWED_TERMINAL_EVENTS: dict[RunStatus, frozenset[str]] = {
+    RunStatus.SUCCEEDED: frozenset({"run.succeeded"}),
+    RunStatus.CANCELLED: frozenset({"run.cancelled"}),
+    RunStatus.FAILED: frozenset(
+        {"run.runner_error", "run.failed_external", "run.external_timeout"}
+    ),
 }
 
 
@@ -899,9 +913,14 @@ class RunStore:
 
         if not status.terminal:
             raise ValueError("finish_run requires a terminal status")
+        allowed_events = _ALLOWED_TERMINAL_EVENTS.get(status, frozenset())
+        if event_type not in allowed_events:
+            raise ValueError(
+                f"Terminal status {status.value} cannot be committed with event "
+                f"{event_type!r}"
+            )
         now = utc_now().isoformat()
         message = _bounded_utf8_text(message, _RUN_MESSAGE_MAX_BYTES)
-        event_payload = self._terminal_event_payload(event_type, event_payload)
         fields = [
             "status = ?",
             "message = ?",
@@ -921,26 +940,68 @@ class RunStore:
                 values.append(value)
         terminal_values = tuple(item.value for item in RunStatus if item.terminal)
         terminal_placeholders = ", ".join("?" for _ in terminal_values)
-        values.extend([run_id, *terminal_values])
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT status, kernel_epoch, metadata_json FROM runs "
+                    "WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                current_status = RunStatus(row["status"])
+                if current_status.terminal:
+                    raise RuntimeError(
+                        f"Run {run_id} is already terminal with status "
+                        f"{current_status.value}"
+                    )
+                kernel_epoch = int(row["kernel_epoch"])
+                supplied_epoch = event_payload.get("kernel_epoch")
+                corrected_supplied_epoch = "kernel_epoch" in event_payload and (
+                    isinstance(supplied_epoch, bool)
+                    or not isinstance(supplied_epoch, int)
+                    or supplied_epoch != kernel_epoch
+                )
+                derived_payload = dict(event_payload)
+                derived_payload["kernel_epoch"] = kernel_epoch
+                projected_payload = self._terminal_event_payload(
+                    event_type, derived_payload
+                )
+                if corrected_supplied_epoch:
+                    projected_payload["projection_truncated"] = True
+                metadata_value = json_loads(row["metadata_json"], {})
+                if not isinstance(metadata_value, dict):
+                    raise CorruptRunState("Run metadata must be a JSON object")
+                metadata = cast(dict[str, Any], metadata_value)
+                metadata[_TERMINAL_EVENT_KEY] = {
+                    "type": event_type,
+                    "kernel_epoch": kernel_epoch,
+                }
+                terminal_fields = [*fields, "metadata_json = ?"]
+                terminal_values_list = [
+                    *values,
+                    json_dumps(metadata),
+                    run_id,
+                    *terminal_values,
+                ]
                 updated = self._connection.execute(
-                    f"UPDATE runs SET {', '.join(fields)} "
+                    f"UPDATE runs SET {', '.join(terminal_fields)} "
                     f"WHERE run_id = ? AND status NOT IN ({terminal_placeholders})",
-                    values,
+                    terminal_values_list,
                 )
                 if updated.rowcount != 1:
-                    row = self._connection.execute(
+                    changed = self._connection.execute(
                         "SELECT status FROM runs WHERE run_id = ?", (run_id,)
                     ).fetchone()
-                    if row is None:
+                    if changed is None:
                         raise KeyError(run_id)
                     raise RuntimeError(
-                        f"Run {run_id} is already terminal with status {row['status']}"
+                        f"Run {run_id} is already terminal with status "
+                        f"{changed['status']}"
                     )
                 event = self._append_event_uncommitted(
-                    run_id, event_type, event_payload, timestamp=now
+                    run_id, event_type, projected_payload, timestamp=now
                 )
                 self._connection.commit()
             except Exception:
@@ -959,6 +1020,75 @@ class RunStore:
             return payload
         kernel_epoch, kernel_epoch_truncated = _terminal_event_kernel_epoch(payload)
         return projector(payload, kernel_epoch, kernel_epoch_truncated)
+
+    def terminal_event_for_state(
+        self, run_id: str, status: RunStatus, kernel_epoch: int
+    ) -> dict[str, Any] | None:
+        """Return the terminal event matching one durable run state.
+
+        Current stores retain the terminal event identity in run metadata so event
+        retention cannot erase the failure reason. Legacy stores fall back to their
+        retained event journal.
+        """
+
+        if not status.terminal:
+            raise ValueError("terminal_event_for_state requires a terminal status")
+        if isinstance(kernel_epoch, bool) or kernel_epoch < 0:
+            raise ValueError("Terminal event kernel epoch must be nonnegative")
+        allowed_events = _ALLOWED_TERMINAL_EVENTS[status]
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            metadata_value = json_loads(row["metadata_json"], {})
+            if not isinstance(metadata_value, dict):
+                raise CorruptRunState("Run metadata must be a JSON object")
+            metadata = cast(dict[str, Any], metadata_value)
+            terminal_value = metadata.get(_TERMINAL_EVENT_KEY)
+            if isinstance(terminal_value, dict):
+                terminal = cast(dict[object, object], terminal_value)
+                event_type = terminal.get("type")
+                event_epoch = terminal.get("kernel_epoch")
+                if (
+                    isinstance(event_type, str)
+                    and event_type in allowed_events
+                    and isinstance(event_epoch, int)
+                    and not isinstance(event_epoch, bool)
+                    and event_epoch == kernel_epoch
+                ):
+                    return {
+                        "run_id": run_id,
+                        "type": event_type,
+                        "payload": {"kernel_epoch": kernel_epoch},
+                    }
+            placeholders = ", ".join("?" for _ in allowed_events)
+            rows = self._connection.execute(
+                f"SELECT * FROM events WHERE run_id = ? "
+                f"AND type IN ({placeholders}) ORDER BY seq DESC",
+                (run_id, *sorted(allowed_events)),
+            ).fetchall()
+        for event_row in rows:
+            payload_value = json_loads(event_row["payload_json"], {})
+            if not isinstance(payload_value, dict):
+                continue
+            payload = cast(dict[str, Any], payload_value)
+            event_epoch = payload.get("kernel_epoch")
+            if (
+                isinstance(event_epoch, bool)
+                or not isinstance(event_epoch, int)
+                or event_epoch != kernel_epoch
+            ):
+                continue
+            return {
+                "seq": int(event_row["seq"]),
+                "run_id": event_row["run_id"],
+                "timestamp": event_row["timestamp"],
+                "type": event_row["type"],
+                "payload": payload,
+            }
+        return None
 
     def mark_run_finalized(self, run_id: str, expected_status: RunStatus) -> None:
         """Record that the runner and supervisor post-run work returned normally."""
@@ -1638,7 +1768,7 @@ class RunStore:
         }
         bounded_text = {
             key: (
-                _bounded_utf8_text(value, _RESOURCE_DOMAIN_EVENT_TEXT_MAX_BYTES)
+                _bounded_json_text(value, _RESOURCE_DOMAIN_EVENT_TEXT_MAX_BYTES)
                 if value is not None
                 else None
             )
@@ -1842,14 +1972,7 @@ class RunStore:
                 event = self._append_event_uncommitted(
                     run_id,
                     "resource.observed",
-                    {
-                        "internal_id": internal_id,
-                        "status": observation.status.value,
-                        "terminal": observation.terminal,
-                        "message": observation.message,
-                        "metrics": observation.metrics,
-                        "new_log_lines": observation.log_lines[-30:],
-                    },
+                    self._resource_observation_event_payload(internal_id, observation),
                     timestamp=now,
                 )
                 self._connection.commit()
@@ -1857,6 +1980,45 @@ class RunStore:
                 self._connection.rollback()
                 raise
         return event
+
+    @staticmethod
+    def _resource_observation_event_payload(
+        internal_id: str, observation: ResourceObservation
+    ) -> dict[str, Any]:
+        raw_internal_id = str(internal_id)
+        bounded_internal_id = _bounded_json_text(
+            raw_internal_id, _RESOURCE_OBSERVATION_EVENT_ID_JSON_BYTES
+        )
+        raw_message = observation.message
+        bounded_message = (
+            None
+            if raw_message is None
+            else _bounded_json_text(
+                raw_message, _RESOURCE_OBSERVATION_EVENT_MESSAGE_JSON_BYTES
+            )
+        )
+        raw_metric_count = len(observation.metrics)
+        raw_log_line_count = len(observation.log_lines)
+        metric_count = min(raw_metric_count, _RESOURCE_DOMAIN_EVENT_INDEX_LIMIT)
+        new_log_line_count = min(raw_log_line_count, _RESOURCE_DOMAIN_EVENT_INDEX_LIMIT)
+        return {
+            "internal_id": bounded_internal_id,
+            "status": observation.status.value,
+            "terminal": observation.terminal,
+            "message": bounded_message,
+            "metric_count": metric_count,
+            "new_log_line_count": new_log_line_count,
+            "projection_truncated": (
+                bounded_internal_id != raw_internal_id
+                or bounded_message != raw_message
+                or bool(observation.metrics)
+                or bool(observation.log_lines)
+                or bool(observation.raw)
+                or observation.history_metrics is not None
+                or metric_count != raw_metric_count
+                or new_log_line_count != raw_log_line_count
+            ),
+        }
 
     def _resource_persistence_row(self, internal_id: str) -> sqlite3.Row | None:
         return self._connection.execute(
@@ -2660,6 +2822,7 @@ class RunStore:
                     self._connection.commit()
                     return False
                 metadata[_NOTIFICATION_EVENT_CURSOR_KEY] = sequence
+                metadata.pop(_NOTIFICATION_ROUTING_FAILURE_KEY, None)
                 self._update_run_metadata(run_id, metadata)
                 self._prune_events(run_id)
                 self._connection.commit()
@@ -2667,6 +2830,133 @@ class RunStore:
                 self._connection.rollback()
                 raise
         return True
+
+    def record_notification_routing_failure(
+        self,
+        run_id: str,
+        sequence: object,
+        source_event_type: str,
+        error_type: str,
+        max_attempts: int,
+    ) -> dict[str, Any]:
+        """Persist one bounded routing retry or atomically dead-letter its event."""
+
+        sequence = self._validated_notification_routing_sequence(sequence)
+        self._validate_notification_routing_max_attempts(max_attempts)
+        bounded_source_type = _bounded_json_text(
+            source_event_type, _NOTIFICATION_ROUTING_EVENT_TYPE_JSON_BYTES
+        )
+        bounded_error_type = _bounded_json_text(
+            error_type, _NOTIFICATION_ROUTING_ERROR_TYPE_JSON_BYTES
+        )
+        now = utc_now().isoformat()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown run {run_id}")
+                metadata, current = self._notification_metadata(row)
+                if sequence <= current:
+                    self._connection.commit()
+                    return {"attempt": 0, "dead_lettered": False, "event": None}
+                attempt = self._next_notification_routing_attempt(metadata, sequence)
+                if attempt < max_attempts:
+                    metadata[_NOTIFICATION_ROUTING_FAILURE_KEY] = {
+                        "event_seq": sequence,
+                        "source_event_type": bounded_source_type,
+                        "error_type": bounded_error_type,
+                        "attempt": attempt,
+                    }
+                    self._update_run_metadata(run_id, metadata)
+                    self._connection.commit()
+                    return {
+                        "attempt": attempt,
+                        "dead_lettered": False,
+                        "event": None,
+                    }
+                metadata[_NOTIFICATION_EVENT_CURSOR_KEY] = sequence
+                metadata.pop(_NOTIFICATION_ROUTING_FAILURE_KEY, None)
+                self._update_run_metadata(run_id, metadata)
+                event = self._append_event_uncommitted(
+                    run_id,
+                    "notification.event_dead_lettered",
+                    self._notification_dead_letter_payload(
+                        sequence=sequence,
+                        source_event_type=source_event_type,
+                        bounded_source_type=bounded_source_type,
+                        error_type=error_type,
+                        bounded_error_type=bounded_error_type,
+                        attempt=attempt,
+                    ),
+                    timestamp=now,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return {"attempt": attempt, "dead_lettered": True, "event": event}
+
+    @staticmethod
+    def _validated_notification_routing_sequence(sequence: object) -> int:
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+            or sequence > _SQLITE_INTEGER_MAX
+        ):
+            raise ValueError("Notification event sequence must be a SQLite integer")
+        return sequence
+
+    @staticmethod
+    def _validate_notification_routing_max_attempts(max_attempts: int) -> None:
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("Notification routing max_attempts must be positive")
+
+    @staticmethod
+    def _next_notification_routing_attempt(
+        metadata: dict[str, Any], sequence: int
+    ) -> int:
+        failure_value = metadata.get(_NOTIFICATION_ROUTING_FAILURE_KEY)
+        if failure_value is None:
+            return 1
+        if not isinstance(failure_value, dict):
+            raise CorruptRunState("Notification routing failure metadata is invalid")
+        failure = cast(dict[object, object], failure_value)
+        if failure.get("event_seq") != sequence:
+            return 1
+        failure_attempt = failure.get("attempt")
+        if (
+            isinstance(failure_attempt, bool)
+            or not isinstance(failure_attempt, int)
+            or failure_attempt < 1
+            or failure_attempt >= _RESOURCE_DOMAIN_EVENT_INDEX_LIMIT
+        ):
+            raise CorruptRunState("Notification routing failure attempt is invalid")
+        return failure_attempt + 1
+
+    @staticmethod
+    def _notification_dead_letter_payload(
+        *,
+        sequence: int,
+        source_event_type: str,
+        bounded_source_type: str,
+        error_type: str,
+        bounded_error_type: str,
+        attempt: int,
+    ) -> dict[str, Any]:
+        return {
+            "event_seq": sequence,
+            "source_event_type": bounded_source_type,
+            "error_type": bounded_error_type,
+            "attempt": attempt,
+            "projection_truncated": (
+                bounded_source_type != source_event_type
+                or bounded_error_type != error_type
+            ),
+        }
 
     def _update_run_metadata(self, run_id: str, metadata: dict[str, Any]) -> None:
         self._connection.execute(
@@ -3196,6 +3486,7 @@ class RunStore:
         dedup_key: str | None,
         destinations: Iterable[tuple[str, str]],
         rolling: bool = False,
+        rearm_failed: bool = True,
     ) -> dict[str, Any]:
         """Persist one notification intent and its independent destinations.
 
@@ -3240,7 +3531,10 @@ class RunStore:
                 row, rolling_result = self._prepare_rolling_notification(row, rolling)
                 if rolling_result is not None:
                     return rolling_result
-                if row is not None and row["status"] == "succeeded":
+                if row is not None and (
+                    row["status"] == "succeeded"
+                    or (row["status"] == "failed" and not rearm_failed)
+                ):
                     result = self._decode_notification_intent(row)
                     result.update({"created": False, "rearmed": False})
                     return result

@@ -184,4 +184,19 @@ class DashboardAdapter(ResourceAdapter):
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        failures: list[Exception] = []
+        try:
+            await self._client.aclose()
+        except Exception as error:
+            failures.append(error)
+        try:
+            await super().close()
+        except Exception as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise RuntimeError(
+                "Dashboard adapter cleanup failed: "
+                + "; ".join(str(error) for error in failures)
+            ) from failures[0]

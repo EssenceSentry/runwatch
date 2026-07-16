@@ -7,7 +7,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from .egress import SecretRedactor
-from .models import NotificationSettings
+from .models import (
+    NotificationSettings,
+    ResourceDisposition,
+    ResourceStatus,
+    RunStatus,
+)
 from .schema_versions import NOTIFICATION_SCHEMA_VERSION
 from .storage import RunStore
 
@@ -203,7 +208,9 @@ class NotificationPresenter:
             )
         if event_type == "resource.observed" and payload.get("status") == "failed":
             internal_id = str(payload["internal_id"])
-            resource = self.store.get_resource(internal_id) or {}
+            resource = self.store.get_resource(internal_id)
+            if resource is None or not _notifiable_failed_resource(resource):
+                return None
             provider = redactor.text(resource.get("provider", "external"), max_chars=80)
             resource_type = redactor.text(
                 resource.get("resource_type", "resource"), max_chars=120
@@ -289,8 +296,12 @@ class NotificationPresenter:
         if status == "succeeded":
             events.append({"type": "run.succeeded", "payload": {"kernel_epoch": epoch}})
         elif status == "failed":
+            terminal_event = self.store.terminal_event_for_state(
+                self.run_id, RunStatus.FAILED, epoch
+            )
             events.append(
-                {"type": "run.runner_error", "payload": {"kernel_epoch": epoch}}
+                terminal_event
+                or {"type": "run.runner_error", "payload": {"kernel_epoch": epoch}}
             )
         elif status == "cancelled":
             events.append({"type": "run.cancelled", "payload": {"kernel_epoch": epoch}})
@@ -308,7 +319,7 @@ class NotificationPresenter:
                 }
             )
         for resource in self.store.list_resources(self.run_id):
-            if resource.get("status") == "failed":
+            if _notifiable_failed_resource(resource):
                 events.append(
                     {
                         "type": "resource.observed",
@@ -398,6 +409,19 @@ def _kernel_epoch(payload: dict[str, Any]) -> str:
     if value is None:
         return "unknown"
     return str(_nonnegative_int(value, "kernel_epoch"))
+
+
+def _notifiable_failed_resource(resource: dict[str, Any] | None) -> bool:
+    return bool(
+        resource is not None
+        and resource.get("status") == ResourceStatus.FAILED.value
+        and resource.get("terminal") is True
+        and resource.get("disposition")
+        not in {
+            ResourceDisposition.SUPERSEDED.value,
+            ResourceDisposition.IGNORED.value,
+        }
+    )
 
 
 def _nonnegative_int(value: object, field: str) -> int:

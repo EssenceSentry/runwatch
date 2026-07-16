@@ -219,6 +219,7 @@ def test_terminal_run_and_event_roll_back_together_on_event_failure(
     assert rolled_back["status"] == RunStatus.RUNNING.value
     assert rolled_back["ended_at"] is None
     assert rolled_back["finalization_complete"] is False
+    assert "_terminal_event" not in rolled_back["metadata"]
     assert store.recent_events("run") == []
 
     store._connection.execute(  # noqa: SLF001 - deliberate fault removal
@@ -239,6 +240,80 @@ def test_terminal_run_and_event_roll_back_together_on_event_failure(
     assert committed["finalization_complete"] is False
     assert event["type"] == "run.succeeded"
     assert [item["type"] for item in store.recent_events("run")] == ["run.succeeded"]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "event_type"),
+    [
+        (RunStatus.SUCCEEDED, "run.runner_error"),
+        (RunStatus.FAILED, "run.succeeded"),
+        (RunStatus.CANCELLED, "run.external_timeout"),
+        (RunStatus.FAILED, "run.future_failure"),
+    ],
+)
+def test_terminal_status_rejects_unknown_or_mismatched_event_types(
+    tmp_path: Path, status: RunStatus, event_type: str
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+
+    with pytest.raises(ValueError, match="cannot be committed"):
+        store.finish_run(
+            "run",
+            status,
+            message="terminal",
+            event_type=event_type,
+            event_payload={"kernel_epoch": 99},
+        )
+
+    run = store.get_run("run")
+    assert run["status"] == RunStatus.CREATED.value
+    assert "_terminal_event" not in run["metadata"]
+    assert store.recent_events("run") == []
+    store.close()
+
+
+def test_terminal_event_identity_uses_durable_epoch_and_survives_event_retention(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_events_per_run=1)
+    initialize(store, tmp_path)
+    assert store.begin_kernel_epoch("run") == 1
+
+    terminal = store.finish_run(
+        "run",
+        RunStatus.FAILED,
+        message="timeout",
+        event_type="run.external_timeout",
+        event_payload={"kernel_epoch": 99},
+    )
+    assert terminal["payload"]["kernel_epoch"] == 1
+    assert terminal["payload"]["projection_truncated"] is True
+    assert store.get_run("run")["metadata"]["_terminal_event"] == {
+        "type": "run.external_timeout",
+        "kernel_epoch": 1,
+    }
+
+    store.append_event("run", "run.runner_error", {"kernel_epoch": 1})
+    assert [event["type"] for event in store.recent_events("run")] == [
+        "run.runner_error"
+    ]
+    recovered = store.terminal_event_for_state("run", RunStatus.FAILED, 1)
+    assert recovered is not None
+    assert recovered["type"] == "run.external_timeout"
+    assert recovered["payload"] == {"kernel_epoch": 1}
+
+    metadata = store.get_run("run")["metadata"]
+    metadata.pop("_terminal_event")
+    store._connection.execute(  # noqa: SLF001 - legacy metadata fixture
+        "UPDATE runs SET metadata_json = ? WHERE run_id = 'run'",
+        (json.dumps(metadata),),
+    )
+    store._connection.commit()  # noqa: SLF001 - legacy metadata fixture
+    legacy = store.terminal_event_for_state("run", RunStatus.FAILED, 1)
+    assert legacy is not None and legacy["type"] == "run.runner_error"
+    assert store.terminal_event_for_state("run", RunStatus.FAILED, 2) is None
     store.close()
 
 
@@ -580,6 +655,51 @@ def test_resource_registration_event_uses_bounded_allowlisted_projection(
     assert duplicate_created is False
     assert reconciled["type"] == "resource.reconciled"
     assert len(store.list_resources("run")) == 1
+    store.close()
+
+
+def test_resource_registration_projection_bounds_json_escaped_control_characters(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3", max_event_payload_bytes=1_024)
+    initialize(store, tmp_path)
+    controls = "\x00\x01\n\t" * 1_000
+    registration = ResourceEvent(
+        event_id="event-" + controls,
+        resource=ResourceSpec(
+            provider="provider-" + controls,
+            type="type-" + controls,
+            id="identifier-" + controls,
+            logical_key="logical-" + controls,
+        ),
+    )
+
+    internal_id, created, event = store.register_resource_with_event(
+        run_id="run",
+        event=registration,
+        cell_index=1,
+        attempt=2,
+        kernel_epoch=3,
+        supports_stop=False,
+    )
+
+    assert created is True
+    assert event["payload"]["projection_truncated"] is True
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 1_024
+    for value in (
+        event["payload"]["event_id"],
+        event["payload"]["resource"]["provider"],
+        event["payload"]["resource"]["type"],
+        event["payload"]["resource"]["id"],
+        event["payload"]["resource"]["logical_key"],
+    ):
+        assert len(json.dumps(value, ensure_ascii=False).encode("utf-8")) <= 64
+    resource = store.get_resource(internal_id)
+    assert resource is not None
+    assert resource["external_id"] == registration.resource.id
     store.close()
 
 
@@ -1243,6 +1363,78 @@ def test_notification_event_cursor_rejects_invalid_persisted_values(
     store.close()
 
 
+def test_notification_routing_failures_persist_and_dead_letter_once(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = RunStore(path, max_event_payload_bytes=256)
+    initialize(store, tmp_path)
+    store.require_notification_event_routing("run")
+    source = store.append_event("run", "probe.poison", {"value": 1})
+    source_type = "probe.\x00" * 100
+    error_type = "Unexpected\nError" * 100
+
+    first = store.record_notification_routing_failure(
+        "run", source["seq"], source_type, error_type, max_attempts=2
+    )
+    assert first == {"attempt": 1, "dead_lettered": False, "event": None}
+    failure = store.get_run("run")["metadata"]["_notification_routing_failure"]
+    assert failure["event_seq"] == source["seq"]
+    assert failure["attempt"] == 1
+    assert (
+        len(
+            json.dumps(failure["source_event_type"], ensure_ascii=False).encode("utf-8")
+        )
+        <= 64
+    )
+    assert (
+        len(json.dumps(failure["error_type"], ensure_ascii=False).encode("utf-8")) <= 64
+    )
+    store.close()
+
+    recovered = RunStore(path, max_event_payload_bytes=256)
+    second = recovered.record_notification_routing_failure(
+        "run", source["seq"], source_type, error_type, max_attempts=2
+    )
+    assert second["attempt"] == 2
+    assert second["dead_lettered"] is True
+    dead_letter = second["event"]
+    assert dead_letter is not None
+    assert dead_letter["type"] == "notification.event_dead_lettered"
+    assert dead_letter["payload"]["event_seq"] == source["seq"]
+    assert dead_letter["payload"]["projection_truncated"] is True
+    assert (
+        len(
+            json.dumps(
+                dead_letter["payload"], ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        )
+        <= 256
+    )
+    assert recovered.notification_event_cursor("run") == source["seq"]
+    assert "_notification_routing_failure" not in recovered.get_run("run")["metadata"]
+    assert [
+        event["type"]
+        for event in recovered.recent_events("run")
+        if event["type"] == "notification.event_dead_lettered"
+    ] == ["notification.event_dead_lettered"]
+
+    duplicate = recovered.record_notification_routing_failure(
+        "run", source["seq"], source_type, error_type, max_attempts=2
+    )
+    assert duplicate == {"attempt": 0, "dead_lettered": False, "event": None}
+
+    assert recovered.advance_notification_event_cursor("run", dead_letter["seq"])
+    next_event = recovered.append_event("run", "probe.next", {})
+    recovered.record_notification_routing_failure(
+        "run", next_event["seq"], "probe.next", "RuntimeError", max_attempts=3
+    )
+    assert "_notification_routing_failure" in recovered.get_run("run")["metadata"]
+    assert recovered.advance_notification_event_cursor("run", next_event["seq"])
+    assert "_notification_routing_failure" not in recovered.get_run("run")["metadata"]
+    recovered.close()
+
+
 def test_corrupt_json_and_incomplete_v2_schema_are_rejected(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state.sqlite3")
     initialize(store, tmp_path)
@@ -1387,7 +1579,7 @@ def test_aggregate_observation_cap_covers_every_persisted_payload(
     store.close()
 
 
-def test_event_payload_failure_rolls_back_atomic_resource_inspection(
+def test_large_valid_resource_observation_uses_small_event_projection(
     tmp_path: Path,
 ) -> None:
     store = RunStore(
@@ -1410,22 +1602,39 @@ def test_event_payload_failure_rolls_back_atomic_resource_inspection(
     observation = ResourceObservation(
         status=ResourceStatus.RUNNING,
         message="é" * 200,
-        metrics={"value": 2},
+        metrics={"value": 2, "detail": "m" * 1_000},
+        log_lines=["log-" + ("l" * 1_000)],
+        raw={"provider_detail": "r" * 1_000},
     )
 
-    with pytest.raises(ValueError, match="max_event_payload_bytes"):
-        store.record_resource_inspection("run", internal_id, observation, {"offset": 2})
+    event = store.record_resource_inspection(
+        "run", internal_id, observation, {"offset": 2}
+    )
 
     resource = store.get_resource(internal_id)
     assert resource is not None
-    assert resource["status"] == ResourceStatus.REGISTERED.value
-    assert resource["cursor"] == {"offset": 1}
-    assert store.resource_observations(internal_id) == []
-    assert store.recent_events("run") == []
+    assert resource["status"] == ResourceStatus.RUNNING.value
+    assert resource["cursor"] == {"offset": 2}
+    assert resource["metrics"] == observation.metrics
+    assert resource["raw"] == observation.raw
+    assert resource["log_tail"] == observation.log_lines
+    assert len(store.resource_observations(internal_id)) == 1
+    assert event["payload"]["internal_id"] == internal_id
+    assert event["payload"]["metric_count"] == 2
+    assert event["payload"]["new_log_line_count"] == 1
+    assert event["payload"]["projection_truncated"] is True
+    assert "metrics" not in event["payload"]
+    assert "new_log_lines" not in event["payload"]
+    serialized = json.dumps(
+        event["payload"], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    assert len(serialized) <= 256
 
     with pytest.raises(ValueError, match="max_event_payload_bytes"):
         store.append_event("run", "probe", {"text": "é" * 200})
-    assert store.recent_events("run") == []
+    assert [item["type"] for item in store.recent_events("run")] == [
+        "resource.observed"
+    ]
     store.close()
 
 
@@ -1465,6 +1674,65 @@ def test_notification_record_cap_rejects_all_columns_atomically(
         "pending_deliveries": 0,
         "sending_deliveries": 0,
     }
+    store.close()
+
+
+def test_failed_notification_can_be_observed_without_rearming(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state.sqlite3")
+    initialize(store, tmp_path)
+    destinations = [("webhook", "https://hooks.example/runwatch")]
+    intent = store.enqueue_notification(
+        run_id="run",
+        title="Original",
+        message="Original failure",
+        data={"reason": "original"},
+        dedup_key="terminal",
+        destinations=destinations,
+    )
+    claimed = store.claim_due_notification_deliveries("run")
+    assert len(claimed) == 1
+    store.finish_notification_delivery(
+        claimed[0]["delivery_id"],
+        succeeded=False,
+        max_attempts=1,
+        retry_delay_seconds=1,
+        error="failed",
+    )
+    failed = store.notification_intent(intent["intent_id"])
+    assert failed is not None and failed["status"] == "failed"
+
+    unchanged = store.enqueue_notification(
+        run_id="run",
+        title="Replacement",
+        message="Replacement failure",
+        data={"reason": "replacement"},
+        dedup_key="terminal",
+        destinations=destinations,
+        rearm_failed=False,
+    )
+    assert unchanged["created"] is False
+    assert unchanged["rearmed"] is False
+    assert unchanged["status"] == "failed"
+    assert unchanged["title"] == "Original"
+    assert unchanged["data"] == {"reason": "original"}
+    delivery = store.notification_deliveries(intent["intent_id"])[0]
+    assert delivery["status"] == "failed"
+    assert delivery["attempt_count"] == 1
+
+    rearmed = store.enqueue_notification(
+        run_id="run",
+        title="Replacement",
+        message="Replacement failure",
+        data={"reason": "replacement"},
+        dedup_key="terminal",
+        destinations=destinations,
+    )
+    assert rearmed["rearmed"] is True
+    assert rearmed["status"] == "pending"
+    assert rearmed["title"] == "Replacement"
+    assert rearmed["data"] == {"reason": "replacement"}
     store.close()
 
 

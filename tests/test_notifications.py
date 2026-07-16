@@ -14,6 +14,7 @@ import pytest
 from runwatch.events import EventBus
 from runwatch.models import (
     NotificationSettings,
+    ResourceDisposition,
     ResourceEvent,
     ResourceObservation,
     ResourceSpec,
@@ -25,6 +26,7 @@ from runwatch.notification_config import notification_destinations
 from runwatch.notification_presentation import (
     NotificationEnvelope,
     NotificationLegacy,
+    NotificationPresenter,
     PresentedNotification,
 )
 from runwatch.notifications import NotificationManager
@@ -348,6 +350,67 @@ async def test_malformed_event_does_not_kill_listener(tmp_path: Path) -> None:
 
     await bus.publish("run.succeeded", {})
     await wait_until(lambda: len(requests) == 1)
+    assert manager._listener_task is not None
+    assert not manager._listener_task.done()
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_poison_event_is_dead_lettered_once_and_routing_continues(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    bus = EventBus(store, "run")
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/dead-letter"],
+            max_routing_attempts=3,
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    original_handle_event = manager._handle_event
+
+    async def fail_poison_event(event: dict[str, Any]) -> None:
+        if event["type"] == "probe.poison":
+            raise RuntimeError("deterministic routing failure")
+        await original_handle_event(event)
+
+    manager._handle_event = fail_poison_event  # type: ignore[method-assign]
+    poison = await bus.publish("probe.poison", {"value": 1})
+    await manager.start()
+
+    await wait_until(
+        lambda: store.notification_event_cursor("run") >= int(poison["seq"])
+    )
+    dead_letters = [
+        event
+        for event in store.recent_events("run", limit=100)
+        if event["type"] == "notification.event_dead_lettered"
+    ]
+    assert len(dead_letters) == 1
+    assert not any(
+        event["type"] == "notification.worker_error"
+        for event in store.recent_events("run", limit=100)
+    )
+
+    succeeded = await bus.publish("run.succeeded", {"kernel_epoch": 0})
+    await wait_until(lambda: len(requests) == 1)
+    await wait_until(
+        lambda: store.notification_event_cursor("run") >= int(succeeded["seq"])
+    )
     assert manager._listener_task is not None
     assert not manager._listener_task.done()
     await manager.close()
@@ -827,6 +890,55 @@ async def test_replay_after_intent_commit_before_cursor_does_not_duplicate_deliv
 
 
 @pytest.mark.asyncio
+async def test_routing_replay_does_not_rearm_failed_delivery_budget(
+    tmp_path: Path,
+) -> None:
+    store = notification_store(tmp_path)
+    bus = EventBus(store, "run")
+    settings = NotificationSettings(
+        webhook_urls=["https://hooks.example/replay-budget"],
+        max_delivery_attempts=1,
+    )
+    manager = NotificationManager(
+        settings=settings,
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    failure = await bus.publish("cell.failed", cell_failure(kernel_epoch=6))
+
+    await manager._handle_event(failure)
+    claimed = store.claim_due_notification_deliveries("run")
+    assert len(claimed) == 1
+    store.finish_notification_delivery(
+        claimed[0]["delivery_id"],
+        succeeded=False,
+        max_attempts=1,
+        retry_delay_seconds=0,
+        error="injected terminal delivery failure",
+    )
+    intent_id = str(claimed[0]["intent_id"])
+    assert notification_intent_has_status(store, intent_id, "failed")
+
+    await manager._handle_event(failure)
+    unchanged = store.notification_deliveries(intent_id)[0]
+    assert unchanged["status"] == "failed"
+    assert unchanged["attempt_count"] == 1
+    assert store.claim_due_notification_deliveries("run") == []
+
+    notification = manager._presenter.from_event(failure)
+    assert notification is not None
+    explicit = await manager.send(notification)
+    assert explicit is not None
+    assert explicit["rearmed"] is True
+    rearmed = store.notification_deliveries(intent_id)[0]
+    assert rearmed["status"] == "pending"
+    assert rearmed["attempt_count"] == 0
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_future_cursor_is_repaired_before_next_failure_is_delivered(
     tmp_path: Path,
 ) -> None:
@@ -928,6 +1040,45 @@ async def test_listener_recovers_after_transient_cursor_store_error(
     await bus.publish("cell.failed", cell_failure(kernel_epoch=9))
     await wait_until(lambda: len(requests) == 1)
     await wait_until(lambda: normalize_attempts >= 2)
+    assert manager._listener_task is not None
+    assert not manager._listener_task.done()
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_cursor_error_emits_one_listener_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/persistent-cursor"],
+            retry_initial_seconds=0.01,
+            retry_max_seconds=0.01,
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    normalize_attempts = 0
+
+    def fail_normalize(_run_id: str) -> tuple[int, bool]:
+        nonlocal normalize_attempts
+        normalize_attempts += 1
+        raise sqlite3.OperationalError("injected persistent cursor failure")
+
+    monkeypatch.setattr(store, "normalize_notification_event_cursor", fail_normalize)
+    await manager.start()
+    await wait_until(lambda: normalize_attempts >= 4)
+
+    listener_errors = [
+        event
+        for event in store.recent_events("run", limit=100)
+        if event["type"] == "notification.listener_error"
+    ]
+    assert len(listener_errors) == 1
     assert manager._listener_task is not None
     assert not manager._listener_task.done()
     await manager.close()
@@ -1126,6 +1277,31 @@ async def test_webhook_presentations_exclude_internal_and_canary_payloads(
 
     store = notification_store(tmp_path)
     bus = EventBus(store, "run")
+    internal_id, _created = store.register_resource(
+        run_id="run",
+        event=ResourceEvent(
+            resource=ResourceSpec(
+                provider="aws",
+                type="processing_job",
+                id="resource-id",
+            )
+        ),
+        cell_index=0,
+        attempt=1,
+        kernel_epoch=2,
+        supports_stop=False,
+    )
+    store.update_resource_observation(
+        "run",
+        internal_id,
+        ResourceObservation(
+            status=ResourceStatus.FAILED,
+            message="PROVIDER_SECRET",
+            metrics={"credential": "METRIC_SECRET"},
+            log_lines=["LOG_SECRET"],
+            raw={"credential": "RAW_SECRET"},
+        ),
+    )
     manager = NotificationManager(
         settings=NotificationSettings(
             webhook_urls=[
@@ -1149,16 +1325,6 @@ async def test_webhook_presentations_exclude_internal_and_canary_payloads(
             "error_value": "TRACE_SECRET",
             "traceback": ["TRACEBACK_SECRET"],
             "metrics": {"credential": "METRIC_SECRET"},
-        },
-    )
-    await bus.publish(
-        "resource.observed",
-        {
-            "internal_id": "resource-id",
-            "status": "failed",
-            "message": "PROVIDER_SECRET",
-            "new_log_lines": ["LOG_SECRET"],
-            "raw": {"credential": "RAW_SECRET"},
         },
     )
     await wait_until(lambda: len(requests) == 6)
@@ -1244,6 +1410,74 @@ async def test_failed_resource_presentation_omits_local_and_s3_identifiers(
     assert b"CLIENT_BUCKET_SECRET" not in serialized
 
     await manager.close()
+    store.close()
+
+
+def test_failed_resource_notifications_require_current_terminal_active_state(
+    tmp_path: Path,
+) -> None:
+    store = notification_store(tmp_path)
+
+    def register(resource_id: str) -> str:
+        internal_id, _created = store.register_resource(
+            run_id="run",
+            event=ResourceEvent(
+                resource=ResourceSpec(
+                    provider="fake",
+                    type="job",
+                    id=resource_id,
+                )
+            ),
+            cell_index=0,
+            attempt=1,
+            kernel_epoch=1,
+            supports_stop=False,
+        )
+        return internal_id
+
+    active = register("active-failed")
+    superseded = register("superseded-failed")
+    ignored = register("ignored-failed")
+    nonterminal = register("still-running")
+    recovered = register("recovered")
+    for internal_id in (active, superseded, ignored):
+        store.update_resource_observation(
+            "run",
+            internal_id,
+            ResourceObservation(status=ResourceStatus.FAILED),
+        )
+    store.set_resource_disposition(superseded, ResourceDisposition.SUPERSEDED)
+    store.set_resource_disposition(ignored, ResourceDisposition.IGNORED)
+    store.update_resource_observation(
+        "run",
+        recovered,
+        ResourceObservation(status=ResourceStatus.COMPLETED),
+    )
+
+    presenter = NotificationPresenter(
+        store=store,
+        run_id="run",
+        settings=NotificationSettings(),
+    )
+    candidates = {
+        internal_id: presenter.from_event(
+            {
+                "type": "resource.observed",
+                "payload": {"internal_id": internal_id, "status": "failed"},
+            }
+        )
+        for internal_id in (active, superseded, ignored, nonterminal, recovered)
+    }
+    assert candidates[active] is not None
+    assert all(
+        candidates[internal_id] is None
+        for internal_id in (superseded, ignored, nonterminal, recovered)
+    )
+
+    reconciled = presenter.reconcile_state()
+    assert [notification.dedup_key for notification in reconciled] == [
+        f"resource-failed:{active}"
+    ]
     store.close()
 
 
@@ -1427,6 +1661,103 @@ async def test_start_reconciles_terminal_state_to_one_stable_intent(
     await asyncio.sleep(0.05)
     assert len(requests) == 1
     await second.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_reconciles_failed_run_with_persisted_terminal_reason(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    store.finish_run(
+        "run",
+        RunStatus.FAILED,
+        message="External resources timed out",
+        event_type="run.external_timeout",
+        event_payload={"kernel_epoch": 4},
+    )
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            webhook_urls=["https://hooks.example/reconcile-reason"]
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await wait_until(lambda: len(requests) == 1)
+
+    payload = json.loads(requests[0].content)
+    assert payload["data"]["kind"] == "run_failed"
+    assert payload["data"]["reason"] == "external_timeout"
+    await asyncio.sleep(0.03)
+    assert len(requests) == 1
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciliation_does_not_rearm_failed_delivery_budget(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    settings = NotificationSettings(
+        webhook_urls=["https://hooks.example/reconcile-budget"],
+        max_delivery_attempts=1,
+    )
+    store = notification_store(tmp_path, settings=settings)
+    store.finish_run(
+        "run",
+        RunStatus.FAILED,
+        message="Runner failed",
+        event_type="run.runner_error",
+        event_payload={},
+    )
+    manager = NotificationManager(
+        settings=settings,
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    notification = manager._presenter.reconcile_state()[0]
+    intent = await manager.send(notification)
+    assert intent is not None
+    claimed = store.claim_due_notification_deliveries("run")
+    assert len(claimed) == 1
+    store.finish_notification_delivery(
+        claimed[0]["delivery_id"],
+        succeeded=False,
+        max_attempts=1,
+        retry_delay_seconds=0,
+        error="injected terminal delivery failure",
+    )
+
+    await manager.start()
+    await wait_until(
+        lambda: store.notification_event_cursor("run")
+        >= int(store.recent_events("run", limit=1)[-1]["seq"])
+    )
+    await asyncio.sleep(0.03)
+    assert requests == []
+    unchanged = store.notification_deliveries(str(intent["intent_id"]))[0]
+    assert unchanged["status"] == "failed"
+    assert unchanged["attempt_count"] == 1
+    await manager.close()
     store.close()
 
 

@@ -304,6 +304,7 @@ class NotificationSettings(BaseModel):
     allow_insecure_http: bool = False
     max_payload_bytes: int = Field(default=16_384, ge=1_024, le=262_144)
     max_delivery_attempts: int = Field(default=4, ge=1, le=20)
+    max_routing_attempts: int = Field(default=4, ge=1, le=20)
     retry_initial_seconds: float = Field(default=1.0, gt=0)
     retry_max_seconds: float = Field(default=60.0, gt=0)
 
@@ -430,6 +431,18 @@ class ResourceObservation(BaseModel):
         if value is not None:
             _validate_json_value(value, path="resource observation history")
         return value
+
+    @model_validator(mode="after")
+    def terminal_matches_status(self) -> ResourceObservation:
+        """Normalize provider terminal statuses and reject contradictory states."""
+
+        if self.status.terminal:
+            self.terminal = True
+        elif self.terminal and self.status is not ResourceStatus.UNKNOWN:
+            raise ValueError(
+                f"Resource status {self.status.value!r} cannot be terminal"
+            )
+        return self
 
 
 class RunnerCommand(BaseModel):
