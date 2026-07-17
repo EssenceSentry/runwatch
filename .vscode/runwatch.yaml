@@ -1,5 +1,5 @@
 notebook:
-  # Refreshed by the VS Code prerequisite task for the active file workspace.
+  # Refreshed by the VS Code launcher for the active file workspace.
   kernel_name: runwatch-workspace
 
 notifications:

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -45,14 +47,46 @@ def test_fake_session_supports_local_only_replay(monkeypatch) -> None:
 
 
 def test_vscode_active_notebook_task_uses_cloudflared() -> None:
-    tasks_path = Path(__file__).resolve().parents[1] / ".vscode" / "tasks.json"
+    repo_root = Path(__file__).resolve().parents[1]
+    tasks_path = repo_root / ".vscode" / "tasks.json"
     tasks = json.loads(tasks_path.read_text(encoding="utf-8"))["tasks"]
     active_notebook = next(
         task for task in tasks if task["label"] == "notebook: run active notebook"
     )
 
-    share_index = active_notebook["args"].index("--share")
-    assert active_notebook["args"][share_index + 1] == "cloudflared"
+    assert active_notebook["type"] == "process"
+    assert active_notebook["command"] == (
+        "${workspaceFolder}/scripts/run_active_notebook.sh"
+    )
+    assert active_notebook["args"] == ["${file}"]
+
+    launcher_path = repo_root / "scripts" / "run_active_notebook.sh"
+    assert os.access(launcher_path, os.X_OK)
+    launcher = launcher_path.read_text(encoding="utf-8")
+    assert "--share cloudflared" in launcher
+
+
+def test_notebook_workspace_resolver_accepts_relative_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    notebook = workspace / "models" / "example.ipynb"
+    notebook.parent.mkdir(parents=True)
+    notebook.touch()
+    (workspace / "pyproject.toml").touch()
+    resolver = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "resolve_notebook_workspace.sh"
+    )
+
+    result = subprocess.run(
+        [str(resolver), str(notebook.relative_to(tmp_path))],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == str(workspace)
 
 
 def test_fake_session_registers_dependency_free_linked_results_dashboard() -> None:
