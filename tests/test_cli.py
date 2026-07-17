@@ -338,6 +338,39 @@ async def test_dashboard_url_selection_and_server_start_failure(monkeypatch) -> 
         await cli._wait_for_server(server, task)  # type: ignore[arg-type]
 
 
+def test_terminal_qr_uses_compact_error_correction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeQrCode:
+        def __init__(self, **kwargs: object) -> None:
+            calls["options"] = kwargs
+
+        def add_data(self, value: str) -> None:
+            calls["value"] = value
+
+        def make(self, *, fit: bool) -> None:
+            calls["fit"] = fit
+
+        def print_ascii(self, *, invert: bool) -> None:
+            calls["invert"] = invert
+
+    monkeypatch.setattr(cli.qrcode, "QRCode", FakeQrCode)
+
+    cli._print_qr("https://example.test/?token=secret")
+
+    assert calls == {
+        "options": {
+            "border": 1,
+            "error_correction": cli.ERROR_CORRECT_L,
+        },
+        "value": "https://example.test/?token=secret",
+        "fit": True,
+        "invert": True,
+    }
+
+
 @pytest.mark.asyncio
 async def test_announce_and_run_status_exit_codes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1257,7 +1290,8 @@ def test_execute_resume_restart_and_open_dispatch(
         cli.app, ["execute", str(notebook), "--run-dir", str(occupied)]
     )
     assert rejected.exit_code != 0
-    assert "not empty" in rejected.output
+    assert "is not" in rejected.output
+    assert "empty; choose a new directory" in rejected.output
     assert (occupied / "keep.txt").read_text(encoding="utf-8") == "owned"
 
     supervisor = _supervisor(tmp_path / "existing")

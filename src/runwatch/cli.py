@@ -19,6 +19,7 @@ import psutil
 import qrcode
 import typer
 import uvicorn
+from qrcode.constants import ERROR_CORRECT_L
 
 from . import __version__
 from ._fs import PRIVATE_DIRECTORY_MODE, atomic_write_bytes, ensure_private_directory
@@ -299,7 +300,10 @@ class RunLock:
 
 
 def _print_qr(url: str) -> None:
-    qr = qrcode.QRCode(border=1)
+    qr = qrcode.QRCode(
+        border=1,
+        error_correction=ERROR_CORRECT_L,
+    )
     qr.add_data(url)
     qr.make(fit=True)
     qr.print_ascii(invert=True)
