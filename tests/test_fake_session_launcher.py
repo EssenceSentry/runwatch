@@ -64,6 +64,7 @@ def test_vscode_active_notebook_task_uses_cloudflared() -> None:
     assert os.access(launcher_path, os.X_OK)
     launcher = launcher_path.read_text(encoding="utf-8")
     assert "--share cloudflared" in launcher
+    assert "--working-dir" not in launcher
 
 
 def test_notebook_workspace_resolver_accepts_relative_paths(tmp_path: Path) -> None:

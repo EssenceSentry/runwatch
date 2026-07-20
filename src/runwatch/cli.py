@@ -319,7 +319,7 @@ def _default_run_dir(working_dir: Path, notebook: Path) -> Path:
     )
 
 
-def _cleanup_successful_run(
+def _cleanup_finished_run(
     run_dir: Path,
     working_dir: Path,
     *,
@@ -521,10 +521,17 @@ async def _dashboard_base(
     return local_base, None
 
 
-def _announce_run(supervisor: RunSupervisor, pairing_url: str) -> None:
+def _announce_run(
+    supervisor: RunSupervisor,
+    pairing_url: str,
+    local_pairing_url: str | None = None,
+) -> None:
     typer.echo(f"\nRunwatch run directory: {supervisor.run_dir}")
     typer.echo(f"Editable notebook: {supervisor.source_path}")
-    typer.echo(f"Dashboard: {pairing_url}\n")
+    typer.echo(f"Dashboard: {pairing_url}")
+    if local_pairing_url is not None:
+        typer.echo(f"Local dashboard: {local_pairing_url}")
+    typer.echo()
     if supervisor.config.server.show_qr:
         _print_qr(pairing_url)
     if supervisor.config.server.open_browser:
@@ -613,7 +620,7 @@ async def _linger_while_action_loop_healthy(
         await asyncio.gather(*wait_tasks, return_exceptions=True)
 
 
-async def _successful_cleanup_decision(
+async def _automatic_cleanup_decision(
     supervisor: RunSupervisor,
 ) -> tuple[bool, str | None]:
     try:
@@ -624,9 +631,10 @@ async def _successful_cleanup_decision(
     if not status.terminal:
         return False, None
     cleanup_requested = bool(getattr(supervisor, "cleanup_on_success", False))
+    cleanup_status = status in {RunStatus.SUCCEEDED, RunStatus.CANCELLED}
     cleanup_authorized = bool(
         cleanup_requested
-        and status is RunStatus.SUCCEEDED
+        and cleanup_status
         and getattr(supervisor, "wait_completed_normally", False)
         and run.get("finalization_complete", False)
     )
@@ -636,13 +644,13 @@ async def _successful_cleanup_decision(
         )
     except Exception as error:
         reason = None
-        if cleanup_requested and status is RunStatus.SUCCEEDED:
+        if cleanup_requested and cleanup_status:
             reason = f"notification drain failed: {type(error).__name__}: {error}"
         return False, reason
     if drain.complete:
         return cleanup_authorized, None
     reason = None
-    if cleanup_requested and status is RunStatus.SUCCEEDED:
+    if cleanup_requested and cleanup_status:
         reason = drain.reason or "notification delivery is incomplete"
     return False, reason
 
@@ -672,25 +680,25 @@ async def _finish_serve(supervisor: RunSupervisor, lock: RunLock) -> None:
             except BaseException as close_error:
                 raise close_error from quiesce_error
             raise
-        cleanup_successful_run, retain_reason = await _successful_cleanup_decision(
+        cleanup_finished_run, retain_reason = await _automatic_cleanup_decision(
             supervisor
         )
         await _publish_cleanup_retention(supervisor, retain_reason)
         await supervisor.close()
-        if cleanup_successful_run:
+        if cleanup_finished_run:
             lock.begin_cleanup()
-            _cleanup_successful_run(
+            _cleanup_finished_run(
                 supervisor.run_dir,
                 supervisor.working_dir,
                 run_lock=lock,
             )
     finally:
         lock.release()
-    if cleanup_successful_run:
+    if cleanup_finished_run:
         _cleanup_empty_runwatch_parents(supervisor.run_dir, supervisor.working_dir)
-        typer.echo(f"Removed successful Runwatch state: {supervisor.run_dir}")
+        typer.echo(f"Removed Runwatch state: {supervisor.run_dir}")
     elif retain_reason is not None:
-        typer.echo(f"Retained successful Runwatch state: {supervisor.run_dir}")
+        typer.echo(f"Retained Runwatch state: {supervisor.run_dir}")
         typer.echo(f"Reason: {retain_reason}")
         typer.echo(
             "Retry notification delivery with: runwatch open " + str(supervisor.run_dir)
@@ -732,6 +740,7 @@ async def _serve(
                 log_level="warning",
                 access_log=False,
                 lifespan="off",
+                timeout_graceful_shutdown=5,
             )
         )
         server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
@@ -739,7 +748,8 @@ async def _serve(
         await _wait_for_server(server, server_task)
         public_base, tunnel = await _dashboard_base(config, local_base)
         pairing_url = with_token(public_base, token)
-        _announce_run(supervisor, pairing_url)
+        local_pairing_url = with_token(local_base, token) if tunnel else None
+        _announce_run(supervisor, pairing_url, local_pairing_url)
         return await _run_while_server_available(
             supervisor,
             start_run=start_run,
@@ -936,7 +946,10 @@ def execute(
         bool,
         typer.Option(
             "--keep-run",
-            help="Retain successful Runwatch state after the dashboard closes.",
+            help=(
+                "Retain successful or cancelled Runwatch state after the dashboard "
+                "closes."
+            ),
         ),
     ] = False,
 ) -> None:

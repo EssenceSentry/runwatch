@@ -42,7 +42,7 @@ with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
   operational payloads. Response bodies are not read, redirects are not followed,
   periodic reminders use one rolling intent, and network plain HTTP requires an
   explicit opt-in.
-- Notification-aware removal of successful run state after the dashboard closes, with
+- Notification-aware removal of successful or cancelled run state after the dashboard closes, with
   incomplete outboxes retained for `runwatch open` recovery and `--keep-run` available
   for retained provenance.
 
@@ -103,18 +103,19 @@ emitted dynamically by cells cannot be predicted during preflight.
 
 Runwatch prints the run directory, editable notebook, pairing URL, and terminal QR code.
 By default the dashboard remains available for 90 seconds after the run reaches a
-terminal state, then closes automatically. If the run succeeded, Runwatch removes that
-run directory and removes the empty `.runwatch/runs` and `.runwatch` parents. When
+terminal state, then closes automatically. If the run succeeded or was cancelled,
+Runwatch removes that run directory and removes the empty `.runwatch/runs` and
+`.runwatch` parents. When
 notifications are configured, cleanup first waits up to
 `notifications.terminal_drain_timeout_seconds` for terminal event routing and delivery
-attempts. If the outbox is still nonterminal, the successful run is retained and the CLI
+attempts. If the outbox is still nonterminal, the run is retained and the CLI
 prints a reason plus `runwatch open RUN_DIR`; opening it restarts notification delivery
 without rerunning the notebook. The recovery controller conservatively retains the run
 when that dashboard closes because it did not itself observe normal notebook
 finalization. After confirming delivery, remove the retained state explicitly if it is
 no longer needed. Set `server.linger_seconds: 0` to close immediately, set it to `null`
-to keep the dashboard open until Ctrl+C, or use `--keep-run` to retain successful state
-after the original execution's dashboard closes.
+to keep the dashboard open until Ctrl+C, or use `--keep-run` to retain successful or
+cancelled state after the original execution's dashboard closes.
 
 For a no-AWS replay with live progress, local metrics, file monitoring, log tailing,
 and final notebook results, use the repository's
@@ -459,7 +460,7 @@ runwatch version
 `open` serves persisted state without starting notebook execution and retries durable
 notification delivery. It conservatively retains the run when the dashboard closes:
 only the controller that observed normal notebook finalization may authorize automatic
-successful-run cleanup.
+run cleanup.
 
 `status`, `context`, and `events` emit bounded presentation schema version 1 in JSON
 mode. They expose recovery-relevant lifecycle fields and safe summaries, not the raw
@@ -493,6 +494,8 @@ runwatch execute notebook.ipynb --share lan
 ```
 
 For a temporary public tunnel, install `cloudflared` and use `--share cloudflared`.
+Runwatch prints both the public pairing URL and a local loopback pairing URL; the QR
+code contains only the public URL.
 The pairing URL is a bearer credential. It is excluded from notifications by default
 and should be treated as a secret. See the
 [security guide](docs/security.md).

@@ -116,21 +116,21 @@ between the manifest and database steps. Purge advances the routing cursor to th
 high-water mark while disabling routing, so enabling notifications later never replays
 pre-purge events.
 
-Successful run directories are temporary operational state. The default 90-second
-post-terminal linger keeps the final dashboard state observable. Cleanup then waits a
-separate bounded interval for notification routing and every outbox item to reach a
-terminal result. A nonterminal outbox or drain error retains the successful run, emits
+Successful and cancelled run directories are temporary operational state. The default
+90-second post-terminal linger keeps the final dashboard state observable. Cleanup then
+waits a separate bounded interval for notification routing and every outbox item to
+reach a terminal result. A nonterminal outbox or drain error retains the run, emits
 `run.cleanup_retained`, and gives the operator `runwatch open RUN_DIR` to restart the
 workers without rerunning the notebook. The recovery controller conservatively retains
 the run when `open` closes; it did not itself observe normal notebook finalization and
-therefore cannot authorize automatic successful-run cleanup.
+therefore cannot authorize automatic run cleanup.
 
 When cleanup is eligible, the controller keeps its run lock and publishes a sibling
 cleanup fence before deleting the run directory. The sibling survives that deletion and
 prevents a successor from acquiring ownership until destructive cleanup is complete.
 Only then is the fence released and empty Runwatch parent directories removed. Paused,
-failed, cancelled, interrupted, write-back-conflicted, and explicitly retained runs
-remain available for inspection or recovery.
+failed, interrupted, write-back-conflicted, and explicitly retained runs remain
+available for inspection or recovery.
 
 ## Persistence and filesystem model
 

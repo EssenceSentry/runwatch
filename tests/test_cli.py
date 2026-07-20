@@ -99,19 +99,19 @@ def test_lock_token_default_directory_and_server_overrides(
     assert config.server.show_qr is False
 
 
-def test_success_cleanup_removes_empty_runwatch_parents(tmp_path: Path) -> None:
+def test_finished_cleanup_removes_empty_runwatch_parents(tmp_path: Path) -> None:
     run_dir = tmp_path / ".runwatch" / "runs" / "successful-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
     (run_dir / "runwatch.sqlite3").write_bytes(b"state")
 
-    cli._cleanup_successful_run(run_dir, tmp_path)
+    cli._cleanup_finished_run(run_dir, tmp_path)
 
     assert not run_dir.exists()
     assert not (tmp_path / ".runwatch").exists()
 
 
-def test_success_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
+def test_finished_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
     runs_dir = tmp_path / ".runwatch" / "runs"
     run_dir = runs_dir / "successful-run"
     retained = runs_dir / "failed-run"
@@ -120,7 +120,7 @@ def test_success_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
     (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
     (run_dir / "runwatch.sqlite3").write_bytes(b"state")
 
-    cli._cleanup_successful_run(run_dir, tmp_path)
+    cli._cleanup_finished_run(run_dir, tmp_path)
 
     assert not run_dir.exists()
     assert retained.is_dir()
@@ -128,7 +128,7 @@ def test_success_cleanup_preserves_other_runwatch_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_cleanup_requires_normal_wait_and_durable_finalization(
+async def test_automatic_cleanup_requires_normal_wait_and_durable_finalization(
     tmp_path: Path,
 ) -> None:
     supervisor = _supervisor(tmp_path)
@@ -141,18 +141,49 @@ async def test_success_cleanup_requires_normal_wait_and_durable_finalization(
         event_payload={"kernel_epoch": 0},
     )
 
-    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+    assert await cli._automatic_cleanup_decision(supervisor) == (False, None)
 
     supervisor._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
-    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+    assert await cli._automatic_cleanup_decision(supervisor) == (False, None)
 
     supervisor.store.mark_run_finalized(supervisor.run_id, RunStatus.SUCCEEDED)
     supervisor._wait_completed_normally = False  # noqa: SLF001 - cleanup gate probe
-    assert await cli._successful_cleanup_decision(supervisor) == (False, None)
+    assert await cli._automatic_cleanup_decision(supervisor) == (False, None)
 
     supervisor._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
-    assert await cli._successful_cleanup_decision(supervisor) == (True, None)
+    assert await cli._automatic_cleanup_decision(supervisor) == (True, None)
     await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_automatic_cleanup_accepts_cancelled_and_preserves_failed(
+    tmp_path: Path,
+) -> None:
+    cancelled = _supervisor(tmp_path / "cancelled")
+    cancelled.store.finish_run(
+        cancelled.run_id,
+        RunStatus.CANCELLED,
+        message="cancelled",
+        event_type="run.cancelled",
+        event_payload={"kernel_epoch": 0},
+    )
+    cancelled.store.mark_run_finalized(cancelled.run_id, RunStatus.CANCELLED)
+    cancelled._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
+    assert await cli._automatic_cleanup_decision(cancelled) == (True, None)
+    await cancelled.close()
+
+    failed = _supervisor(tmp_path / "failed")
+    failed.store.finish_run(
+        failed.run_id,
+        RunStatus.FAILED,
+        message="failed",
+        event_type="run.runner_error",
+        event_payload={"kernel_epoch": 0, "error_type": "Error", "error": "boom"},
+    )
+    failed.store.mark_run_finalized(failed.run_id, RunStatus.FAILED)
+    failed._wait_completed_normally = True  # noqa: SLF001 - cleanup gate probe
+    assert await cli._automatic_cleanup_decision(failed) == (False, None)
+    await failed.close()
 
 
 def test_run_lock_is_atomically_published_and_release_is_token_fenced(
@@ -290,7 +321,7 @@ def test_cleanup_helper_refuses_an_active_unfenced_owner(tmp_path: Path) -> None
     owner.acquire()
     try:
         with pytest.raises(RuntimeError, match="actively owned"):
-            cli._cleanup_successful_run(run_dir, tmp_path)
+            cli._cleanup_finished_run(run_dir, tmp_path)
         assert run_dir.is_dir()
     finally:
         owner.release()
@@ -373,7 +404,9 @@ def test_terminal_qr_uses_compact_error_correction(
 
 @pytest.mark.asyncio
 async def test_announce_and_run_status_exit_codes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     opened: list[str] = []
     qr: list[str] = []
@@ -388,9 +421,14 @@ async def test_announce_and_run_status_exit_codes(
         ),
         start=lambda: None,
     )
-    cli._announce_run(cast(RunSupervisor, supervisor), "https://example.test/?token=x")
+    public_url = "https://example.test/?token=x"
+    local_url = "http://127.0.0.1:8765/?token=x"
+    cli._announce_run(cast(RunSupervisor, supervisor), public_url, local_url)
     assert opened == ["https://example.test/?token=x"]
     assert qr == opened
+    output = capsys.readouterr().out
+    assert f"Dashboard: {public_url}" in output
+    assert f"Local dashboard: {local_url}" in output
 
     class FakeSupervisor:
         def __init__(self, status: RunStatus) -> None:
@@ -814,6 +852,7 @@ async def test_serve_writes_back_and_cleans_successful_default_run(
     updated = nbformat.read(notebook, as_version=4)
     assert updated.cells[0].outputs[0].text.strip() == "published"
     assert server_options["lifespan"] == "off"
+    assert server_options["timeout_graceful_shutdown"] == 5
     assert len(requests) == 1
     assert not run_dir.exists()
     assert not (tmp_path / ".runwatch").exists()
@@ -899,7 +938,7 @@ async def test_success_cleanup_retains_state_when_terminal_notification_is_pendi
     assert await cli._serve(supervisor, start_run=True) == 0
 
     output = capsys.readouterr().out
-    assert "Retained successful Runwatch state" in output
+    assert "Retained Runwatch state" in output
     assert "delivery attempt(s) remain pending" in output
     assert f"runwatch open {run_dir}" in output
     assert run_dir.is_dir()

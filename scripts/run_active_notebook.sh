@@ -37,5 +37,4 @@ exec "$workspace_dotenv" \
     -- \
     "$runwatch" execute "$notebook_path" \
     --config "$repo_root/.vscode/runwatch.yaml" \
-    --working-dir "$workspace_root" \
     --share cloudflared

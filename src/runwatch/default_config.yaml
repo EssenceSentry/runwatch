@@ -59,7 +59,7 @@ notifications:
   ntfy_topic: null
   # Optional periodic status notification interval (minimum 60 seconds).
   periodic_seconds: null
-  # Bound the terminal outbox drain before retaining successful run state for retry.
+  # Bound the terminal outbox drain before retaining disposable run state for retry.
   terminal_drain_timeout_seconds: 30.0
   # Failed destinations retry independently through the durable SQLite outbox.
   request_timeout_seconds: 15.0
