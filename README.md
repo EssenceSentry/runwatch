@@ -393,7 +393,16 @@ for item in tqdm(items, desc="Building features", unit="items"):
 Runwatch preserves tqdm's normal notebook output and emits structured updates at most
 twice per second by default. Updates reuse one hidden notebook display per bar, so a
 long loop does not append an output for every refresh. The dashboard scopes progress
-to the current cell and prefers the outermost bar when bars are nested. Set
+to the current cell and prefers the outermost bar when bars are nested. It keeps tqdm's
+recent-rate ETA and adds a Bayesian median finish time with an 80%
+posterior-predictive range
+using the current run's elapsed time and completed items. It compares a shared-rate
+model with a two-rate model, including the posterior probability that the new regime is
+materially slower. When that probability remains high, the estimate recalibrates from
+the inferred cache boundary instead of treating cache hits as real-work throughput.
+It then keeps testing recent windows against the current regime in both directions,
+requiring 99.99% posterior probability before rebasing. Large rate shifts accumulate
+that evidence quickly, while smaller shifts require longer observations. Set
 `notebook.capture_tqdm: false` to disable automatic capture, or adjust
 `notebook.tqdm_min_interval_seconds`. Progress created in a separate process is outside
 the notebook kernel and is not captured automatically.

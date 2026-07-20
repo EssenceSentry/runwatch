@@ -28,6 +28,7 @@ from runwatch.models import (
 )
 from runwatch.supervisor import RunSupervisor
 from runwatch.web import (
+    _dashboard_event_payload,
     _dashboard_event_signal,
     _delivery_batch,
     _event_stream,
@@ -37,6 +38,36 @@ from runwatch.web import (
 )
 
 _WEB_ARTIFACTS = Path(__file__).resolve().parents[1] / "web_artifacts"
+
+
+def test_dashboard_keeps_bayesian_progress_finish_times() -> None:
+    payload = _dashboard_event_payload(
+        {
+            "type": "notebook.progress",
+            "payload": {
+                "completed": 10,
+                "total": 100,
+                "metrics": {
+                    "source": "tqdm",
+                    "bayesian_finish_status": "cache_adjusted",
+                    "bayesian_change_probability": 0.997,
+                    "bayesian_finish_times": {
+                        "p10": "2026-07-20T18:01:00+00:00",
+                        "p50": "2026-07-20T18:33:00+00:00",
+                        "p90": "2026-07-20T19:27:00+00:00",
+                    },
+                },
+            },
+        }
+    )
+
+    assert payload["metrics"]["bayesian_finish_times"] == {
+        "p10": "2026-07-20T18:01:00+00:00",
+        "p50": "2026-07-20T18:33:00+00:00",
+        "p90": "2026-07-20T19:27:00+00:00",
+    }
+    assert payload["metrics"]["bayesian_finish_status"] == "cache_adjusted"
+    assert payload["metrics"]["bayesian_change_probability"] == 0.997
 
 
 @pytest.mark.asyncio
@@ -1039,6 +1070,23 @@ def test_dashboard_scopes_tqdm_progress_and_prefers_the_outermost_bar() -> None:
     assert "latest.payload.metrics.position || 0" in script
     assert "candidate.metrics?.progress_id === progressId" in script
     assert "payload.metrics?.closed === true" in script
+    assert "tqdm ETA" in script
+    assert "Bayesian finish" in script
+    assert (
+        "Possible cache-hit phase detected · recalibrating Bayesian finish time"
+        in script
+    )
+    assert "Possible sustained rate drift detected" in script
+    assert "slowdown probability" in script
+    assert "change probability" in script
+    assert "bayesian_finish_times" in script
+    assert "progress-finish" in script
+    assert "hourCycle: 'h23'" in script
+    assert "fmtFinishTime(bayesian.p50, true)" in script
+    assert "weekday: 'short'" not in script
+
+    template = (_WEB_ARTIFACTS / "runwatch/index.html").read_text(encoding="utf-8")
+    assert '<div id="progress-finish"' in template
 
 
 def test_dashboard_uses_resource_specific_summaries_and_terminal_semantics() -> None:

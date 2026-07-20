@@ -421,6 +421,13 @@ a.gloss-button:visited {
   white-space: nowrap;
 }
 
+.progress-finish {
+  margin-top: 4px;
+  color: var(--ink-2);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
 .notebook-progress-row {
   display: flex;
   align-items: center;

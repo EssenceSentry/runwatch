@@ -332,6 +332,19 @@ function progressRate(events, current) {
   return seconds > 0 ? (payload.completed - previous.payload.completed) / seconds : null;
 }
 
+function fmtFinishTime(value, includeDate = false) {
+  const date = toDate(value);
+  if (!date) return '—';
+  const options = {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  };
+  return includeDate
+    ? date.toLocaleString('en-US', { month: 'short', day: 'numeric', ...options })
+    : date.toLocaleTimeString('en-US', options);
+}
+
 function renderProgress(run, cells, events) {
   const current = cells.find(cell => cell.cell_index === run.current_cell_index) || cells.find(cell => cell.status === 'running');
   const executable = cells.filter(cell => cell.cell_type === 'code');
@@ -378,15 +391,33 @@ function renderProgress(run, cells, events) {
     const rate = closed || (hasTotal && payload.completed >= payload.total) ? null : progressRate(events, progressEvent);
     const rateCopy = rate && payload.unit ? `${fmtCompact(rate)} ${payload.unit}/s` : rate ? `${fmtCompact(rate)}/s` : '';
     const remaining = hasTotal && rate ? Math.max(0, payload.total - payload.completed) / rate : null;
-    $('progress-rate').textContent = [rateCopy, remaining != null ? `ETA ${fmtDuration(remaining)}` : ''].filter(Boolean).join(' · ');
+    const bayesian = payload.metrics?.bayesian_finish_times;
+    const bayesianStatus = payload.metrics?.bayesian_finish_status;
+    const changeProbability = payload.metrics?.bayesian_change_probability
+      ?? payload.metrics?.bayesian_slowdown_probability;
+    const bayesianReady = !closed && ['p10', 'p50', 'p90'].every(key => toDate(bayesian?.[key]));
+    const bayesianCopy = !closed && bayesianStatus === 'recalibrating'
+      ? `Possible cache-hit phase detected · recalibrating Bayesian finish time${finiteNumber(changeProbability) ? ` (${Math.round(100 * changeProbability)}% slowdown probability)` : ''}`
+      : !closed && bayesianStatus === 'recalibrating_drift'
+        ? `Possible sustained rate drift detected · recalibrating Bayesian finish time${finiteNumber(changeProbability) ? ` (${Math.round(100 * changeProbability)}% change probability)` : ''}`
+      : bayesianReady ? `Bayesian finish ${fmtFinishTime(bayesian.p50, true)} (80% ${fmtFinishTime(bayesian.p10)}–${fmtFinishTime(bayesian.p90)})` : '';
+    $('progress-rate').textContent = [rateCopy, remaining != null ? `tqdm ETA ${fmtDuration(remaining)}` : ''].filter(Boolean).join(' · ');
+    $('progress-finish').textContent = bayesianCopy;
+    $('progress-finish').hidden = !bayesianCopy;
   } else {
     $('reported-progress').textContent = executable.length ? `${done} / ${executable.length} code cells` : 'Preparing execution';
     $('reported-percent').textContent = executable.length ? `${Math.round(notebookPercent)}%` : '';
     $('reported-message').textContent = current ? 'Notebook execution progress' : 'Waiting for the notebook to start.';
     $('progress-rate').textContent = '';
+    $('progress-finish').textContent = '';
+    $('progress-finish').hidden = true;
   }
 
-  if (RUN_TERMINAL.has(run.status)) $('progress-rate').textContent = '';
+  if (RUN_TERMINAL.has(run.status)) {
+    $('progress-rate').textContent = '';
+    $('progress-finish').textContent = '';
+    $('progress-finish').hidden = true;
+  }
 
   const primaryTrack = $('reported-progress-bar');
   primaryTrack.value = primaryPercent;

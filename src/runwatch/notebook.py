@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -24,6 +25,7 @@ from nbclient.util import run_hook, run_sync
 from nbformat import NotebookNode
 from traitlets.config import Config
 
+from ._eta import CacheAwareBayesianETA
 from ._fs import atomic_write_bytes
 from ._tqdm import tqdm_bootstrap_code
 from .emit import EVENT_MIME_TYPE, FALLBACK_PREFIX, RESOURCE_MIME_TYPE
@@ -48,6 +50,34 @@ _WRITEBACK_STATE_FILENAME = "writeback-state.json"
 _EVENT_TEXT_MAX_CHARS = 120
 _EVENT_RESOURCE_ID_MAX_CHARS = 64
 _EVENT_RESOURCE_SAMPLE_SIZE = 5
+
+
+def _with_bayesian_tqdm_eta(
+    progress: ProgressEvent,
+    estimators: dict[str, CacheAwareBayesianETA],
+) -> ProgressEvent:
+    metrics = progress.metrics
+    elapsed = metrics.get("elapsed_seconds")
+    progress_id = metrics.get("progress_id")
+    if (
+        metrics.get("source") != "tqdm"
+        or not isinstance(progress_id, str)
+        or not isinstance(elapsed, (int, float))
+    ):
+        return progress
+    eta, status, change_probability = estimators.setdefault(
+        progress_id, CacheAwareBayesianETA()
+    ).update(progress.completed, progress.total, float(elapsed))
+    updated_metrics = {**metrics, "bayesian_finish_status": status}
+    if eta:
+        observed_at = datetime.now(timezone.utc)
+        updated_metrics["bayesian_finish_times"] = {
+            key: (observed_at + timedelta(seconds=seconds)).isoformat()
+            for key, seconds in eta.items()
+        }
+    if change_probability is not None:
+        updated_metrics["bayesian_change_probability"] = change_probability
+    return progress.model_copy(update={"metrics": updated_metrics})
 
 
 @dataclass(frozen=True)
@@ -374,6 +404,7 @@ class NotebookRunner:
         self.kernel_epoch = 0
         self.command_queue: asyncio.Queue[RunnerCommand] = asyncio.Queue()
         self._pending_output_tasks: set[asyncio.Task[Any]] = set()
+        self._bayesian_tqdm_etas: dict[str, CacheAwareBayesianETA] = {}
         self._pending_output_errors: list[Exception] = []
         self._pending_cell_outputs: dict[int, dict[str, Any]] = {}
         self._pending_cell_output_counts: dict[int, int] = {}
@@ -1404,6 +1435,10 @@ class NotebookRunner:
             elif mime_type == EVENT_MIME_TYPE:
                 try:
                     progress = ProgressEvent.model_validate(payload)
+                    progress = _with_bayesian_tqdm_eta(
+                        progress,
+                        self._bayesian_tqdm_etas,
+                    )
                     self._schedule(
                         self.bus.publish(
                             "notebook.progress",

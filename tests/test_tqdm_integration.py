@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -213,6 +214,15 @@ bar.close()
     assert final_payload["message"] == "Loading rows"
     assert final_payload["metrics"]["source"] == "tqdm"
     assert final_payload["metrics"]["closed"] is True
+    finish_times = final_payload["metrics"]["bayesian_finish_times"]
+    assert set(finish_times) == {"p10", "p50", "p90"}
+    assert all(
+        abs(
+            (datetime.fromisoformat(value) - datetime.now(timezone.utc)).total_seconds()
+        )
+        < 5
+        for value in finish_times.values()
+    )
 
     executed = nbformat.read(supervisor.output_path, as_version=4)
     outputs = executed.cells[1].outputs
