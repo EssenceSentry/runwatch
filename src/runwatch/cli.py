@@ -404,7 +404,7 @@ def _require_new_run_dir(run_dir: Path, *, run_lock: RunLock | None = None) -> N
     )
     if occupied:
         raise typer.BadParameter(
-            f"Run directory {run_dir} is not empty; choose a new directory"
+            f"Run directory is not empty; choose a new directory: {run_dir}"
         )
 
 

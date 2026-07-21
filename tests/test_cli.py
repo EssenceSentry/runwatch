@@ -1367,8 +1367,7 @@ def test_execute_resume_restart_and_open_dispatch(
         cli.app, ["execute", str(notebook), "--run-dir", str(occupied)]
     )
     assert rejected.exit_code != 0
-    assert "is not" in rejected.output
-    assert "empty; choose a new directory" in rejected.output
+    assert "Run directory is not empty; choose a new directory" in rejected.output
     assert (occupied / "keep.txt").read_text(encoding="utf-8") == "owned"
 
     supervisor = _supervisor(tmp_path / "existing")
