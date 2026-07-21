@@ -227,6 +227,43 @@ async def test_cell_failure_delivers_webhook_and_ntfy_without_pairing_url(
 
 
 @pytest.mark.asyncio
+async def test_rotated_dashboard_link_is_ntfy_click_target_only(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    store = notification_store(tmp_path)
+    manager = NotificationManager(
+        settings=NotificationSettings(
+            ntfy_base_url="https://ntfy.example",
+            ntfy_topic="runs",
+        ),
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    pairing_url = "https://new.trycloudflare.com/?token=secret-token"
+
+    assert await manager.notify_dashboard_link_changed(pairing_url)
+    assert len(requests) == 1
+    assert str(requests[0].url) == "https://ntfy.example/runs"
+    assert requests[0].headers["click"] == pairing_url
+    assert requests[0].content == (b"Runwatch replaced the Cloudflare dashboard link.")
+    events = store.recent_events("run", limit=100)
+    assert events[-1]["type"] == "notification.dashboard_link_sent"
+    assert "secret-token" not in str(events)
+
+    await manager.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_delivery_retries_then_deduplicates_only_after_success(
     tmp_path: Path,
 ) -> None:

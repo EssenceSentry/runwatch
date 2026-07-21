@@ -85,6 +85,9 @@ multi-user service.
 - A pairing URL is a bearer credential and can leak through browser history, copied
   messages, logs, or screenshots.
 - `no-store` reduces cache retention but does not make a pairing URL safe to disclose.
+- When Cloudflare sharing and ntfy are both configured, a replacement pairing URL is
+  deliberately sent to that ntfy topic as a clickable target. Use a private topic and
+  treat access to it as equivalent to access to the dashboard.
   An authenticated dashboard intentionally displays bounded notebook output,
   tracebacks, resource identifiers and metrics, and log tails. That user-controlled
   text can itself contain paths, secrets, or other sensitive values.

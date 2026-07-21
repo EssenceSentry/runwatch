@@ -27,6 +27,7 @@ from runwatch.models import (
     RunwatchConfig,
 )
 from runwatch.supervisor import RunSupervisor
+from runwatch.tunnel import DashboardShareState
 from runwatch.web import (
     _dashboard_event_payload,
     _dashboard_event_signal,
@@ -34,6 +35,7 @@ from runwatch.web import (
     _event_stream,
     _events_after,
     _ntfy_deep_link,
+    _qr_svg,
     create_app,
 )
 
@@ -192,6 +194,55 @@ def test_dashboard_auth_and_reduced_remote_surface(
     assert state_response.headers["cache-control"] == "no-store"
     assert client.post("/api/actions/cancel", json={}).status_code == 404
     assert client.get("/notifications/ntfy/open").status_code == 404
+    supervisor.store.close()
+
+
+def test_local_dashboard_exposes_current_cloudflare_link_and_qr(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "empty.ipynb"
+    nbformat.write(nbformat.v4.new_notebook(), notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+    share = DashboardShareState()
+    client = TestClient(create_app(supervisor, "secret-token", dashboard_share=share))
+
+    assert client.get("/api/share").status_code == 401
+    dashboard = client.get("/?token=secret-token")
+    assert 'id="share-panel"' in dashboard.text
+    assert 'id="cloudflare-qr"' in dashboard.text
+
+    starting = client.get("/api/share")
+    assert starting.headers["cache-control"] == "no-store"
+    assert starting.json()["status"] == "starting"
+    assert starting.json()["href"] is None
+
+    share.ready("https://first.trycloudflare.com")
+    first = client.get("/api/share").json()
+    first_href = "https://first.trycloudflare.com/?token=secret-token"
+    assert first == {
+        "status": "ready",
+        "href": first_href,
+        "qr_url": "/api/share/qr?generation=1",
+        "generation": 1,
+        "message": None,
+    }
+    qr = client.get(first["qr_url"])
+    assert qr.headers["content-type"].startswith("image/svg+xml")
+    assert qr.headers["cache-control"] == "no-store"
+    assert qr.text == _qr_svg(first_href)
+
+    share.ready("https://second.trycloudflare.com")
+    second = client.get("/api/share").json()
+    assert second["generation"] == 2
+    assert second["href"] == ("https://second.trycloudflare.com/?token=secret-token")
+    assert second["qr_url"] == "/api/share/qr?generation=2"
+    assert second["href"] not in client.get("/api/state").text
     supervisor.store.close()
 
 

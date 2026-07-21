@@ -45,6 +45,7 @@ server:
   # Optional externally managed base URL. Pairing tokens are appended at runtime.
   public_url: null
   open_browser: true
+  # Show the current public-link QR inside the authenticated local dashboard.
   show_qr: true
   cloudflared_binary: cloudflared
   # Keep the terminal result visible briefly before automatic close and cleanup.

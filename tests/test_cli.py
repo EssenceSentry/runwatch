@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -25,6 +26,7 @@ from runwatch.models import (
 from runwatch.notification_config import notification_destinations
 from runwatch.storage import RunStore
 from runwatch.supervisor import RunSupervisor
+from runwatch.tunnel import DashboardShareState
 
 runner = CliRunner()
 
@@ -328,36 +330,7 @@ def test_cleanup_helper_refuses_an_active_unfenced_owner(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_dashboard_url_selection_and_server_start_failure(monkeypatch) -> None:
-    public = RunwatchConfig.model_validate(
-        {"server": {"public_url": "https://example.test/root/"}}
-    )
-    assert await cli._dashboard_base(public, "http://local") == (
-        "https://example.test/root",
-        None,
-    )
-
-    lan = RunwatchConfig.model_validate({"server": {"share": "lan", "port": 9876}})
-    monkeypatch.setattr(cli, "discover_lan_ip", lambda: "192.0.2.3")
-    assert await cli._dashboard_base(lan, "http://local") == (
-        "http://192.0.2.3:9876",
-        None,
-    )
-
-    class FakeTunnel:
-        def __init__(self, binary: str) -> None:
-            assert binary == "cloudflared"
-
-        async def start(self, local: str) -> str:
-            assert local == "http://local"
-            return "https://tunnel.example"
-
-    monkeypatch.setattr(cli, "CloudflaredTunnel", FakeTunnel)
-    cloud = RunwatchConfig.model_validate({"server": {"share": "cloudflared"}})
-    base, tunnel = await cli._dashboard_base(cloud, "http://local")
-    assert base == "https://tunnel.example"
-    assert isinstance(tunnel, FakeTunnel)
-
+async def test_server_start_failure() -> None:
     server = SimpleNamespace(started=False)
 
     async def fail() -> None:
@@ -369,39 +342,6 @@ async def test_dashboard_url_selection_and_server_start_failure(monkeypatch) -> 
         await cli._wait_for_server(server, task)  # type: ignore[arg-type]
 
 
-def test_terminal_qr_uses_compact_error_correction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: dict[str, object] = {}
-
-    class FakeQrCode:
-        def __init__(self, **kwargs: object) -> None:
-            calls["options"] = kwargs
-
-        def add_data(self, value: str) -> None:
-            calls["value"] = value
-
-        def make(self, *, fit: bool) -> None:
-            calls["fit"] = fit
-
-        def print_ascii(self, *, invert: bool) -> None:
-            calls["invert"] = invert
-
-    monkeypatch.setattr(cli.qrcode, "QRCode", FakeQrCode)
-
-    cli._print_qr("https://example.test/?token=secret")
-
-    assert calls == {
-        "options": {
-            "border": 1,
-            "error_correction": cli.ERROR_CORRECT_L,
-        },
-        "value": "https://example.test/?token=secret",
-        "fit": True,
-        "invert": True,
-    }
-
-
 @pytest.mark.asyncio
 async def test_announce_and_run_status_exit_codes(
     tmp_path: Path,
@@ -409,9 +349,7 @@ async def test_announce_and_run_status_exit_codes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     opened: list[str] = []
-    qr: list[str] = []
     monkeypatch.setattr(cli.webbrowser, "open", opened.append)
-    monkeypatch.setattr(cli, "_print_qr", qr.append)
     supervisor = SimpleNamespace(
         run_dir=tmp_path / "run",
         source_path=tmp_path / "source.ipynb",
@@ -421,14 +359,12 @@ async def test_announce_and_run_status_exit_codes(
         ),
         start=lambda: None,
     )
-    public_url = "https://example.test/?token=x"
     local_url = "http://127.0.0.1:8765/?token=x"
-    cli._announce_run(cast(RunSupervisor, supervisor), public_url, local_url)
-    assert opened == ["https://example.test/?token=x"]
-    assert qr == opened
+    cli._announce_run(cast(RunSupervisor, supervisor), local_url)
+    assert opened == [local_url]
     output = capsys.readouterr().out
-    assert f"Dashboard: {public_url}" in output
-    assert f"Local dashboard: {local_url}" in output
+    assert f"Dashboard: {local_url}" in output
+    assert "trycloudflare.com" not in output
 
     class FakeSupervisor:
         def __init__(self, status: RunStatus) -> None:
@@ -451,6 +387,108 @@ async def test_announce_and_run_status_exit_codes(
     assert await cli._run_and_linger(cast(RunSupervisor, success), start_run=True) == 0
     assert await cli._run_and_linger(cast(RunSupervisor, failed), start_run=True) == 1
     assert success.started and failed.started
+
+
+@pytest.mark.asyncio
+async def test_cloudflared_serve_announces_local_url_and_routes_rotated_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    published: list[tuple[str, dict[str, object]]] = []
+    notified: list[str] = []
+
+    class FakeBus:
+        async def publish(self, event_type: str, payload: dict[str, object]) -> None:
+            published.append((event_type, payload))
+
+    class FakeNotifications:
+        async def notify_dashboard_link_changed(self, url: str) -> bool:
+            notified.append(url)
+            return True
+
+    class FakeSupervisor:
+        run_dir = tmp_path / "run"
+        source_path = run_dir / "source.ipynb"
+        controller_token = "controller-token"
+        bus = FakeBus()
+        notifications = FakeNotifications()
+        config = RunwatchConfig.model_validate(
+            {
+                "server": {
+                    "share": "cloudflared",
+                    "open_browser": False,
+                }
+            }
+        )
+
+        def attach_dashboard_links(self, manager: object) -> None:
+            del manager
+
+    class FakeServer:
+        def __init__(self, config: object) -> None:
+            del config
+            self.started = False
+            self.should_exit = False
+            self.install_signal_handlers: object | None = None
+
+        async def serve(self) -> None:
+            self.started = True
+            while not self.should_exit:
+                await asyncio.sleep(0)
+
+    class FakeCloudflaredShare:
+        def __init__(self, **kwargs: object) -> None:
+            captured["share_options"] = kwargs
+            self.state = cast(DashboardShareState, kwargs["state"])
+            self.on_rotation = cast(
+                Callable[[str], Awaitable[None]], kwargs["on_rotation"]
+            )
+            self.closed = False
+
+        async def start(self) -> str:
+            self.state.ready("https://initial.trycloudflare.com")
+            self.state.ready("https://replacement.trycloudflare.com")
+            await self.on_rotation("https://replacement.trycloudflare.com")
+            return "https://initial.trycloudflare.com"
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def finish(supervisor: RunSupervisor, lock: cli.RunLock) -> None:
+        del supervisor
+        lock.release()
+
+    async def finish_work(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        return 0
+
+    def fake_create_app(*args: object, **kwargs: object) -> object:
+        captured["dashboard_share"] = kwargs["dashboard_share"]
+        return object()
+
+    announced: list[str] = []
+    monkeypatch.setattr(cli, "CloudflaredShare", FakeCloudflaredShare)
+    monkeypatch.setattr(cli, "create_app", fake_create_app)
+    monkeypatch.setattr(
+        cli, "_announce_run", lambda _supervisor, url: announced.append(url)
+    )
+    monkeypatch.setattr(cli, "_run_while_server_available", finish_work)
+    monkeypatch.setattr(cli, "_finish_serve", finish)
+    monkeypatch.setattr(cli, "DashboardLinkManager", lambda **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
+
+    assert await cli._serve(cast(RunSupervisor, FakeSupervisor()), start_run=True) == 0
+    assert len(announced) == 1
+    assert announced[0].startswith("http://127.0.0.1:8765/?token=")
+    assert "trycloudflare.com" not in announced[0]
+    assert notified == [
+        "https://replacement.trycloudflare.com/?token="
+        + announced[0].split("token=", 1)[1]
+    ]
+    assert published == [("dashboard.share_rotated", {"generation": 2})]
+    share_options = cast(dict[str, object], captured["share_options"])
+    assert captured["dashboard_share"] is share_options["state"]
 
 
 @pytest.mark.asyncio
@@ -694,7 +732,7 @@ async def test_serve_stops_work_when_server_crashes_after_startup(
     monkeypatch.setattr(cli, "_run_and_linger", wait_for_server_failure)
     monkeypatch.setattr(cli, "_finish_serve", record_finish)
     monkeypatch.setattr(cli, "_announce_run", lambda *args: None)
-    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "DashboardLinkManager", lambda **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
@@ -757,7 +795,7 @@ async def test_server_crash_pauses_real_supervisor_after_runner_is_cancelled(
 
     monkeypatch.setattr(supervisor.runner, "run", run_until_server_crashes)
     monkeypatch.setattr(cli, "_announce_run", lambda *args: None)
-    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Server", CrashingServer)
 
@@ -845,7 +883,7 @@ async def test_serve_writes_back_and_cleans_successful_default_run(
 
     monkeypatch.setattr(cli.uvicorn, "Config", fake_server_config)
     monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
-    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
 
     assert await cli._serve(supervisor, start_run=True) == 0
 
@@ -932,7 +970,7 @@ async def test_success_cleanup_retains_state_when_terminal_notification_is_pendi
         return 0
 
     monkeypatch.setattr(cli, "_run_and_linger", finish_without_kernel)
-    monkeypatch.setattr(cli, "create_app", lambda *args: object())
+    monkeypatch.setattr(cli, "create_app", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Config", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "Server", FakeServer)
     assert await cli._serve(supervisor, start_run=True) == 0

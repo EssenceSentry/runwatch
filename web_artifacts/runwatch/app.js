@@ -1,5 +1,6 @@
 const $ = id => document.getElementById(id);
 let state = null;
+let shareState = null;
 let refreshTimer = null;
 const mascotState = {
   catalog: null,
@@ -153,7 +154,7 @@ function scheduleRefresh(delay = 160) {
   refreshTimer = setTimeout(async () => {
     refreshTimer = null;
     try {
-      state = await api('/api/state');
+      [state, shareState] = await Promise.all([api('/api/state'), api('/api/share')]);
       render();
       setConnection('LIVE');
     } catch {
@@ -161,6 +162,52 @@ function scheduleRefresh(delay = 160) {
     }
   }, delay);
 }
+
+function renderShare() {
+  const panel = $('share-panel');
+  if (!panel || !shareState || shareState.status === 'disabled') {
+    if (panel) panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const ready = Boolean(shareState.href);
+  const link = $('cloudflare-link');
+  const copy = $('copy-cloudflare-link');
+  const qr = $('cloudflare-qr');
+  const qrFrame = $('share-qr-frame');
+  link.hidden = !ready;
+  copy.hidden = !ready;
+  if (qr) qr.hidden = !ready || !shareState.qr_url;
+  if (qrFrame) qrFrame.hidden = !ready || !shareState.qr_url;
+  if (ready) {
+    link.href = shareState.href;
+    let host = 'Open Cloudflare dashboard';
+    try { host = new URL(shareState.href).host; } catch {}
+    $('cloudflare-link-label').textContent = host;
+    if (qr && shareState.qr_url && qr.dataset.generation !== String(shareState.generation)) {
+      qr.src = shareState.qr_url;
+      qr.dataset.generation = String(shareState.generation);
+    }
+  }
+  const defaults = {
+    starting: 'Preparing the public link…',
+    ready: 'This link and QR stay current if Runwatch replaces the tunnel.',
+    rotating: 'The old link stopped responding. Runwatch is replacing it…',
+    degraded: 'Replacement failed. Runwatch will keep trying.',
+    closed: 'Cloudflare sharing has stopped.',
+  };
+  $('share-message').textContent = shareState.message || defaults[shareState.status] || '';
+}
+
+$('copy-cloudflare-link')?.addEventListener('click', async () => {
+  if (!shareState?.href) return;
+  try {
+    await navigator.clipboard.writeText(shareState.href);
+    toast('Cloudflare link copied.');
+  } catch {
+    toast('Could not copy the Cloudflare link.', true);
+  }
+});
 
 function mascotAssetUrl(imageName) {
   const narrator = $('mascot-narrator');
@@ -882,6 +929,7 @@ function humanEvent(event) {
   if (event.type === 'resource.registered') return [`${eventResourceName(event)} detected`, 'Runwatch started monitoring this resource.', 'info'];
   if (event.type === 'resource.link_ready') return ['Dashboard ready', 'The captured local dashboard can now be opened.', 'success'];
   if (event.type === 'resource.link_failed') return ['Dashboard unavailable', payload.message || 'The captured dashboard link could not be prepared.', 'error'];
+  if (event.type === 'dashboard.share_rotated') return ['Cloudflare link replaced', 'The public link and QR were updated.', 'success'];
   if (event.type === 'resource.monitor_error' || event.type === 'resource.monitor_failed') return [`${eventResourceName(event)} monitoring failed`, payload.error || 'Runwatch could not inspect this resource.', 'error'];
   if (event.type === 'resource.stop_requested') return [`Stopping ${eventResourceName(event)}`, 'Remote cancellation was requested.', 'warning'];
   if (event.type === 'resource.stop_confirmed') return [`${eventResourceName(event)} stopped`, 'The provider confirmed the stop request.', 'success'];
@@ -930,6 +978,7 @@ function renderEvents(events) {
 
 function render() {
   const {run, cells, resources, events, capabilities} = state;
+  renderShare();
   $('run-name').textContent = run.name;
   $('run-message').textContent = run.message || 'Monitoring notebook execution.';
   $('run-status').textContent = friendlyStatus(run.status);

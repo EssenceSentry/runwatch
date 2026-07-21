@@ -11,6 +11,7 @@ from sysconfig import get_path
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote, urlsplit
 
+import qrcode
 from fastapi import (
     Cookie,
     Depends,
@@ -26,10 +27,12 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from qrcode.constants import ERROR_CORRECT_L
 
 from ._notebook_snapshot import (
     NotebookSnapshotChanged,
@@ -44,7 +47,7 @@ from .models import NotificationSettings
 from .resource_manager import ResourceStopRejected
 from .schema_versions import DASHBOARD_SCHEMA_VERSION
 from .supervisor import RunSupervisor
-from .tunnel import with_token
+from .tunnel import DashboardShareState, with_token
 
 _COOKIE_NAME = DASHBOARD_ACCESS_COOKIE
 _MASCOT_ASSET_NAMES = frozenset(
@@ -315,6 +318,13 @@ def _notebook_renderer(request: Request) -> NotebookSnapshotRenderer:
     )
 
 
+def _dashboard_share(request: Request) -> DashboardShareState | None:
+    return cast(
+        DashboardShareState | None,
+        getattr(request.app.state, "runwatch_dashboard_share", None),
+    )
+
+
 def _ntfy_deep_link(settings: NotificationSettings) -> str | None:
     if not settings.ntfy_base_url or not settings.ntfy_topic:
         return None
@@ -352,6 +362,72 @@ async def _health(_request: Request) -> dict[str, str]:
     return {"status": "ok"}
 
 
+async def _share_snapshot(request: Request) -> JSONResponse:
+    share = _dashboard_share(request)
+    if share is None:
+        payload: dict[str, Any] = {
+            "status": "disabled",
+            "href": None,
+            "qr_url": None,
+            "generation": 0,
+            "message": None,
+        }
+    else:
+        snapshot = share.snapshot()
+        href = (
+            with_token(snapshot.public_url, _auth(request).token)
+            if snapshot.public_url is not None
+            else None
+        )
+        payload = {
+            "status": snapshot.status,
+            "href": href,
+            "qr_url": (
+                f"/api/share/qr?generation={snapshot.generation}"
+                if href is not None and _supervisor(request).config.server.show_qr
+                else None
+            ),
+            "generation": snapshot.generation,
+            "message": snapshot.message,
+        }
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+def _qr_svg(value: str) -> str:
+    qr = qrcode.QRCode(border=2, error_correction=ERROR_CORRECT_L)
+    qr.add_data(value)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    size = len(matrix)
+    modules = "".join(
+        f"M{x} {y}h1v1h-1z"
+        for y, row in enumerate(matrix)
+        for x, enabled in enumerate(row)
+        if enabled
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" '
+        'shape-rendering="crispEdges">'
+        f'<path fill="#fff" d="M0 0h{size}v{size}H0z"/>'
+        f'<path fill="#111827" d="{modules}"/></svg>'
+    )
+
+
+async def _share_qr(request: Request) -> Response:
+    if not _supervisor(request).config.server.show_qr:
+        raise HTTPException(404, "Dashboard QR display is disabled")
+    share = _dashboard_share(request)
+    snapshot = share.snapshot() if share is not None else None
+    if snapshot is None or snapshot.public_url is None:
+        raise HTTPException(404, "Cloudflare sharing is not ready")
+    href = with_token(snapshot.public_url, _auth(request).token)
+    return Response(
+        _qr_svg(href),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def _dashboard(
     request: Request,
     token: str | None = Query(default=None),
@@ -374,6 +450,7 @@ async def _dashboard(
             "run_name": supervisor.name,
             "asset_version": request.app.state.runwatch_asset_version,
             "mascot_showcase": request.app.state.runwatch_mascot_showcase,
+            "show_share_qr": supervisor.config.server.show_qr,
             "ntfy_enabled": _ntfy_deep_link(supervisor.config.notifications)
             is not None,
         },
@@ -901,6 +978,7 @@ def create_app(
     supervisor: RunSupervisor,
     access_token: str,
     *,
+    dashboard_share: DashboardShareState | None = None,
     web_artifacts_root: Path | None = None,
     mascot_showcase: bool | None = None,
 ) -> FastAPI:
@@ -916,6 +994,7 @@ def create_app(
     app = FastAPI(title="Runwatch", docs_url=None, redoc_url=None)
     app.state.runwatch_supervisor = supervisor
     app.state.runwatch_auth = DashboardAuth(access_token)
+    app.state.runwatch_dashboard_share = dashboard_share
     app.state.runwatch_notebook_renderer = NotebookSnapshotRenderer(
         source_path=supervisor.source_path,
         partial_output_path=supervisor.partial_output_path,
@@ -1009,6 +1088,18 @@ def create_app(
     )
     app.add_api_route(
         "/api/state", _state_snapshot, methods=["GET"], dependencies=auth_dependency
+    )
+    app.add_api_route(
+        "/api/share",
+        _share_snapshot,
+        methods=["GET"],
+        dependencies=auth_dependency,
+    )
+    app.add_api_route(
+        "/api/share/qr",
+        _share_qr,
+        methods=["GET"],
+        dependencies=auth_dependency,
     )
     app.add_api_route(
         "/api/events", _stream_events, methods=["GET"], dependencies=auth_dependency

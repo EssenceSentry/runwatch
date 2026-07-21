@@ -101,7 +101,9 @@ kernel availability, paths, sharing prerequisites, configured adapters, and term
 conditions without starting a kernel, dashboard, or provider resource. Resources
 emitted dynamically by cells cannot be predicted during preflight.
 
-Runwatch prints the run directory, editable notebook, pairing URL, and terminal QR code.
+Runwatch prints the run directory, editable notebook, and pairing URL. With Cloudflare
+sharing, that pairing URL is the authenticated localhost dashboard; the current public
+link and QR live on that page.
 By default the dashboard remains available for 90 seconds after the run reaches a
 terminal state, then closes automatically. If the run succeeded or was cancelled,
 Runwatch removes that run directory and removes the empty `.runwatch/runs` and
@@ -503,10 +505,14 @@ runwatch execute notebook.ipynb --share lan
 ```
 
 For a temporary public tunnel, install `cloudflared` and use `--share cloudflared`.
-Runwatch prints both the public pairing URL and a local loopback pairing URL; the QR
-code contains only the public URL.
-The pairing URL is a bearer credential. It is excluded from notifications by default
-and should be treated as a secret. See the
+Runwatch prints only the local loopback pairing URL. Open it to get the current public
+Cloudflare link and QR. Runwatch checks that public route throughout the run and, after
+repeated failures, replaces only the tunnel: the notebook kernel and local dashboard
+keep running while the link and QR update. If ntfy is configured, the replacement
+pairing URL is also sent as the notification's clickable target.
+
+The pairing URL is a bearer credential. Configure ntfy only with a private topic you
+trust to receive it. Otherwise keep the URL private. See the
 [security guide](docs/security.md).
 
 ## Agent workflow

@@ -7,7 +7,9 @@ from collections import deque
 import pytest
 
 from runwatch.tunnel import (
+    CloudflaredShare,
     CloudflaredTunnel,
+    DashboardShareState,
     discover_lan_ip,
     with_token,
 )
@@ -149,3 +151,68 @@ async def test_drain_without_process_is_noop() -> None:
     tunnel = CloudflaredTunnel()
     await tunnel._drain_output()
     await tunnel.close()
+
+
+@pytest.mark.asyncio
+async def test_cloudflared_share_replaces_unhealthy_tunnel_without_stopping_local_url() -> (
+    None
+):
+    class ManagedTunnel(CloudflaredTunnel):
+        def __init__(self, url: str) -> None:
+            super().__init__()
+            self.url = url
+            self.active = False
+            self.closed = False
+
+        @property
+        def running(self) -> bool:
+            return self.active
+
+        async def start(self, local_url: str, *, timeout_seconds: float = 30.0) -> str:
+            del timeout_seconds
+            assert local_url == "http://127.0.0.1:8765"
+            self.active = True
+            return self.url
+
+        async def close(self) -> None:
+            self.active = False
+            self.closed = True
+
+    old = ManagedTunnel("https://old.trycloudflare.com")
+    new = ManagedTunnel("https://new.trycloudflare.com")
+    tunnels = iter([old, new])
+    rotated: list[str] = []
+    rotation_complete = asyncio.Event()
+
+    async def health_check(url: str) -> bool:
+        return url == new.url
+
+    async def on_rotation(url: str) -> None:
+        rotated.append(url)
+        rotation_complete.set()
+
+    state = DashboardShareState()
+    share = CloudflaredShare(
+        local_url="http://127.0.0.1:8765",
+        state=state,
+        tunnel_factory=lambda: next(tunnels),
+        health_check=health_check,
+        health_interval_seconds=0.001,
+        failure_threshold=2,
+        on_rotation=on_rotation,
+    )
+
+    assert await share.start() == old.url
+    await asyncio.wait_for(rotation_complete.wait(), timeout=1)
+
+    snapshot = state.snapshot()
+    assert snapshot.status == "ready"
+    assert snapshot.public_url == new.url
+    assert snapshot.generation == 2
+    assert rotated == [new.url]
+    assert old.closed
+    assert new.running
+
+    await share.close()
+    assert new.closed
+    assert state.snapshot().status == "closed"

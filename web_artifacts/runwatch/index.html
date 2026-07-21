@@ -55,6 +55,29 @@
       </div>
     </header>
 
+    <section id="share-panel" class="share-panel panel surface" aria-labelledby="share-title" hidden>
+      <div class="share-copy">
+        <div class="card-label">CLOUDFLARE ACCESS</div>
+        <h2 id="share-title">Open this run from another device</h2>
+        <p id="share-message" class="muted">Preparing the public link…</p>
+        <div class="share-actions">
+          <a
+            id="cloudflare-link"
+            class="gloss-button blue share-link"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+          ><span id="cloudflare-link-label">Open Cloudflare dashboard</span></a>
+          <button id="copy-cloudflare-link" class="soft-button" type="button"><span>Copy link</span></button>
+        </div>
+      </div>
+      {% if show_share_qr %}
+      <div id="share-qr-frame" class="share-qr-frame">
+        <img id="cloudflare-qr" alt="QR code for the current Cloudflare dashboard link" />
+      </div>
+      {% endif %}
+    </section>
+
     <section class="run-overview panel surface" aria-labelledby="current-label">
       <div class="progress-main">
         <div class="overview-heading">

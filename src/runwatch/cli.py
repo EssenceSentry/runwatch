@@ -16,10 +16,8 @@ from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import psutil
-import qrcode
 import typer
 import uvicorn
-from qrcode.constants import ERROR_CORRECT_L
 
 from . import __version__
 from ._fs import PRIVATE_DIRECTORY_MODE, atomic_write_bytes, ensure_private_directory
@@ -47,7 +45,12 @@ from .storage import (
     source_hash,
 )
 from .supervisor import RunSupervisor
-from .tunnel import CloudflaredTunnel, discover_lan_ip, with_token
+from .tunnel import (
+    CloudflaredShare,
+    DashboardShareState,
+    discover_lan_ip,
+    with_token,
+)
 from .validation import ValidationReport, validate_execution
 from .web import create_app
 
@@ -299,16 +302,6 @@ class RunLock:
             self.held = False
 
 
-def _print_qr(url: str) -> None:
-    qr = qrcode.QRCode(
-        border=1,
-        error_correction=ERROR_CORRECT_L,
-    )
-    qr.add_data(url)
-    qr.make(fit=True)
-    qr.print_ascii(invert=True)
-
-
 def _default_run_dir(working_dir: Path, notebook: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return (
@@ -508,32 +501,14 @@ async def _run_while_server_available(
         await stop.wait_for_cancellation()
 
 
-async def _dashboard_base(
-    config: RunwatchConfig, local_base: str
-) -> tuple[str, CloudflaredTunnel | None]:
-    if config.server.public_url:
-        return config.server.public_url.rstrip("/"), None
-    if config.server.share == "cloudflared":
-        tunnel = CloudflaredTunnel(config.server.cloudflared_binary)
-        return await tunnel.start(local_base), tunnel
-    if config.server.share == "lan":
-        return f"http://{discover_lan_ip()}:{config.server.port}", None
-    return local_base, None
-
-
 def _announce_run(
     supervisor: RunSupervisor,
     pairing_url: str,
-    local_pairing_url: str | None = None,
 ) -> None:
     typer.echo(f"\nRunwatch run directory: {supervisor.run_dir}")
     typer.echo(f"Editable notebook: {supervisor.source_path}")
     typer.echo(f"Dashboard: {pairing_url}")
-    if local_pairing_url is not None:
-        typer.echo(f"Local dashboard: {local_pairing_url}")
     typer.echo()
-    if supervisor.config.server.show_qr:
-        _print_qr(pairing_url)
     if supervisor.config.server.open_browser:
         webbrowser.open(pairing_url)
 
@@ -716,7 +691,7 @@ async def _serve(
     lock = _serve_lock(supervisor, run_lock)
     server: uvicorn.Server | None = None
     server_task: asyncio.Task[Any] | None = None
-    tunnel: CloudflaredTunnel | None = None
+    cloudflared_share: CloudflaredShare | None = None
     try:
         token = _token(run_dir)
         supervisor.attach_dashboard_links(
@@ -732,9 +707,14 @@ async def _serve(
             host = "0.0.0.0"
         local_host = "127.0.0.1" if host == "0.0.0.0" else host
         local_base = f"http://{local_host}:{config.server.port}"
+        share_state = (
+            DashboardShareState()
+            if config.server.public_url or config.server.share == "cloudflared"
+            else None
+        )
         server = uvicorn.Server(
             uvicorn.Config(
-                create_app(supervisor, token),
+                create_app(supervisor, token, dashboard_share=share_state),
                 host=host,
                 port=config.server.port,
                 log_level="warning",
@@ -746,19 +726,47 @@ async def _serve(
         server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
         server_task = asyncio.create_task(server.serve(), name="runwatch-web-server")
         await _wait_for_server(server, server_task)
-        public_base, tunnel = await _dashboard_base(config, local_base)
-        pairing_url = with_token(public_base, token)
-        local_pairing_url = with_token(local_base, token) if tunnel else None
-        _announce_run(supervisor, pairing_url, local_pairing_url)
+        if config.server.public_url:
+            assert share_state is not None
+            share_state.ready(config.server.public_url)
+        elif config.server.share == "cloudflared":
+            assert share_state is not None
+
+            async def announce_rotation(public_url: str) -> None:
+                await supervisor.bus.publish(
+                    "dashboard.share_rotated",
+                    {"generation": share_state.snapshot().generation},
+                )
+                await supervisor.notifications.notify_dashboard_link_changed(
+                    with_token(public_url, token)
+                )
+                typer.echo(
+                    "\nCloudflare dashboard link changed. "
+                    "Open the local dashboard for the current link and QR."
+                )
+
+            cloudflared_share = CloudflaredShare(
+                local_url=local_base,
+                binary=config.server.cloudflared_binary,
+                state=share_state,
+                on_rotation=announce_rotation,
+            )
+            await cloudflared_share.start()
+        pairing_base = (
+            f"http://{discover_lan_ip()}:{config.server.port}"
+            if config.server.share == "lan"
+            else local_base
+        )
+        _announce_run(supervisor, with_token(pairing_base, token))
         return await _run_while_server_available(
             supervisor,
             start_run=start_run,
             server_task=server_task,
         )
     finally:
-        if tunnel:
+        if cloudflared_share:
             with contextlib.suppress(Exception):
-                await tunnel.close()
+                await cloudflared_share.close()
         if server is not None:
             server.should_exit = True
         if server_task is not None:
@@ -941,7 +949,13 @@ def execute(
         Literal["none", "lan", "cloudflared"] | None, typer.Option("--share")
     ] = None,
     browser: Annotated[bool | None, typer.Option("--browser/--no-browser")] = None,
-    qr: Annotated[bool | None, typer.Option("--qr/--no-qr")] = None,
+    qr: Annotated[
+        bool | None,
+        typer.Option(
+            "--qr/--no-qr",
+            help="Show the public-link QR inside the local dashboard.",
+        ),
+    ] = None,
     keep_run: Annotated[
         bool,
         typer.Option(

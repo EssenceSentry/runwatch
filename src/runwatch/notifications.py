@@ -253,6 +253,44 @@ class NotificationManager:
     def _destinations(self) -> list[tuple[str, str]]:
         return notification_destinations(self.settings)
 
+    async def notify_dashboard_link_changed(self, click_url: str) -> bool:
+        """Send the rotated pairing URL to the explicitly configured ntfy topic."""
+
+        destination = next(
+            (value for kind, value in self._destinations() if kind == "ntfy"),
+            None,
+        )
+        if destination is None:
+            return False
+        try:
+            request = self._client.build_request(
+                "POST",
+                destination,
+                content=b"Runwatch replaced the Cloudflare dashboard link.",
+                headers={
+                    "Title": "Runwatch: Cloudflare link changed",
+                    "Tags": "link,computer",
+                    "Click": click_url,
+                },
+            )
+            response = await self._client.send(
+                request, stream=True, follow_redirects=False
+            )
+            try:
+                response.raise_for_status()
+            finally:
+                await response.aclose()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._publish_safely(
+                "notification.dashboard_link_failed",
+                {"error": _error_payload(error)},
+            )
+            return False
+        await self._publish_safely("notification.dashboard_link_sent", {})
+        return True
+
     async def _deliver(self) -> None:
         idle_seconds = min(self.settings.retry_initial_seconds, 1.0)
         while True:

@@ -54,6 +54,12 @@ Do not substitute `localhost`, omit the token, or reconstruct the URL from separ
 host, port, or token values. The pairing URL is a bearer credential: send it only to
 the user in the private conversation, and replace it if Runwatch prints a new one.
 
+With `--share cloudflared`, the authoritative `Dashboard:` line is instead the
+authenticated loopback URL. Open that local page to get the current public Cloudflare
+link and QR. Runwatch replaces an unhealthy Quick Tunnel without restarting the
+notebook or local server; the page updates to the replacement link. When ntfy is
+configured, Runwatch sends that replacement pairing URL as a clickable notification.
+
 `resume` reloads `source.ipynb` and uses the live kernel only when prior executed cells
 are unchanged. `restart` creates a new kernel epoch. If the old process is gone,
 `resume` journals a durable action and reconstructs the run from cell zero. Offline

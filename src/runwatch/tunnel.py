@@ -4,11 +4,62 @@ import asyncio
 import re
 import socket
 from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
 
 from ._compat import timeout
 
 _CLOUDFLARED_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+DashboardShareStatus = Literal["starting", "ready", "rotating", "degraded", "closed"]
+
+
+@dataclass(frozen=True)
+class DashboardShareSnapshot:
+    status: DashboardShareStatus
+    public_url: str | None
+    generation: int
+    message: str | None
+
+
+class DashboardShareState:
+    """Current public dashboard address, shared with the local web app."""
+
+    def __init__(self) -> None:
+        self._status: DashboardShareStatus = "starting"
+        self._public_url: str | None = None
+        self._generation = 0
+        self._message: str | None = "Cloudflare tunnel is starting."
+
+    def snapshot(self) -> DashboardShareSnapshot:
+        return DashboardShareSnapshot(
+            status=self._status,
+            public_url=self._public_url,
+            generation=self._generation,
+            message=self._message,
+        )
+
+    def ready(self, public_url: str) -> None:
+        self._status = "ready"
+        self._public_url = public_url.rstrip("/")
+        self._generation += 1
+        self._message = None
+
+    def rotating(self) -> None:
+        self._status = "rotating"
+        self._message = "Cloudflare link stopped responding; replacing it."
+
+    def degraded(self) -> None:
+        self._status = "degraded"
+        self._message = "Cloudflare link replacement failed; Runwatch will retry."
+
+    def close(self) -> None:
+        self._status = "closed"
+        self._message = "Cloudflare sharing has stopped."
 
 
 def discover_lan_ip() -> str:
@@ -58,6 +109,10 @@ class CloudflaredTunnel:
         self.output: deque[str] = deque(maxlen=retained_lines)
         self._drain_task: asyncio.Task[None] | None = None
 
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.returncode is None
+
     async def start(self, local_url: str, *, timeout_seconds: float = 30.0) -> str:
         if self.process is not None:
             raise RuntimeError("cloudflared tunnel has already been started")
@@ -92,6 +147,9 @@ class CloudflaredTunnel:
                         return match.group(0)
                     if self.process.returncode is not None:
                         break
+        except asyncio.CancelledError:
+            await self.close()
+            raise
         except TimeoutError:
             await self.close()
             raise RuntimeError(
@@ -140,3 +198,102 @@ class CloudflaredTunnel:
                 await asyncio.gather(self._drain_task, return_exceptions=True)
             self._drain_task = None
         self.process = None
+
+
+class CloudflaredShare:
+    """Keep a Quick Tunnel healthy while preserving the local Runwatch server."""
+
+    def __init__(
+        self,
+        *,
+        local_url: str,
+        binary: str = "cloudflared",
+        state: DashboardShareState | None = None,
+        on_rotation: Callable[[str], Awaitable[None]] | None = None,
+        health_interval_seconds: float = 30.0,
+        failure_threshold: int = 3,
+        health_check: Callable[[str], Awaitable[bool]] | None = None,
+        tunnel_factory: Callable[[], CloudflaredTunnel] | None = None,
+    ) -> None:
+        self.local_url = local_url
+        self.state = state or DashboardShareState()
+        self.on_rotation = on_rotation
+        self.health_interval_seconds = health_interval_seconds
+        self.failure_threshold = failure_threshold
+        self._health_check = health_check
+        self._tunnel_factory = tunnel_factory or (lambda: CloudflaredTunnel(binary))
+        self._tunnel: CloudflaredTunnel | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._client = httpx.AsyncClient(timeout=10.0, follow_redirects=False)
+
+    async def start(self) -> str:
+        public_url = await self._replace(initial=True)
+        self._monitor_task = asyncio.create_task(
+            self._monitor(), name="runwatch-cloudflared-health"
+        )
+        return public_url
+
+    async def _monitor(self) -> None:
+        failures = 0
+        while True:
+            await asyncio.sleep(self.health_interval_seconds)
+            if await self._healthy():
+                failures = 0
+                continue
+            failures += 1
+            if failures < self.failure_threshold:
+                continue
+            self.state.rotating()
+            try:
+                await self._replace(initial=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.state.degraded()
+                failures = self.failure_threshold - 1
+            else:
+                failures = 0
+
+    async def _healthy(self) -> bool:
+        snapshot = self.state.snapshot()
+        if self._tunnel is None or not self._tunnel.running:
+            return False
+        if snapshot.public_url is None:
+            return False
+        try:
+            if self._health_check is not None:
+                return await self._health_check(snapshot.public_url)
+            response = await self._client.get(f"{snapshot.public_url}/health")
+            return response.status_code == 200
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
+    async def _replace(self, *, initial: bool) -> str:
+        candidate = self._tunnel_factory()
+        public_url = await candidate.start(self.local_url)
+        previous = self._tunnel
+        self._tunnel = candidate
+        self.state.ready(public_url)
+        if previous is not None:
+            await previous.close()
+        if not initial and self.on_rotation is not None:
+            try:
+                await self.on_rotation(public_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        return public_url
+
+    async def close(self) -> None:
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
+        if self._tunnel is not None:
+            await self._tunnel.close()
+            self._tunnel = None
+        await self._client.aclose()
+        self.state.close()

@@ -12,7 +12,9 @@ When launching a notebook for a user, use `runwatch execute ... --share lan` whe
 phone access is requested. Stay attached until the CLI prints `Dashboard:` and give
 the user that exact tokenized LAN URL immediately, as both a clickable link and raw
 text. Never reconstruct the URL or publish it in commits, notifications, issues, or
-documentation; it is a bearer credential.
+documentation; it is a bearer credential. The one product-level exception is an
+explicitly configured ntfy topic, which receives a rotated Cloudflare pairing URL as a
+clickable target.
 
 Run `uv sync --extra test --extra dev --extra docs` before development. The required
 local gate is `uv run pre-commit run --all-files`. Keep the GitHub quality workflow and

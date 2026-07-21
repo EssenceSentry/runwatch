@@ -10,22 +10,25 @@ source changes; use the Runwatch CLI for run transitions and resource control.
 
 ## Launch and hand off a run
 
-1. Run the notebook with `runwatch execute`. Use `--share lan` whenever the user needs
-   to monitor it from another device on the same network.
+1. Run the notebook with `runwatch execute`. Use `--share lan` on a trusted local
+   network, or `--share cloudflared` when the other device needs a public route.
 2. Stay attached to the command output until Runwatch prints its `Dashboard:` line.
    If the command yields a background session, keep polling that session. Do not infer
    or construct the URL yourself.
-3. After every launch, immediately give the user the exact dashboard pairing URL,
-   including its token. Present it both as a clickable Markdown link and as raw text so
-   a mobile client cannot silently rewrite it.
+3. After every launch, immediately give the user the exact URL from `Dashboard:`,
+   including its token. Present it both as a clickable Markdown link and as raw text.
+   In Cloudflare mode this is the local control page; its current public link and QR
+   update without changing the terminal URL.
 4. For a LAN handoff, verify that the URL uses the machine's LAN address rather than
    `localhost` or `127.0.0.1`. Do not claim the run is handed off until the user has the
    usable URL.
 5. Treat the pairing URL as a bearer credential. Share it only in the private response
-   to the user; never place it in notifications, commits, pull requests, issues, or
-   durable documentation.
-6. If Runwatch restarts or prints a replacement pairing URL, give the user the new URL
-   and do not reuse the stale one.
+   to the user; never place it in commits, pull requests, issues, or durable
+   documentation. An explicitly configured ntfy topic is the sole notification
+   exception for rotated Cloudflare links.
+6. In Cloudflare mode, use the local dashboard as the source of truth for the current
+   public link and QR. Runwatch replaces a failed tunnel in place and can send the new
+   authenticated link through configured ntfy.
 7. Settled cell source and outputs are written back to the notebook passed to
    `execute`. By default the final dashboard remains observable for 90 seconds, then a
    successful run directory is removed unless the run was launched with `--keep-run`;

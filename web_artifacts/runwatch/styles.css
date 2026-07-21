@@ -262,6 +262,69 @@ a.gloss-button:visited {
   );
 }
 
+/* Cloudflare handoff */
+
+.share-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 12px;
+  padding: 18px 22px;
+}
+
+.share-copy {
+  min-width: 0;
+}
+
+.share-panel h2 {
+  margin: 5px 0 4px;
+  color: var(--ink);
+  font-size: 1.12rem;
+  letter-spacing: -0.02em;
+}
+
+.share-panel p {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.share-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 13px;
+}
+
+.share-link {
+  max-width: min(100%, 560px);
+}
+
+.share-link span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-qr-frame {
+  display: grid;
+  width: 132px;
+  height: 132px;
+  place-items: center;
+  padding: 8px;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow:
+    inset 0 0 0 1px rgba(90, 100, 120, 0.1),
+    0 9px 22px rgba(82, 91, 112, 0.13);
+}
+
+.share-qr-frame img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .ntfy-button::after {
   border-color: rgba(255, 255, 255, 0.28);
   box-shadow:
@@ -1531,6 +1594,16 @@ dialog::backdrop {
     margin-left: auto;
   }
 
+  .share-panel {
+    grid-template-columns: minmax(0, 1fr) 112px;
+    gap: 16px;
+  }
+
+  .share-qr-frame {
+    width: 112px;
+    height: 112px;
+  }
+
   .run-overview {
     grid-template-columns: 1fr;
     gap: 14px;
@@ -1689,6 +1762,30 @@ dialog::backdrop {
 
   .notebook-button {
     min-height: 44px;
+  }
+
+  .share-panel {
+    grid-template-columns: 1fr;
+    margin-bottom: 9px;
+    padding: 14px;
+  }
+
+  .share-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .share-actions .soft-button,
+  .share-actions .gloss-button {
+    width: 100%;
+    min-height: 46px;
+  }
+
+  .share-qr-frame {
+    width: min(100%, 280px);
+    height: auto;
+    aspect-ratio: 1;
+    justify-self: center;
   }
 
   .topbar-actions {
