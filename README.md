@@ -11,6 +11,7 @@
 </p>
 
 <p align="center">
+  <a href="https://pypi.org/project/runwatch-notebook/"><img src="https://img.shields.io/pypi/v/runwatch-notebook?logo=pypi&amp;logoColor=white&amp;label=PyPI" alt="PyPI package version"></a>
   <a href="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml"><img src="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main" alt="Quality gate"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
   <a href=".pre-commit-config.yaml"><img src="https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&amp;logoColor=white" alt="pre-commit enabled"></a>
@@ -24,7 +25,8 @@ monitors intact, ready for you—or your coding agent—to repair and continue.
 
 **Keep notebook ergonomics. Gain the confidence of an operational job.**
 
-[Get started](#first-run) · [Run from VS Code](#run-from-vs-code) ·
+[Install from PyPI](#installation) · [Run your first notebook](#first-run) ·
+[Run from VS Code](#run-from-vs-code) ·
 [Explore resource monitoring](#resource-emission) ·
 [See failure recovery](#failure-and-recovery) · [Read the docs](https://essencesentry.github.io/runwatch/)
 
@@ -71,31 +73,41 @@ Python 3.10 or newer is required. Runwatch supports local POSIX filesystems on L
 and macOS; those are the platforms exercised in CI. Windows and shared/network
 filesystems are not currently supported execution targets.
 
+Install the published package from
+[PyPI](https://pypi.org/project/runwatch-notebook/) in the virtual environment used by
+your notebook project:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[supervisor]'
+python -m pip install 'runwatch-notebook[supervisor]'
 ```
 
-Notebook kernels that only emit generic Runwatch protocol events can use the
-Pydantic-only base install. The CLI, notebook runner, dashboard, notifications, and
-built-in AWS/local adapters require the `supervisor` extra shown above.
+The `supervisor` extra is the recommended installation for people running notebooks.
+It includes the CLI, notebook runner, dashboard, notifications, and built-in AWS and
+local resource adapters. The selected notebook kernel must use this environment, or
+another environment that can import `runwatch`, when cells emit resource events.
+
+The smaller, Pydantic-only base package is intended for kernels or integrations that
+only emit generic Runwatch protocol events:
+
+```bash
+python -m pip install runwatch-notebook
+```
 
 Install optional NVIDIA monitoring support with:
 
 ```bash
-python -m pip install -e '.[supervisor,gpu]'
+python -m pip install 'runwatch-notebook[supervisor,gpu]'
 ```
 
-For development:
+To develop Runwatch itself from a source checkout:
 
 ```bash
 uv sync --extra supervisor --extra test --extra dev --extra docs
 uv run pytest tests
 uv run ruff check src tests
 ```
-
-The selected notebook kernel must be able to import `runwatch` when cells emit resources.
 
 Third-party supervisor adapters can extend Runwatch without adding provider-specific
 code to this package. See [Third-party resource adapters](docs/resource-events.md#third-party-resource-adapters)
@@ -173,8 +185,8 @@ below is project-local: it uses the project's `.venv`, reads notification secret
 an ignored `.env`, prepares a matching Jupyter kernel, and runs whichever saved
 notebook is active in the editor.
 
-First install Runwatch, `ipykernel`, and the `dotenv` command in the project's virtual
-environment:
+First create the project's virtual environment and install Runwatch from PyPI together
+with `ipykernel` and the `dotenv` command. No Runwatch source checkout is required:
 
 ```bash
 python -m venv .venv
