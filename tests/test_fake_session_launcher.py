@@ -11,6 +11,8 @@ from types import ModuleType
 
 import nbformat
 
+from runwatch.config import load_config
+
 
 def _load_launcher() -> ModuleType:
     repo_root = Path(__file__).resolve().parents[1]
@@ -46,8 +48,12 @@ def test_fake_session_supports_local_only_replay(monkeypatch) -> None:
     assert args.ntfy is False
 
 
-def test_vscode_active_notebook_task_uses_cloudflared() -> None:
+def test_vscode_active_notebook_task_uses_cloudflared(
+    monkeypatch,
+) -> None:
     repo_root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("RUNWATCH_NTFY_BASE_URL", "https://ntfy.example")
+    monkeypatch.setenv("RUNWATCH_NTFY_TOPIC", "private-runs")
     tasks_path = repo_root / ".vscode" / "tasks.json"
     tasks = json.loads(tasks_path.read_text(encoding="utf-8"))["tasks"]
     active_notebook = next(
@@ -65,6 +71,10 @@ def test_vscode_active_notebook_task_uses_cloudflared() -> None:
     launcher = launcher_path.read_text(encoding="utf-8")
     assert "--share cloudflared" in launcher
     assert "--working-dir" not in launcher
+
+    config = load_config(repo_root / ".vscode" / "runwatch.yaml")
+    assert config.host.prevent_system_sleep is True
+    assert config.notifications.ntfy_on_section_start is True
 
 
 def test_notebook_workspace_resolver_accepts_relative_paths(tmp_path: Path) -> None:

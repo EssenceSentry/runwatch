@@ -24,7 +24,8 @@ monitors intact, ready for you—or your coding agent—to repair and continue.
 
 **Keep notebook ergonomics. Gain the confidence of an operational job.**
 
-[Get started](#first-run) · [Explore resource monitoring](#resource-emission) ·
+[Get started](#first-run) · [Run from VS Code](#run-from-vs-code) ·
+[Explore resource monitoring](#resource-emission) ·
 [See failure recovery](#failure-and-recovery) · [Read the docs](https://essencesentry.github.io/runwatch/)
 
 ## Built for notebook jobs that have outgrown “Run All”
@@ -164,6 +165,116 @@ and SQLite databases use schema version 3; configuration and kernel resource eve
 schema version 2; S3 progress manifests use schema version 1. Legacy schema-version-2
 run directories reopen conservatively. Runwatch intentionally does not migrate 0.1 run
 directories.
+
+## Run from VS Code
+
+Turn the active notebook into a Runwatch job from VS Code's task picker. The setup
+below is project-local: it uses the project's `.venv`, reads notification secrets from
+an ignored `.env`, prepares a matching Jupyter kernel, and runs whichever saved
+notebook is active in the editor.
+
+First install Runwatch, `ipykernel`, and the `dotenv` command in the project's virtual
+environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install 'runwatch-notebook[supervisor]' ipykernel 'python-dotenv[cli]'
+```
+
+Create `.vscode/runwatch.yaml`:
+
+```yaml
+notebook:
+  kernel_name: runwatch-workspace
+
+host:
+  prevent_system_sleep: true
+
+notifications:
+  ntfy_base_url: ${RUNWATCH_NTFY_BASE_URL}
+  ntfy_topic: ${RUNWATCH_NTFY_TOPIC}
+  ntfy_on_section_start: true
+```
+
+Keep the ntfy destination in the project's `.env` and make sure that file is ignored
+by Git:
+
+```dotenv
+RUNWATCH_NTFY_BASE_URL=https://ntfy.sh
+RUNWATCH_NTFY_TOPIC=your-private-topic
+```
+
+Then add the following tasks to `.vscode/tasks.json` (merge them into its existing
+`tasks` array if the project already has one):
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "notebook: prepare Runwatch kernel",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "args": [
+        "-m",
+        "ipykernel",
+        "install",
+        "--prefix",
+        "${workspaceFolder}/.venv",
+        "--name",
+        "runwatch-workspace",
+        "--display-name",
+        "Runwatch workspace (.venv)"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "notebook: run active notebook",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/dotenv",
+      "args": [
+        "--file",
+        "${workspaceFolder}/.env",
+        "run",
+        "--",
+        "${workspaceFolder}/.venv/bin/runwatch",
+        "execute",
+        "${file}",
+        "--config",
+        "${workspaceFolder}/.vscode/runwatch.yaml",
+        "--share",
+        "cloudflared"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
+          "JUPYTER_PATH": "${workspaceFolder}/.venv/share/jupyter:${env:JUPYTER_PATH}"
+        }
+      },
+      "dependsOn": "notebook: prepare Runwatch kernel",
+      "dependsOrder": "sequence",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}
+```
+
+Save and focus the `.ipynb` you want to run, open **Tasks: Run Task** from the Command
+Palette, and select **notebook: run active notebook**. The terminal shows the Runwatch
+dashboard pairing URL while the task keeps running. This example uses a Cloudflare
+quick tunnel, so `cloudflared` must be available on `PATH`; change the final share value
+to `lan` for a trusted local network or `none` for a local-only dashboard.
+
+The task configuration enables sleep inhibition and ntfy section announcements. If
+notifications are not wanted, remove the `notifications` block from
+`.vscode/runwatch.yaml` and invoke `runwatch` directly instead of through `dotenv`.
 
 ## Keep the execution host awake
 

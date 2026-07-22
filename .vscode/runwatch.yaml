@@ -2,7 +2,13 @@ notebook:
   # Refreshed by the VS Code launcher for the active file workspace.
   kernel_name: runwatch-workspace
 
+host:
+  # Keep the workstation awake for notebook execution started from VS Code.
+  prevent_system_sleep: true
+
 notifications:
   # Keep the private topic in the notebook workspace's ignored .env file.
   ntfy_base_url: ${RUNWATCH_NTFY_BASE_URL}
   ntfy_topic: ${RUNWATCH_NTFY_TOPIC}
+  # Announce Markdown section transitions before their next code cell begins.
+  ntfy_on_section_start: true

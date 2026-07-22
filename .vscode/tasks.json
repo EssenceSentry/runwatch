@@ -14,7 +14,7 @@
         "clear": true,
         "showReuseMessage": false
       },
-      "detail": "Execute the active saved notebook with Runwatch, Cloudflare sharing, its workspace kernel, and ntfy settings loaded from that workspace's .env."
+      "detail": "Execute the active saved notebook with Runwatch, Cloudflare sharing, sleep inhibition, its workspace kernel, and ntfy section notifications loaded from that workspace's .env."
     },
     {
       "label": "check: all (pre-commit)",
