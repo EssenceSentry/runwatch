@@ -16,7 +16,15 @@ repos:
         name: github workflow structure
         entry: .venv/bin/python scripts/check_github_workflows.py
         language: system
-        files: ^\.github/workflows/.*\.ya?ml$
+        pass_filenames: false
+        files: ^(\.github/workflows/.*\.ya?ml|scripts/check_github_workflows\.py)$
+
+      - id: release-metadata
+        name: release metadata
+        entry: .venv/bin/python scripts/check_release.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|scripts/check_release\.py)$
 
       - id: quality-gate-parity
         name: quality gate parity

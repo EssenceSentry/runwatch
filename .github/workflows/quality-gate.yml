@@ -35,6 +35,8 @@ jobs:
         run: uv run python scripts/check_config_syntax.py
       - name: GitHub Workflows
         run: uv run python scripts/check_github_workflows.py
+      - name: Release Metadata
+        run: uv run python scripts/check_release.py
       - name: Quality Gate Parity
         run: uv run python scripts/check_quality_gate_parity.py
 

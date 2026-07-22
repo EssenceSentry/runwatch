@@ -21,7 +21,8 @@ uv run pre-commit run --all-files
 ```
 
 The gate checks repository hygiene, configuration and workflow syntax, lockfile
-freshness, Ruff, Black, strict Pyright over source and tests, cognitive complexity,
+freshness, release metadata, Ruff, Black, strict Pyright over source and tests,
+cognitive complexity,
 public API docs, the
 repository-local agent skill, a clean built-wheel smoke test, strict Sphinx docs, and
 the full package suite with branch coverage. Coverage is enforced across `runwatch` at
@@ -62,3 +63,10 @@ installs the base wheel and proves that the root API, AWS/local emitter modules,
 generic resource event work without supervisor dependencies. It then installs the
 `supervisor` extra in the same isolated environment and checks the dashboard assets and
 CLI. The wheel must not contain an `auto_classifier` namespace.
+
+The release workflow is intentionally separate from ordinary CI and runs only when a
+GitHub Release is published. It requires an exact `v<project.version>` tag, main-branch
+ancestry, the complete local quality gate, valid wheel and source-distribution metadata,
+and approval through the protected `pypi` environment. Its build job has no OIDC
+permission; only the dependency-free publishing job can request a short-lived PyPI
+credential. See {doc}`releasing` for the maintainer procedure.

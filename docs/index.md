@@ -56,4 +56,5 @@ architecture
 resource-events
 security
 quality-gates
+releasing
 ```

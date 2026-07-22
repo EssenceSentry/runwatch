@@ -3,13 +3,19 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - documentation CI uses Python 3.12
+    import tomli as tomllib
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 project = "Runwatch"
 author = "Agustín Sellanes"
 copyright = "2026, Agustín Sellanes"
-release = "0.2.0"
+with (ROOT / "pyproject.toml").open("rb") as pyproject_file:
+    release = str(tomllib.load(pyproject_file)["project"]["version"])
 
 extensions = [
     "myst_parser",

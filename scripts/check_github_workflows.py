@@ -12,8 +12,10 @@ import yaml
 from yaml.constructor import ConstructorError
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
 EXPRESSION_OPEN = re.compile(r"\$\{\{")
 EXPRESSION_CLOSE = re.compile(r"\}\}")
+PINNED_ACTION = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 
 
 class WorkflowLoader(yaml.BaseLoader):
@@ -112,6 +114,70 @@ def _check_job_steps(
             )
 
 
+def _release_workflow_policy(
+    workflow: dict[str, object], jobs: dict[str, object]
+) -> list[str]:
+    errors: list[str] = []
+    expected_trigger = {"release": {"types": ["published"]}}
+    if workflow.get("on") != expected_trigger:
+        errors.append("release workflow must run only for published GitHub Releases")
+    if workflow.get("permissions") != {"contents": "read"}:
+        errors.append("release workflow must default to contents: read")
+    build = _as_mapping(jobs.get("release-build"))
+    publish = _as_mapping(jobs.get("pypi-publish"))
+    if build is None or publish is None:
+        errors.append("release workflow requires release-build and pypi-publish jobs")
+        return errors
+    build_permissions = _as_mapping(build.get("permissions")) or {}
+    if build_permissions.get("id-token") == "write":
+        errors.append("release-build must not receive OIDC permission")
+    if publish.get("needs") != ["release-build"]:
+        errors.append("pypi-publish must depend only on release-build")
+    environment = _as_mapping(publish.get("environment"))
+    if environment is None or environment.get("name") != "pypi":
+        errors.append("pypi-publish must use the pypi environment")
+    if publish.get("permissions") != {"id-token": "write"}:
+        errors.append("pypi-publish must receive only id-token: write")
+    for job_id, job in (("release-build", build), ("pypi-publish", publish)):
+        _check_release_action_pins(job_id, job, errors)
+    _check_publish_steps(publish, errors)
+    return errors
+
+
+def _check_release_action_pins(
+    job_id: str, job: dict[str, object], errors: list[str]
+) -> None:
+    for index, raw_step in enumerate(_as_list(job.get("steps")) or [], start=1):
+        step = _as_mapping(raw_step)
+        uses = step.get("uses") if step is not None else None
+        if isinstance(uses, str) and PINNED_ACTION.fullmatch(uses) is None:
+            errors.append(
+                f"release workflow job {job_id!r} step {index} must pin actions by SHA"
+            )
+
+
+def _check_publish_steps(job: dict[str, object], errors: list[str]) -> None:
+    allowed = {"actions/download-artifact", "pypa/gh-action-pypi-publish"}
+    publisher_count = 0
+    for raw_step in _as_list(job.get("steps")) or []:
+        step = _as_mapping(raw_step)
+        if step is None:
+            continue
+        if "run" in step:
+            errors.append("pypi-publish must not execute arbitrary run steps")
+        uses = step.get("uses")
+        action = str(uses).split("@", maxsplit=1)[0] if uses is not None else ""
+        if action not in allowed:
+            errors.append(f"pypi-publish uses disallowed action {action!r}")
+        if action == "pypa/gh-action-pypi-publish":
+            publisher_count += 1
+            options = _as_mapping(step.get("with")) or {}
+            if {"password", "user", "username"}.intersection(options):
+                errors.append("PyPI publishing must use OIDC instead of credentials")
+    if publisher_count != 1:
+        errors.append("pypi-publish requires exactly one PyPA publishing action")
+
+
 def check_workflow(path: Path) -> list[str]:
     relpath = path.relative_to(ROOT).as_posix()
     errors: list[str] = []
@@ -148,6 +214,9 @@ def check_workflow(path: Path) -> list[str]:
             if needed not in job_ids:
                 errors.append(f"{relpath}: job {job_id!r} needs unknown job {needed!r}")
         _check_job_steps(relpath=relpath, job_id=job_id, job=job, errors=errors)
+
+    if relpath == RELEASE_WORKFLOW:
+        errors.extend(_release_workflow_policy(top, jobs))
 
     _check_expression_balance(path, errors)
     return errors

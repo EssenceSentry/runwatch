@@ -10,6 +10,11 @@ import tempfile
 from pathlib import Path
 from zipfile import ZipFile
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised by the Python 3.10 CI environment
+    import tomli as tomllib
+
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PACKAGE_FILES = {
     "runwatch/__init__.py",
@@ -87,6 +92,14 @@ def _inspect_wheel(wheel: Path) -> None:
         raise RuntimeError("; ".join(details))
 
 
+def _project_version(root: Path) -> str:
+    with (root / "pyproject.toml").open("rb") as pyproject_file:
+        value = tomllib.load(pyproject_file)["project"]["version"]
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("pyproject.toml project.version must be a string")
+    return value
+
+
 def main() -> int:
     uv = shutil.which("uv")
     if uv is None:
@@ -119,6 +132,7 @@ def main() -> int:
                 raise RuntimeError(f"expected one wheel, found {len(wheels)}")
             wheel = wheels[0]
             _inspect_wheel(wheel)
+            expected_version = _project_version(source)
 
             venv = root / ".venv"
             _run([uv, "venv", "--python", sys.executable, str(venv)], cwd=root)
@@ -133,7 +147,7 @@ def main() -> int:
                         "import runwatch; import runwatch.aws; import runwatch.local; "
                         "from runwatch import (ResourceEvent, ResourceLifecycle, "
                         "ResourceSpec, emit_resource); "
-                        "assert runwatch.__version__ == '0.2.0'; "
+                        f"assert runwatch.__version__ == {expected_version!r}; "
                         "event = ResourceEvent(resource=ResourceSpec("
                         "provider='example', type='job', id='job-1'), "
                         "lifecycle=ResourceLifecycle()); "
