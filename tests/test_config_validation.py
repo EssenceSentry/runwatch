@@ -28,6 +28,8 @@ def test_init_config_is_commented_and_round_trips(tmp_path: Path) -> None:
     assert config == RunwatchConfig()
     assert config.notebook.capture_tqdm is True
     assert config.notebook.tqdm_min_interval_seconds == 0.5
+    assert config.host.prevent_system_sleep is False
+    assert config.notifications.ntfy_on_section_start is False
     assert config.server.linger_seconds == 90
 
 
@@ -173,6 +175,24 @@ def test_notification_config_bounds_periodic_interval_and_rejects_fragments() ->
         )
 
 
+def test_section_start_notifications_require_ntfy() -> None:
+    with pytest.raises(ValueError, match="ntfy_on_section_start requires"):
+        RunwatchConfig.model_validate(
+            {"notifications": {"ntfy_on_section_start": True}}
+        )
+
+    config = RunwatchConfig.model_validate(
+        {
+            "notifications": {
+                "ntfy_base_url": "https://ntfy.example",
+                "ntfy_topic": "runs",
+                "ntfy_on_section_start": True,
+            }
+        }
+    )
+    assert config.notifications.ntfy_on_section_start is True
+
+
 def test_config_rejects_nonterminal_blocking_resource(tmp_path: Path) -> None:
     path = tmp_path / "runwatch.yaml"
     path.write_text(
@@ -222,6 +242,24 @@ def test_preflight_reports_notebook_and_missing_cloudflared(
     assert report["valid"] is False
     assert report["cell_count"] == 1
     assert "missing-cloudflared" in report["errors"][0]
+
+
+def test_preflight_reports_unavailable_requested_sleep_inhibitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notebook_path = tmp_path / "demo.ipynb"
+    nbformat.write(nbformat.v4.new_notebook(), notebook_path)
+
+    def unavailable() -> None:
+        raise RuntimeError("logind is unavailable")
+
+    monkeypatch.setattr("runwatch.validation.create_sleep_inhibitor", unavailable)
+    config = RunwatchConfig.model_validate({"host": {"prevent_system_sleep": True}})
+
+    report = validate_execution(notebook_path, config, working_dir=tmp_path)
+
+    assert report["valid"] is False
+    assert any("logind is unavailable" in error for error in report["errors"])
 
 
 def test_config_defaults_and_rejects_non_mapping(tmp_path: Path) -> None:

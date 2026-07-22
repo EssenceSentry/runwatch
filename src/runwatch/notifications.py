@@ -219,6 +219,9 @@ class NotificationManager:
         """
 
         destinations = self._destinations()
+        if notification.destination_kinds is not None:
+            allowed = set(notification.destination_kinds)
+            destinations = [item for item in destinations if item[0] in allowed]
         if not destinations:
             return None
         payload = notification.envelope.webhook_payload()

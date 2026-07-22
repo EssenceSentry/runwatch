@@ -50,6 +50,8 @@ _WRITEBACK_STATE_FILENAME = "writeback-state.json"
 _EVENT_TEXT_MAX_CHARS = 120
 _EVENT_RESOURCE_ID_MAX_CHARS = 64
 _EVENT_RESOURCE_SAMPLE_SIZE = 5
+_ATX_HEADING_RE = re.compile(r"^[ \\t]{0,3}(#{1,6})[ \\t]+(.+?)[ \\t]*$")
+_SETEXT_HEADING_RE = re.compile(r"^[ \\t]{0,3}(=+|-+)[ \\t]*$")
 
 
 def _with_bayesian_tqdm_eta(
@@ -149,6 +151,41 @@ def _cell_label(notebook: NotebookNode, index: int) -> str:
         (line.strip() for line in str(cell.source).splitlines() if line.strip()), ""
     )
     return first[:_EVENT_TEXT_MAX_CHARS] or f"{cell.cell_type.title()} cell {index + 1}"
+
+
+def _markdown_headings(source: str) -> list[tuple[int, str]]:
+    headings: list[tuple[int, str]] = []
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        atx = _ATX_HEADING_RE.match(line)
+        if atx is not None:
+            title = re.sub(r"[ \\t]+#+[ \\t]*$", "", atx.group(2)).strip()
+            if title:
+                headings.append((len(atx.group(1)), title))
+            continue
+        if index == 0:
+            continue
+        setext = _SETEXT_HEADING_RE.match(line)
+        title = lines[index - 1].strip()
+        if setext is not None and title:
+            headings.append((1 if setext.group(1).startswith("=") else 2, title))
+    return headings
+
+
+def _section_heading_between(
+    notebook: NotebookNode, previous_code_index: int, next_code_index: int
+) -> tuple[int, str] | None:
+    latest: tuple[int, str] | None = None
+    for cell in notebook.cells[previous_code_index + 1 : next_code_index]:
+        if cell.cell_type != "markdown":
+            continue
+        headings = _markdown_headings(str(cell.source))
+        if headings:
+            latest = headings[-1]
+    if latest is None:
+        return None
+    level, title = latest
+    return level, title[:_EVENT_TEXT_MAX_CHARS]
 
 
 def ensure_cell_ids(notebook: NotebookNode) -> None:
@@ -883,6 +920,7 @@ class NotebookRunner:
 
     async def _execute_cells(self, start_index: int) -> str:
         index = start_index
+        previous_code_index: int | None = None
         while index < len(self.notebook.cells):
             if self._cancel_requested.is_set():
                 return "cancel"
@@ -892,9 +930,25 @@ class NotebookRunner:
                 self.store.mark_cell_skipped(self.run_id, index)
                 index += 1
                 continue
+            if previous_code_index is not None:
+                heading = _section_heading_between(
+                    self.notebook, previous_code_index, index
+                )
+                if heading is not None:
+                    heading_level, heading_text = heading
+                    await self.bus.publish(
+                        "notebook.section_started",
+                        {
+                            "heading": heading_text,
+                            "heading_level": heading_level,
+                            "cell_index": index,
+                            "kernel_epoch": self.kernel_epoch,
+                        },
+                    )
             outcome = await self._execute_cell_until_resolved(index)
             if outcome != "next":
                 return outcome
+            previous_code_index = index
             index += 1
         return "complete"
 

@@ -14,6 +14,10 @@ recovery, typed AWS and local resource monitors, and a mobile dashboard. Runwatc
 agent-agnostic: edit the run-owned `source.ipynb` with ordinary `nbformat`, then use the
 `runwatch` CLI to resume or restart.
 
+Optional native sleep inhibition keeps a macOS or Linux execution host awake for an
+unattended run. Opt-in ntfy section notifications announce Markdown-headed transitions
+immediately before the next code cell begins.
+
 Install the package:
 
 ```bash

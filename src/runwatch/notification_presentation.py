@@ -38,6 +38,14 @@ class NotificationCellFailure(BaseModel):
     error_type: str | None = Field(default=None, max_length=160)
 
 
+class NotificationSectionStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    heading: str = Field(max_length=200)
+    heading_level: int = Field(ge=1, le=6)
+    cell_index: int = Field(ge=0)
+
+
 class NotificationResourceFailure(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +74,7 @@ class NotificationLegacy(BaseModel):
 NotificationData = (
     NotificationRunSummary
     | NotificationCellFailure
+    | NotificationSectionStart
     | NotificationResourceFailure
     | NotificationTerminal
     | NotificationLegacy
@@ -79,6 +88,7 @@ class NotificationEnvelope(BaseModel):
     kind: Literal[
         "periodic_status",
         "cell_failed",
+        "section_started",
         "resource_failed",
         "run_succeeded",
         "run_failed",
@@ -109,6 +119,7 @@ class PresentedNotification(BaseModel):
     envelope: NotificationEnvelope
     dedup_key: str | None = Field(default=None, max_length=512)
     rolling: bool = False
+    destination_kinds: tuple[Literal["webhook", "ntfy"], ...] | None = None
 
 
 class NotificationDeliveryError(BaseModel):
@@ -206,6 +217,8 @@ class NotificationPresenter:
                 ),
                 dedup_key=f"cell-failed:{epoch}:{cell_index}:{attempt}",
             )
+        if event_type == "notebook.section_started":
+            return self._section_start(payload, redactor)
         if event_type == "resource.observed" and payload.get("status") == "failed":
             internal_id = str(payload["internal_id"])
             resource = self.store.get_resource(internal_id)
@@ -374,6 +387,32 @@ class NotificationPresenter:
             data=NotificationLegacy(),
         )
 
+    def _section_start(
+        self, payload: dict[str, Any], redactor: SecretRedactor
+    ) -> PresentedNotification | None:
+        if not self.settings.ntfy_on_section_start:
+            return None
+        cell_index = _nonnegative_int(payload.get("cell_index"), "cell_index")
+        heading_level = _heading_level(payload.get("heading_level"))
+        heading = redactor.text(payload.get("heading", ""), max_chars=200)
+        if not heading:
+            raise ValueError("Notification section heading must not be empty")
+        epoch = _kernel_epoch(payload)
+        return PresentedNotification(
+            envelope=NotificationEnvelope(
+                kind="section_started",
+                title="Runwatch: starting notebook section",
+                message=f"Starting section: {heading}",
+                data=NotificationSectionStart(
+                    heading=heading,
+                    heading_level=heading_level,
+                    cell_index=cell_index,
+                ),
+            ),
+            dedup_key=f"section-started:{epoch}:{cell_index}",
+            destination_kinds=("ntfy",),
+        )
+
     def _terminal(
         self,
         *,
@@ -428,6 +467,13 @@ def _nonnegative_int(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"Notification event {field} must be nonnegative")
     return value
+
+
+def _heading_level(value: object) -> int:
+    level = _nonnegative_int(value, "heading_level")
+    if level < 1 or level > 6:
+        raise ValueError("Notification event heading_level must be between 1 and 6")
+    return level
 
 
 def _optional_text(

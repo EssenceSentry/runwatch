@@ -25,6 +25,10 @@ notebook:
   # Recommended for unattended runs; null waits without a deadline.
   resource_completion_timeout_seconds: null
 
+host:
+  # Hold an IOKit assertion on macOS or a logind inhibitor on Linux while the run is live.
+  prevent_system_sleep: false
+
 aws:
   # null uses the normal boto3 credential and region resolution chain.
   profile_name: null
@@ -58,6 +62,8 @@ notifications:
   # Set both values to enable ntfy push notifications.
   ntfy_base_url: null
   ntfy_topic: null
+  # Notify through ntfy before code enters a Markdown-headed notebook section.
+  ntfy_on_section_start: false
   # Optional periodic status notification interval (minimum 60 seconds).
   periodic_seconds: null
   # Bound the terminal outbox drain before retaining disposable run state for retry.

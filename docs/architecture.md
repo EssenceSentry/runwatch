@@ -71,6 +71,18 @@ refreshes update one notebook output in place. The runner consumes both initial
 normal progress-event model, and keeps instrumentation failures isolated from notebook
 execution.
 
+When host sleep inhibition is enabled, the supervisor acquires the platform backend
+before starting runtime services. macOS holds an IOKit `NoIdleSleepAssertion`; Linux
+keeps the standard input of a logind-backed `systemd-inhibit` process open. Normal run
+finalization releases the inhibitor before dashboard linger. Quiescence also releases
+it, and process death drops the operating-system assertion or closes the helper pipe.
+
+After a code cell succeeds, the runner tracks any Markdown headings before the next
+non-empty code cell. It emits `notebook.section_started` with a bounded heading, level,
+cell index, and kernel epoch immediately before execution enters that code cell. The
+notification presenter can convert that durable event into an ntfy-only, deduplicated
+section announcement; generic webhooks are deliberately excluded.
+
 ## Durable actions
 
 Local CLI recovery and resource stops insert SQLite actions before side effects,

@@ -244,6 +244,72 @@ def test_configured_cell_label_is_bounded_for_minimum_event_payload() -> None:
     )
 
 
+def test_markdown_heading_parser_supports_atx_and_setext() -> None:
+    headings = notebook_module._markdown_headings(
+        "# Preparation\n\nDetails\n\nModel evaluation\n----------------\n\n### Results ###"
+    )
+
+    assert headings == [
+        (1, "Preparation"),
+        (2, "Model evaluation"),
+        (3, "Results"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_section_event_precedes_next_code_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notebook_path = tmp_path / "sections.ipynb"
+    notebook = nbformat.v4.new_notebook(
+        cells=[
+            nbformat.v4.new_code_cell("prepare()"),
+            nbformat.v4.new_markdown_cell("# Training\nSet up the model."),
+            nbformat.v4.new_markdown_cell("## Model evaluation"),
+            nbformat.v4.new_code_cell("evaluate()"),
+        ]
+    )
+    nbformat.write(notebook, notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "executed.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=config(),
+    )
+    runner = supervisor.runner
+    runner.kernel_epoch = 4
+    event_types_before_execution: dict[int, list[str]] = {}
+
+    async def execute_cell(index: int) -> str:
+        event_types_before_execution[index] = [
+            event["type"]
+            for event in supervisor.store.recent_events(supervisor.run_id, limit=100)
+        ]
+        return "next"
+
+    monkeypatch.setattr(runner, "_execute_cell_until_resolved", execute_cell)
+
+    assert await runner._execute_cells(0) == "complete"
+
+    events = [
+        event
+        for event in supervisor.store.recent_events(supervisor.run_id, limit=100)
+        if event["type"] == "notebook.section_started"
+    ]
+    assert len(events) == 1
+    assert events[0]["payload"] == {
+        "heading": "Model evaluation",
+        "heading_level": 2,
+        "cell_index": 3,
+        "kernel_epoch": 4,
+    }
+    assert "notebook.section_started" not in event_types_before_execution[0]
+    assert "notebook.section_started" in event_types_before_execution[3]
+
+    await supervisor.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("transition", "expected_status", "expected_event"),

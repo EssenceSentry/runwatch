@@ -227,6 +227,141 @@ async def test_cell_failure_delivers_webhook_and_ntfy_without_pairing_url(
 
 
 @pytest.mark.asyncio
+async def test_section_start_notification_is_opt_in_and_ntfy_only(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    settings = NotificationSettings(
+        webhook_urls=["https://hooks.example/runwatch"],
+        ntfy_base_url="https://ntfy.example",
+        ntfy_topic="runs",
+        ntfy_on_section_start=True,
+    )
+    store = notification_store(tmp_path, settings=settings)
+    bus = EventBus(store, "run")
+    manager = NotificationManager(
+        settings=settings,
+        store=store,
+        bus=bus,
+        run_id="run",
+    )
+    await manager._client.aclose()
+    replace_client(manager, handler)
+    await manager.start()
+    await bus.publish(
+        "notebook.section_started",
+        {
+            "heading": "Model evaluation",
+            "heading_level": 2,
+            "cell_index": 7,
+            "kernel_epoch": 3,
+        },
+    )
+    await wait_until(lambda: len(requests) == 1)
+
+    request = requests[0]
+    assert str(request.url) == "https://ntfy.example/runs"
+    assert request.headers["title"] == "Runwatch: starting notebook section"
+    assert request.content == b"Starting section: Model evaluation"
+    assert not any("hooks.example" in str(candidate.url) for candidate in requests)
+
+    await manager.close()
+    store.close()
+
+
+def test_section_start_event_is_ignored_when_option_is_disabled(tmp_path: Path) -> None:
+    settings = NotificationSettings(
+        ntfy_base_url="https://ntfy.example",
+        ntfy_topic="runs",
+    )
+    store = notification_store(tmp_path, settings=settings)
+    presenter = NotificationPresenter(store=store, run_id="run", settings=settings)
+
+    notification = presenter.from_event(
+        {
+            "type": "notebook.section_started",
+            "payload": {
+                "heading": "Model evaluation",
+                "heading_level": 2,
+                "cell_index": 7,
+                "kernel_epoch": 3,
+            },
+        }
+    )
+
+    assert notification is None
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_ntfy_only_section_intent_supports_same_topology_rotation(
+    tmp_path: Path,
+) -> None:
+    old = NotificationSettings(
+        webhook_urls=["https://old-hooks.example/runwatch"],
+        ntfy_base_url="https://old-ntfy.example",
+        ntfy_topic="runs",
+        ntfy_on_section_start=True,
+    )
+    desired = NotificationSettings(
+        webhook_urls=["https://new-hooks.example/runwatch"],
+        ntfy_base_url="https://new-ntfy.example",
+        ntfy_topic="runs",
+        ntfy_on_section_start=True,
+    )
+    store = notification_store(tmp_path, settings=old)
+    first = NotificationManager(
+        settings=old,
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    notification = first._presenter.from_event(
+        {
+            "type": "notebook.section_started",
+            "payload": {
+                "heading": "Model evaluation",
+                "heading_level": 2,
+                "cell_index": 7,
+                "kernel_epoch": 3,
+            },
+        }
+    )
+    assert notification is not None
+    intent = await first.send(notification)
+    assert intent is not None
+    assert store.notification_delivery_topology("run") == (("ntfy", 1),)
+    await first.close()
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    rotated = NotificationManager(
+        settings=desired,
+        store=store,
+        bus=EventBus(store, "run"),
+        run_id="run",
+    )
+    await rotated._client.aclose()
+    replace_client(rotated, handler)
+    await rotated.start()
+    await wait_until(lambda: len(requests) == 1)
+
+    assert str(requests[0].url) == "https://new-ntfy.example/runs"
+    assert not any("hooks.example" in str(request.url) for request in requests)
+    await rotated.close()
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_rotated_dashboard_link_is_ntfy_click_target_only(
     tmp_path: Path,
 ) -> None:

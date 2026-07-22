@@ -37,6 +37,9 @@ multi-user service.
 - Optimistic resource versions reject stale stop confirmations.
 - AWS credentials remain server-side.
 - Pairing URLs are excluded from notifications.
+- When `ntfy_on_section_start` is enabled, bounded Markdown heading text is deliberately
+  sent to the configured ntfy topic. Treat headings as outbound data and keep secrets
+  out of them.
 - Notification routing replays persisted events and retries each destination
   independently. Delivery is at least once, with stable `Idempotency-Key` and
   `X-Runwatch-Intent-ID` headers for receiver-side deduplication.

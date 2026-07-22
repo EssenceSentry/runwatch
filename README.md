@@ -1,56 +1,68 @@
-# Runwatch
+<p align="center">
+  <img src="web_artifacts/runwatch/mascot/ready.png" width="160" alt="Runwatch mascot">
+</p>
 
-[![quality-gate](https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main)](https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
-[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](.pre-commit-config.yaml)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+<h1 align="center">Runwatch</h1>
 
-Runwatch is `nbclient` on steroids: durable notebook execution, structured AWS and local
-resource monitoring, restart/replay, and a mobile-friendly dashboard. The dashboard is
-observational except for one deliberately narrow remote action: stopping an owned,
-stoppable resource cancels the run.
+<p align="center"><strong>Turn long-running notebooks into durable, observable jobs—without turning them into pipelines.</strong></p>
 
-Runwatch is agent-agnostic. Codex, Claude, or a human edits the run-owned `source.ipynb`
-with normal `nbformat` APIs and uses the local CLI to resume or restart the run.
+<p align="center">
+  Run the notebook you already have. Follow it from your phone. Recover where the work failed.
+</p>
 
-## Highlights
+<p align="center">
+  <a href="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml"><img src="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main" alt="Quality gate"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
+  <a href=".pre-commit-config.yaml"><img src="https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&amp;logoColor=white" alt="pre-commit enabled"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
 
-- Cell-by-cell `nbclient` execution with a live kernel.
-- Atomic write-back of settled cell sources, execution counts, and outputs to the
-  notebook passed to `runwatch execute`.
-- Failure pause that preserves kernel state while monitoring continues.
-- Manual recovery after kernel death or a stopped Runwatch process.
-- Immutable input, editable source, rolling partial output, and final executed notebook.
-- Durable SQLite actions for live and stopped-process control, kernel epochs, source
-  hashes, adapter cursors, observations, logs, notifications, and bounded events.
-- Built-in resource adapters for:
-  - SageMaker Processing jobs;
-  - S3 prefixes and Runwatch manifests;
-  - CloudWatch metrics and logs;
-  - host/kernel CPU and memory plus optional NVIDIA GPU metrics;
-  - local file counts and incremental line counts;
-  - health-checked links to other localhost dashboards.
-- FastAPI dashboard with SSE, pairing-token authentication, LAN sharing, and optional
-  `cloudflared` quick tunnels.
-- Webhook and `ntfy` notifications backed by durable event replay and a
-  per-destination retry outbox. Delivery is at least once; retries carry stable
-  `Idempotency-Key` and `X-Runwatch-Intent-ID` headers so receivers can deduplicate a
-  request accepted immediately before a Runwatch crash. Unexpected event-routing
-  failures use bounded backoff and one durable dead-letter record instead of pinning
-  event retention indefinitely.
-- Versioned notification presentations exclude resolved configuration and raw
-  operational payloads. Response bodies are not read, redirects are not followed,
-  periodic reminders use one rolling intent, and network plain HTTP requires an
-  explicit opt-in.
-- Notification-aware removal of successful or cancelled run state after the dashboard closes, with
-  incomplete outboxes retained for `runwatch open` recovery and `--keep-run` available
-  for retained provenance.
+Runwatch is a reliability layer for Jupyter notebooks. It combines cell-by-cell
+`nbclient` execution with durable checkpoints, live resource monitoring, notifications,
+and a mobile-friendly dashboard. When a cell fails, the run pauses with its state and
+monitors intact, ready for you—or your coding agent—to repair and continue.
 
-Runwatch versions its persisted and wire contracts independently. New run manifests
-and SQLite databases use schema version 3; configuration and kernel resource events use
-schema version 2; S3 progress manifests use schema version 1. Legacy schema-version-2
-run directories reopen conservatively. Runwatch intentionally does not migrate 0.1 run
-directories.
+**Keep notebook ergonomics. Gain the confidence of an operational job.**
+
+[Get started](#first-run) · [Explore resource monitoring](#resource-emission) ·
+[See failure recovery](#failure-and-recovery) · [Read the docs](https://essencesentry.github.io/runwatch/)
+
+## Built for notebook jobs that have outgrown “Run All”
+
+- **Recover instead of rerun.** Runwatch checkpoints every settled cell, preserves a
+  live kernel after failure, and supports resume or clean replay after a process or
+  kernel restart.
+- **Walk away without losing visibility.** Follow cells, outputs, tracebacks, progress,
+  metrics, logs, and external resources from a responsive dashboard on desktop or
+  mobile.
+- **Get an ETA that adapts to the work.** Runwatch mirrors existing `tqdm` bars without
+  changing the loop, adds an uncertainty range, and recalibrates when throughput shifts.
+- **See the whole workload, not just the notebook.** Built-in adapters watch SageMaker
+  Processing, S3, CloudWatch, host and kernel metrics, NVIDIA GPUs, local files, logs,
+  and linked localhost dashboards.
+- **Know when something changes.** Durable webhook and `ntfy` delivery can notify you
+  with periodic status reminders, notebook section transitions, failures, completion,
+  and refreshed Cloudflare sharing links.
+- **Keep the execution host awake.** An optional native IOKit assertion on macOS or
+  logind inhibitor on Linux prevents idle system sleep while the run is live.
+- **Share access intentionally.** Keep the dashboard on localhost, expose it to a
+  trusted LAN, or use a self-healing `cloudflared` quick tunnel with pairing-token
+  authentication.
+- **Work equally well with humans and coding agents.** The editable run-owned notebook,
+  structured context command, and explicit resume/restart workflow use ordinary files
+  and CLI commands—no agent lock-in.
+- **Get the result back where you expect it.** Settled sources, execution counts, and
+  outputs are written atomically to the notebook you launched, with conflict detection
+  to protect outside edits.
+- **Avoid a trail of abandoned state.** Successful and cancelled runs clean themselves
+  up after the dashboard closes, while incomplete notification delivery and
+  `--keep-run` preserve state when it still matters.
+
+The dashboard is deliberately observation-first. Its one remote mutation is narrowly
+scoped: stopping an owned, stoppable resource also cancels the run. Runwatch records
+actions, source hashes, kernel epochs, adapter cursors, observations, logs,
+notifications, and bounded events in durable SQLite state so recovery does not depend
+on one long-lived process.
 
 ## Installation
 
@@ -146,6 +158,32 @@ files are created with mode `0600`. Retained state is nevertheless sensitive: it
 contain notebook source and output, tracebacks, local paths, resource identifiers and
 logs, notification destinations and payloads, actions, and the dashboard bearer token.
 The mode of the original notebook passed to `execute` is preserved during write-back.
+
+Runwatch versions its persisted and wire contracts independently. New run manifests
+and SQLite databases use schema version 3; configuration and kernel resource events use
+schema version 2; S3 progress manifests use schema version 1. Legacy schema-version-2
+run directories reopen conservatively. Runwatch intentionally does not migrate 0.1 run
+directories.
+
+## Keep the execution host awake
+
+For an unattended run on macOS or Linux, opt into native idle-sleep inhibition:
+
+```yaml
+host:
+  prevent_system_sleep: true
+```
+
+macOS uses an IOKit `NoIdleSleepAssertion`; Linux holds a logind inhibitor through
+`systemd-inhibit`. The inhibitor starts before the notebook runtime and remains active
+through execution, blocking-resource waits, failure pauses, recovery, cancellation, and
+finalization. It is released before the post-run dashboard linger begins and during
+abnormal supervisor cleanup. Display sleep is unaffected.
+
+Linux hosts need `systemd-inhibit` and a reachable logind service. Runwatch fails the
+start if the explicitly requested inhibitor cannot be acquired; `runwatch validate`
+checks that the platform backend can be constructed before execution. Windows is not a
+supported execution target.
 
 ## Failure and recovery
 
@@ -408,6 +446,26 @@ that evidence quickly, while smaller shifts require longer observations. Set
 `notebook.capture_tqdm: false` to disable automatic capture, or adjust
 `notebook.tqdm_min_interval_seconds`. Progress created in a separate process is outside
 the notebook kernel and is not captured automatically.
+
+### Notebook section notifications
+
+Runwatch can announce notebook section transitions through ntfy:
+
+```yaml
+notifications:
+  ntfy_base_url: https://ntfy.sh
+  ntfy_topic: your-private-topic
+  ntfy_on_section_start: true
+```
+
+After a non-empty code cell finishes, Runwatch inspects the Markdown cells before the
+next non-empty code cell. If they contain headings, it emits a durable section-start
+event and sends the nearest heading to ntfy immediately before that next code cell
+begins. The notification is ntfy-only even when generic webhooks are also configured.
+The first code cell is not announced because no preceding code cell has completed.
+
+Heading text leaves the machine when this option is enabled. Keep secrets out of
+Markdown headings and use a private ntfy topic.
 
 ## Dashboard and remote stop
 

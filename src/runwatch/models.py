@@ -266,6 +266,12 @@ class NotebookSettings(BaseModel):
     resource_completion_timeout_seconds: float | None = Field(default=None, gt=0)
 
 
+class HostSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prevent_system_sleep: bool = False
+
+
 class AwsSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -298,6 +304,7 @@ class NotificationSettings(BaseModel):
     webhook_urls: list[str] = Field(default_factory=list)
     ntfy_base_url: str | None = None
     ntfy_topic: str | None = None
+    ntfy_on_section_start: bool = False
     periodic_seconds: float | None = Field(default=None, ge=60)
     terminal_drain_timeout_seconds: float = Field(default=30.0, ge=0)
     request_timeout_seconds: float = Field(default=15.0, gt=0)
@@ -350,6 +357,10 @@ class NotificationSettings(BaseModel):
     def complete_ntfy_pair(self) -> NotificationSettings:
         if bool(self.ntfy_base_url) != bool(self.ntfy_topic):
             raise ValueError("ntfy_base_url and ntfy_topic must be configured together")
+        if self.ntfy_on_section_start and not self.ntfy_topic:
+            raise ValueError(
+                "ntfy_on_section_start requires ntfy_base_url and ntfy_topic"
+            )
         if self.retry_max_seconds < self.retry_initial_seconds:
             raise ValueError(
                 "retry_max_seconds must be greater than or equal to "
@@ -399,6 +410,7 @@ class RunwatchConfig(BaseModel):
 
     schema_version: Literal[2] = CONFIG_SCHEMA_VERSION
     notebook: NotebookSettings = Field(default_factory=NotebookSettings)
+    host: HostSettings = Field(default_factory=HostSettings)
     aws: AwsSettings = Field(default_factory=AwsSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)

@@ -9,6 +9,7 @@ import nbformat
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
 from nbformat import NotebookNode
 
+from ._sleep_inhibition import create_sleep_inhibitor
 from .adapters import default_adapter_registry
 from .models import ResourceEvent, RunwatchConfig
 
@@ -109,6 +110,18 @@ def _validate_sharing(
         )
 
 
+def _validate_host(config: RunwatchConfig, errors: list[str]) -> None:
+    if not config.host.prevent_system_sleep:
+        return
+    try:
+        create_sleep_inhibitor()
+    except Exception as error:
+        errors.append(
+            "System sleep inhibition is unavailable: "
+            f"{type(error).__name__}: {error}"
+        )
+
+
 def validate_execution(
     notebook_path: Path,
     config: RunwatchConfig,
@@ -129,6 +142,7 @@ def validate_execution(
     _validate_kernel(kernel_name, errors)
     resources = _validate_resources(config, errors)
     _validate_sharing(config, errors, warning_messages)
+    _validate_host(config, errors)
     warning_messages.append(
         "Resources emitted dynamically by notebook cells cannot be known until those cells run"
     )

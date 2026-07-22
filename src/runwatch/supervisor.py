@@ -12,6 +12,7 @@ from uuid import uuid4
 import nbformat
 
 from ._fs import atomic_write_bytes, ensure_private_directory
+from ._sleep_inhibition import SleepInhibitor, create_sleep_inhibitor
 from .events import EventBus
 from .manifest import read_run_manifest
 from .models import (
@@ -53,7 +54,11 @@ class RunSupervisor:
         initial_from_cell: int = 0,
         bootstrap_action_id: str | None = None,
         cleanup_on_success: bool = True,
+        sleep_inhibitor: SleepInhibitor | None = None,
     ) -> None:
+        configured_sleep_inhibitor = sleep_inhibitor
+        if config.host.prevent_system_sleep and configured_sleep_inhibitor is None:
+            configured_sleep_inhibitor = create_sleep_inhibitor()
         self.notebook_path = notebook_path.resolve()
         self.output_path = output_path.resolve()
         self.working_dir = working_dir.resolve()
@@ -152,6 +157,7 @@ class RunSupervisor:
         self.controller_started_at = process_start_time(os.getpid())
         self._process_registered = False
         self._dashboard_links: DashboardLinkManager | None = None
+        self._sleep_inhibitor = configured_sleep_inhibitor
 
     def attach_dashboard_links(self, manager: DashboardLinkManager) -> None:
         """Attach authenticated sharing for ``local.dashboard`` resources."""
@@ -235,6 +241,7 @@ class RunSupervisor:
         recovered_actions = self.store.recover_incomplete_actions(self.run_id)
         self._recovered_stop_pending = self._has_unfinished_stop_actions()
         bootstrap_action = self._claim_bootstrap_action()
+        await self._acquire_sleep_inhibitor()
         await self._restore_runtime_services()
         self._register_controller_process()
         if recovered_actions:
@@ -363,6 +370,7 @@ class RunSupervisor:
             await self._raise_if_action_loop_terminated()
             self.store.mark_run_finalized(self.run_id, status)
             self._finalized = True
+        await self._release_sleep_inhibitor()
         self._wait_completed_normally = True
         return status
 
@@ -456,8 +464,9 @@ class RunSupervisor:
         self._quiesced = True
         runtime_error = await self._capture_async_cleanup(self._stop_runtime_tasks)
         resource_error = await self._capture_async_cleanup(self.resources.shutdown)
+        sleep_error = await self._capture_async_cleanup(self._release_sleep_inhibitor)
         try:
-            self._raise_cleanup_errors([runtime_error, resource_error])
+            self._raise_cleanup_errors([runtime_error, resource_error, sleep_error])
         except BaseException as error:
             self._quiesce_error = error
             raise
@@ -546,6 +555,28 @@ class RunSupervisor:
             return
         self.store.clear_process(self.run_id, process_token=self.controller_token)
         self._process_registered = False
+
+    async def _acquire_sleep_inhibitor(self) -> None:
+        if self._sleep_inhibitor is None:
+            return
+        await self._sleep_inhibitor.acquire()
+        await self.bus.publish(
+            "host.sleep_inhibition_started",
+            {"backend": self._sleep_inhibitor.backend},
+        )
+
+    async def _release_sleep_inhibitor(self) -> None:
+        if self._sleep_inhibitor is None:
+            return
+        was_active = self._sleep_inhibitor.active
+        backend = self._sleep_inhibitor.backend
+        await self._sleep_inhibitor.release()
+        if not was_active:
+            return
+        await self.bus.publish(
+            "host.sleep_inhibition_stopped",
+            {"backend": backend},
+        )
 
     @staticmethod
     def _raise_cleanup_errors(errors: list[BaseException | None]) -> None:

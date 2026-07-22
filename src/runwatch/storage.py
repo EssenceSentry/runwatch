@@ -87,6 +87,15 @@ _NOTIFICATION_DATA_FIELDS: dict[str, frozenset[str]] = {
         }
     ),
     "cell_failed": frozenset({"schema_version", "kind", "cell_index", "error_type"}),
+    "section_started": frozenset(
+        {
+            "schema_version",
+            "kind",
+            "heading",
+            "heading_level",
+            "cell_index",
+        }
+    ),
     "resource_failed": frozenset(
         {
             "schema_version",
@@ -135,7 +144,17 @@ def _notification_rotation_pairs(
 ) -> list[tuple[str, str, str]]:
     if not actual:
         return []
-    if _notification_topology(actual) != _notification_topology(desired):
+    if current is None:
+        if _notification_topology(actual) != _notification_topology(desired):
+            raise ValueError(
+                "Persisted notification destinations do not match the desired topology"
+            )
+        current = actual
+    if _notification_topology(current) != _notification_topology(desired):
+        raise ValueError(
+            "Persisted notification destinations do not match the desired topology"
+        )
+    if not set(actual).issubset(current):
         raise ValueError(
             "Persisted notification destinations do not match the desired topology"
         )
@@ -144,23 +163,14 @@ def _notification_rotation_pairs(
         actual_values = sorted(
             destination for item_kind, destination in actual if item_kind == kind
         )
-        current_values = (
-            [destination for item_kind, destination in current if item_kind == kind]
-            if current is not None
-            else []
-        )
-        sources = (
-            current_values
-            if len(current_values) == len(actual_values)
-            and set(current_values) == set(actual_values)
-            else actual_values
-        )
+        current_values = [
+            destination for item_kind, destination in current if item_kind == kind
+        ]
         targets = [
             destination for item_kind, destination in desired if item_kind == kind
         ]
-        pairs.extend(
-            (kind, old, new) for old, new in zip(sources, targets, strict=True)
-        )
+        replacements = dict(zip(current_values, targets, strict=True))
+        pairs.extend((kind, old, replacements[old]) for old in actual_values)
     return pairs
 
 
