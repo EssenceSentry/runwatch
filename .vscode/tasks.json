@@ -2,6 +2,30 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "git: periodic pull (clean, ff-only)",
+      "type": "process",
+      "command": "/bin/zsh",
+      "args": [
+        "-c",
+        "echo \"[periodic pull] monitoring $PWD every 300 seconds\"; while true; do if [[ -z \"$(git status --porcelain=v1 --untracked-files=normal 2>/dev/null)\" ]] && git symbolic-ref -q HEAD >/dev/null && git rev-parse --verify '@{upstream}' >/dev/null 2>&1; then before=$(git rev-parse HEAD) && if git pull --ff-only --quiet; then after=$(git rev-parse HEAD); [[ \"$before\" = \"$after\" ]] || echo \"[periodic pull] updated $(basename \"$PWD\") $before -> $after\"; else echo \"[periodic pull] pull failed for $PWD\" >&2; fi; fi; sleep 300; done"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "isBackground": true,
+      "problemMatcher": [],
+      "runOptions": {
+        "runOn": "folderOpen",
+        "instanceLimit": 1
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "detail": "Every five minutes, fast-forward pull this repository only when it is clean and tracks an upstream branch."
+    },
+    {
       "label": "notebook: run active notebook",
       "type": "process",
       "command": "${workspaceFolder}/scripts/run_active_notebook.sh",
