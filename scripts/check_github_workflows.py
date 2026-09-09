@@ -129,8 +129,8 @@ def _release_workflow_policy(
         errors.append("release workflow requires release-build and pypi-publish jobs")
         return errors
     build_permissions = _as_mapping(build.get("permissions")) or {}
-    if build_permissions.get("id-token") == "write":
-        errors.append("release-build must not receive OIDC permission")
+    if any(value == "write" for value in build_permissions.values()):
+        errors.append("release-build must not receive write permissions")
     if publish.get("needs") != ["release-build"]:
         errors.append("pypi-publish must depend only on release-build")
     environment = _as_mapping(publish.get("environment"))

@@ -561,7 +561,7 @@ async def test_dashboard_state_and_sse_are_allowlisted_presentations(
     serialized = response.text
 
     assert response.headers["cache-control"] == "no-store"
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert "actions" not in snapshot
     assert set(snapshot["capabilities"]) == {"controller_live"}
     assert "source" not in snapshot["cells"][0]

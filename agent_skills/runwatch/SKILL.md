@@ -1,6 +1,6 @@
 ---
 name: runwatch
-description: Execute, monitor, inspect, repair, resume, restart, and verify Runwatch-managed Jupyter notebook runs. Use when launching a notebook with Runwatch, providing its LAN or mobile dashboard URL, monitoring a run, repairing a paused or failed run, editing source.ipynb or imported code, recovering a dead kernel or Runwatch process, inspecting resources, or choosing between live resume and replay.
+description: Execute, monitor, inspect, repair, resume, restart, and verify Runwatch-managed Jupyter and Marimo notebook runs. Use when launching a notebook with Runwatch, providing its LAN or mobile dashboard URL, monitoring a run, repairing a paused or failed run, editing source.ipynb, source.py, or imported code, recovering a dead kernel or Runwatch process, inspecting resources, or choosing between live resume and replay.
 ---
 
 # Runwatch execution and recovery
@@ -34,7 +34,7 @@ source changes; use the Runwatch CLI for run transitions and resource control.
    successful run directory is removed unless the run was launched with `--keep-run`;
    failed and recoverable runs are retained.
 
-## Recover a run
+## Recover a Jupyter run
 
 1. Locate the run directory supplied by the user, notification, or `.runwatch/runs/`.
 2. Run `runwatch context RUN_DIR --json` and inspect the failed cell, kernel epoch,
@@ -57,6 +57,33 @@ source changes; use the Runwatch CLI for run transitions and resource control.
 6. Wait for the CLI action to complete or reject, then verify with
    `runwatch status RUN_DIR --json` and, when needed,
    `runwatch events RUN_DIR --follow --json`.
+
+## Recover a Marimo run
+
+1. Run `runwatch context RUN_DIR --json`; use its backend, source path, graph parents,
+   active/failed cells, generation, and epoch as the current authority.
+2. Edit `RUN_DIR/source.py` with normal Python file tools. Never edit `input.py`,
+   `marimo-runtime/runtime.py`, or snapshot files. Saves do not execute code.
+3. Use `runwatch resume RUN_DIR` for unambiguously mapped cell-body repairs. Failed,
+   interrupted, stale, and failure-blocked cells execute explicitly; unaffected
+   successful branches stay intact. Independent branches may finish before pause.
+4. Use `runwatch restart RUN_DIR` for structural, reordered, setup, imported-module,
+   or environment changes. Restart creates a new epoch and runs the whole graph.
+   Marimo `--from-cell N` selects N, its descendants, and required ancestors; unrelated
+   branches are not replayed. This selector differs from Jupyter's sequential replay.
+5. After controller/kernel loss or an uncertain request outcome, inspect fresh context
+   and request explicit recovery. Never manually resubmit an uncertain execution batch.
+6. Verify status and both `.executed.html` and `.executed.session.json` results. The
+   original `.py` contains repaired source only. Source conflicts or failed artifact
+   publication retain the run directory; do not delete it to bypass finalization.
+
+Use a prepared Python environment with `runwatch-notebook[supervisor,marimo]` and
+notebook dependencies already installed. `runwatch validate notebook.py` checks source
+and inline dependency declarations without running cells. Configure a separate prepared
+interpreter through `notebook.marimo.python_executable`; never set `kernel_name` for
+Marimo or install dependencies during execution. Share only the Runwatch dashboard.
+The Marimo server stays authenticated, loopback-only, and private. Interactive widgets
+have static fallbacks in durable results.
 
 ## Safety
 

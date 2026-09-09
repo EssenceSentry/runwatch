@@ -5,10 +5,11 @@ import warnings as warning_control
 from pathlib import Path
 from typing import Any, TypedDict
 
-import nbformat
 from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
 from nbformat import NotebookNode
 
+from ._backends import python_executable, resolve_backend
+from ._jupyter_document import JupyterDocument
 from ._sleep_inhibition import create_sleep_inhibitor
 from .adapters import default_adapter_registry
 from .models import ResourceEvent, RunwatchConfig
@@ -18,6 +19,7 @@ class ValidationReport(TypedDict):
     """Structured result returned by notebook execution preflight."""
 
     valid: bool
+    backend: str
     notebook: str
     working_dir: str
     kernel_name: str
@@ -30,9 +32,7 @@ class ValidationReport(TypedDict):
 
 def _read_notebook(notebook_path: Path, errors: list[str]) -> NotebookNode | None:
     try:
-        notebook = nbformat.read(notebook_path, as_version=4)
-        nbformat.validate(notebook)
-        return notebook
+        return JupyterDocument.read(notebook_path).view()
     except Exception as error:
         errors.append(
             f"Notebook is not valid nbformat v4: {type(error).__name__}: {error}"
@@ -132,14 +132,33 @@ def validate_execution(
 
     errors: list[str] = []
     warning_messages: list[str] = []
-    notebook = _read_notebook(notebook_path, errors)
+    notebook = None
+    try:
+        backend = resolve_backend(notebook_path, config.notebook)
+    except ValueError as error:
+        backend = "jupyter"
+        errors.append(str(error))
+    if backend == "marimo":
+        try:
+            from ._marimo_document import MarimoDocument
+
+            notebook = MarimoDocument.read(
+                notebook_path, config.notebook, working_dir
+            ).view()
+        except Exception as error:
+            errors.append(f"Marimo validation failed: {error}")
+    else:
+        notebook = _read_notebook(notebook_path, errors)
     _validate_working_dir(working_dir, errors)
 
     kernel_name = config.notebook.kernel_name
     if kernel_name is None and notebook is not None:
         kernel_name = notebook.metadata.get("kernelspec", {}).get("name")
     kernel_name = str(kernel_name or "python3")
-    _validate_kernel(kernel_name, errors)
+    if backend == "jupyter":
+        _validate_kernel(kernel_name, errors)
+    else:
+        kernel_name = python_executable(config.notebook)
     resources = _validate_resources(config, errors)
     _validate_sharing(config, errors, warning_messages)
     _validate_host(config, errors)
@@ -160,6 +179,7 @@ def validate_execution(
     cells = list(notebook.cells) if notebook is not None else []
     return {
         "valid": not errors,
+        "backend": backend,
         "notebook": str(notebook_path.resolve()),
         "working_dir": str(working_dir.resolve()),
         "kernel_name": kernel_name,

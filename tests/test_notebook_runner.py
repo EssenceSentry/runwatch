@@ -77,6 +77,7 @@ async def test_notebook_runner_requires_curve_transport(tmp_path: Path) -> None:
     )
 
     try:
+        assert isinstance(supervisor.runner, notebook_module.NotebookRunner)
         client = supervisor.runner._make_client()
         manager = client.create_kernel_manager()
 
@@ -278,6 +279,7 @@ async def test_section_event_precedes_next_code_cell(
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     runner.kernel_epoch = 4
     event_types_before_execution: dict[int, list[str]] = {}
 
@@ -337,6 +339,7 @@ async def test_durable_transitions_ignore_in_memory_fanout_failure(
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
 
     async def skip_checkpoint(*, force: bool, writeback: bool = False) -> None:
         assert force is True
@@ -573,6 +576,7 @@ async def test_oversized_runner_error_and_working_dir_terminalize_safely(
         config=minimum_event_payload_config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     runner.working_dir = Path("/" + ("deep-segment/" * 500))
     canary = "RUNNER_EVENT_TAIL_CANARY"
 
@@ -723,6 +727,7 @@ async def test_checkpoint_generation_preserves_request_arriving_during_worker_wr
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     first_write_started = threading.Event()
     release_first_write = threading.Event()
     snapshots: list[bytes] = []
@@ -781,6 +786,7 @@ async def test_periodic_checkpoint_retries_transient_failure_and_records_recover
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     attempts = 0
     original_write = runner._write_notebook_bytes_atomic
 
@@ -834,6 +840,7 @@ async def test_writeback_rechecks_original_immediately_before_replace(
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     runner.notebook.cells[0].outputs = [
         nbformat.v4.new_output("stream", name="stdout", text="executed\n")
     ]
@@ -1097,6 +1104,7 @@ async def test_cancellation_retries_when_durable_status_update_fails_once(
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     original_request = supervisor.store.request_run_cancellation
     attempts = 0
 
@@ -1191,6 +1199,7 @@ async def test_cancellation_stops_after_interrupt_without_losing_kernel_state(
         config=config(),
     )
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     execution: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     calls: list[str] = []
 
@@ -1283,6 +1292,7 @@ async def test_cancellation_escalates_and_abandons_unresponsive_cell_without_han
             await asyncio.Event().wait()
 
     runner = supervisor.runner
+    assert isinstance(runner, notebook_module.NotebookRunner)
     client = UnresponsiveClient()
     monkeypatch.setattr(runner, "_make_client", lambda: client)
     await supervisor.start()
@@ -1362,6 +1372,7 @@ async def test_recovery_rejection_event_failure_does_not_fail_runner(
         )
     )
 
+    assert isinstance(supervisor.runner, notebook_module.NotebookRunner)
     assert await supervisor.runner._recovery_loop(0, 1) == "cancel"  # noqa: SLF001
     action = supervisor.store.get_action(action_id)
     assert action is not None

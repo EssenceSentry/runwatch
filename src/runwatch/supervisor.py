@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import nbformat
 
+from ._backends import resolve_backend
 from ._fs import atomic_write_bytes, ensure_private_directory
 from ._sleep_inhibition import SleepInhibitor, create_sleep_inhibitor
 from .events import EventBus
@@ -51,7 +52,7 @@ class RunSupervisor:
         name: str | None = None,
         run_id: str | None = None,
         reopen: bool = False,
-        initial_from_cell: int = 0,
+        initial_from_cell: int | None = None,
         bootstrap_action_id: str | None = None,
         cleanup_on_success: bool = True,
         sleep_inhibitor: SleepInhibitor | None = None,
@@ -68,13 +69,31 @@ class RunSupervisor:
         self.run_id = run_id or str(uuid4())
         self.initial_from_cell = initial_from_cell
         self.cleanup_on_success = cleanup_on_success
-        self.source_path = self.run_dir / "source.ipynb"
-        self.input_snapshot_path = self.run_dir / "input.ipynb"
-        self.partial_output_path = self.run_dir / "executed.partial.ipynb"
+        self.backend = resolve_backend(self.notebook_path, config.notebook)
+        extension = ".py" if self.backend == "marimo" else ".ipynb"
+        self.source_path = self.run_dir / f"source{extension}"
+        self.input_snapshot_path = self.run_dir / f"input{extension}"
+        self.partial_output_path = self.run_dir / (
+            "executed.partial.session.json"
+            if self.backend == "marimo"
+            else "executed.partial.ipynb"
+        )
         self._validate_output_path_ownership()
         ensure_private_directory(self.run_dir)
 
-        if not reopen:
+        if not reopen and self.backend == "marimo":
+            from ._marimo_document import MarimoDocument
+
+            document = MarimoDocument.read(
+                self.notebook_path, config.notebook, self.working_dir
+            )
+            atomic_write_bytes(
+                self.input_snapshot_path, document.source.encode(), preserve_mode=False
+            )
+            atomic_write_bytes(
+                self.source_path, document.source.encode(), preserve_mode=False
+            )
+        elif not reopen:
             original = nbformat.read(self.notebook_path, as_version=4)
             ensure_cell_ids(original)
             write_notebook_atomic(original, self.input_snapshot_path)
@@ -109,7 +128,10 @@ class RunSupervisor:
                 working_dir=self.working_dir,
                 run_dir=self.run_dir,
                 source_digest=source_hash(self.source_path),
-                metadata={"config": config.model_dump(mode="json")},
+                metadata={
+                    "config": config.model_dump(mode="json"),
+                    "notebook": {"backend": self.backend},
+                },
             )
             self._write_manifest()
 
@@ -127,7 +149,12 @@ class RunSupervisor:
             bus=self.bus,
             run_id=self.run_id,
         )
-        self.runner = NotebookRunner(
+        runner_class = NotebookRunner
+        if self.backend == "marimo":
+            from ._marimo_runner import MarimoRunner
+
+            runner_class = MarimoRunner
+        self.runner = runner_class(
             run_id=self.run_id,
             notebook_path=self.notebook_path,
             source_path=self.source_path,
@@ -173,12 +200,28 @@ class RunSupervisor:
         return self._wait_completed_normally
 
     def _validate_output_path_ownership(self) -> None:
+        if self.backend == "marimo" and self.output_path.suffix != ".html":
+            raise ValueError("Marimo output must be an .html path")
         reserved = {
             self.notebook_path: "the original notebook",
             self.input_snapshot_path: "Runwatch's immutable input snapshot",
             self.source_path: "Runwatch's editable source notebook",
             self.partial_output_path: "Runwatch's partial execution checkpoint",
         }
+        if (
+            self.backend == "marimo"
+            and self.run_dir / "marimo-runtime" in self.output_path.parents
+        ):
+            raise ValueError(
+                "Output cannot be stored inside the private Marimo runtime"
+            )
+        if (
+            self.backend == "marimo"
+            and self.output_path.with_suffix(".session.json") in reserved
+        ):
+            raise ValueError(
+                "Marimo snapshot would overwrite a Runwatch-owned artifact"
+            )
         description = reserved.get(self.output_path)
         if description is not None:
             raise ValueError(
@@ -191,11 +234,12 @@ class RunSupervisor:
         cls,
         run_dir: Path,
         *,
-        from_cell: int = 0,
+        from_cell: int | None = None,
         bootstrap_action_id: str | None = None,
     ) -> RunSupervisor:
         manifest = cls.read_manifest(run_dir)
         config = RunwatchConfig.model_validate(manifest["config"])
+        config.notebook.backend = manifest.get("backend", "jupyter")
         return cls(
             notebook_path=Path(manifest["notebook_path"]),
             output_path=Path(manifest["output_path"]),
@@ -220,6 +264,7 @@ class RunSupervisor:
         payload = json.dumps(
             {
                 "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+                "backend": self.backend,
                 "run_id": self.run_id,
                 "name": self.name,
                 "notebook_path": str(self.notebook_path),
@@ -281,10 +326,14 @@ class RunSupervisor:
         if action.get("expected_cell_attempt") != run.get("failed_attempt"):
             return "Failed-cell attempt changed before stopped-process recovery"
         if action.get("expected_source_hash") != source_hash(self.source_path):
-            return "source.ipynb changed after recovery was requested"
+            return f"{self.source_path.name} changed after recovery was requested"
         if action["payload"].get("failed_cell_index") != run.get("failed_cell_index"):
             return "Failed-cell identity changed before stopped-process recovery"
-        if int(action["payload"].get("from_cell", 0)) != self.initial_from_cell:
+        requested_from = action["payload"].get("from_cell")
+        actual_from = self.initial_from_cell
+        if self.backend == "jupyter":
+            requested_from, actual_from = requested_from or 0, actual_from or 0
+        if requested_from != actual_from:
             return "Recovery start cell no longer matches the requested action"
         return None
 
@@ -311,7 +360,7 @@ class RunSupervisor:
             self.source_path
         ):
             return
-        message = "source.ipynb changed while stopped-process recovery was starting"
+        message = f"{self.source_path.name} changed while stopped-process recovery was starting"
         self.store.finish_action(
             action["action_id"], ActionStatus.REJECTED, message=message
         )
@@ -331,7 +380,7 @@ class RunSupervisor:
             action["action_id"],
             ActionStatus.COMPLETED,
             message="Stopped-process recovery accepted; a new kernel epoch is starting",
-            result={"from_cell": int(action["payload"].get("from_cell", 0))},
+            result={"from_cell": action["payload"].get("from_cell")},
         )
         await self._publish_action_event_safely(
             "action.completed",
@@ -612,7 +661,9 @@ class RunSupervisor:
             raise RuntimeError("Linked dashboard sharing is not active")
         return self._dashboard_links.open_target(internal_id)
 
-    def create_recovery_action(self, kind: ActionKind, *, from_cell: int = 0) -> str:
+    def create_recovery_action(
+        self, kind: ActionKind, *, from_cell: int | None = None
+    ) -> str:
         if kind not in {ActionKind.RESUME, ActionKind.RESTART}:
             raise ValueError(kind)
         run = self.store.get_run(self.run_id)
@@ -732,7 +783,7 @@ class RunSupervisor:
         command = RunnerCommand(
             action_id=action["action_id"],
             kind=action["kind"],
-            from_cell=int(action["payload"].get("from_cell", 0)),
+            from_cell=action["payload"].get("from_cell"),
             expected_kernel_epoch=int(action["expected_kernel_epoch"]),
             expected_failed_attempt=action.get("expected_cell_attempt"),
             requested_source_hash=str(action["expected_source_hash"]),
@@ -751,7 +802,7 @@ class RunSupervisor:
         if action["payload"].get("failed_cell_index") != run.get("failed_cell_index"):
             return "Failed-cell identity changed before the recovery action executed"
         if action.get("expected_source_hash") != source_hash(self.source_path):
-            return "source.ipynb changed after the recovery action was requested"
+            return f"{self.source_path.name} changed after the recovery action was requested"
         if self._another_recovery_is_executing(str(action["action_id"])):
             return "Another recovery action is already in flight for this failure"
         return None

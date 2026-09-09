@@ -14,6 +14,12 @@ user notebook ↔ conflict-guarded cell write-back
 The kernel is a child process and may be replaced. SQLite and the run artifacts are the
 durable authority for run state; AWS remains authoritative for AWS resource state.
 
+The shared `RunnerCore` owns lifecycle, durable progress/resource handling, checkpoint
+publication, and finalization. `NotebookRunner` retains the Jupyter facade; the Marimo
+runner uses a static document adapter and a version-validated code-mode session adapter.
+See [Marimo notebooks](marimo.md) for native graph semantics and artifact contracts.
+The sequential lifecycle below describes Jupyter.
+
 ## Notebook lifecycle
 
 ```text

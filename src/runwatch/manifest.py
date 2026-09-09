@@ -35,11 +35,17 @@ class _RunManifestV2(_ManifestBase):
 
 
 class _RunManifestV3(_ManifestBase):
-    schema_version: Literal[3] = RUN_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[3]
     cleanup_on_success: StrictBool
 
 
-RunManifest: TypeAlias = _RunManifestV2 | _RunManifestV3
+class _RunManifestV4(_ManifestBase):
+    schema_version: Literal[4] = RUN_MANIFEST_SCHEMA_VERSION
+    cleanup_on_success: StrictBool
+    backend: Literal["jupyter", "marimo"]
+
+
+RunManifest: TypeAlias = _RunManifestV2 | _RunManifestV3 | _RunManifestV4
 
 
 def read_run_manifest(path: Path) -> RunManifest:
@@ -53,7 +59,7 @@ def read_run_manifest(path: Path) -> RunManifest:
     Returns
     -------
     RunManifest
-        A strictly validated legacy-v2 or current-v3 manifest.
+        A strictly validated legacy v2/v3 or current v4 manifest.
 
     Raises
     ------
@@ -71,19 +77,21 @@ def read_run_manifest(path: Path) -> RunManifest:
         raise InvalidRunManifest("Runwatch manifest must be a JSON object")
     value = cast(dict[str, object], decoded)
     version = value.get("schema_version")
-    model: type[_RunManifestV2] | type[_RunManifestV3]
+    model: type[_RunManifestV2] | type[_RunManifestV3] | type[_RunManifestV4]
     if type(version) is not int:
         raise InvalidRunManifest(
-            f"Unsupported Runwatch manifest schema {version!r}; expected 2 or "
+            f"Unsupported Runwatch manifest schema {version!r}; expected 2, 3 or "
             f"{RUN_MANIFEST_SCHEMA_VERSION}"
         )
     if version == 2:
         model = _RunManifestV2
-    elif version == RUN_MANIFEST_SCHEMA_VERSION:
+    elif version == 3:
         model = _RunManifestV3
+    elif version == RUN_MANIFEST_SCHEMA_VERSION:
+        model = _RunManifestV4
     else:
         raise InvalidRunManifest(
-            f"Unsupported Runwatch manifest schema {version!r}; expected 2 or "
+            f"Unsupported Runwatch manifest schema {version!r}; expected 2, 3 or "
             f"{RUN_MANIFEST_SCHEMA_VERSION}"
         )
     compatible = dict(value)

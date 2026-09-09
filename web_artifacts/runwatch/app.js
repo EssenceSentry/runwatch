@@ -399,7 +399,8 @@ function renderProgress(run, cells, events) {
   const notebookPercent = executable.length ? 100 * done / executable.length : 0;
 
   if (current) {
-    $('current-label').textContent = current.label || `Cell ${current.cell_index + 1}`;
+    const active = cells.filter(cell => cell.status === 'running');
+    $('current-label').textContent = active.length > 1 ? `${active.length} cells running` : current.label || `Cell ${current.cell_index + 1}`;
     const codePosition = executable.findIndex(cell => cell.cell_index === current.cell_index);
     const position = codePosition >= 0 ? `Code cell ${codePosition + 1} of ${executable.length}` : `Cell ${current.cell_index + 1}`;
     $('current-meta').textContent = `${position}${current.attempt > 1 ? ` · retry ${current.attempt}` : ''}`;
@@ -869,7 +870,9 @@ function cellRows(cells) {
     const stateCopy = friendlyStatus(cell.status);
     const attemptCopy = cell.attempt > 1 ? ` · retry ${cell.attempt}` : '';
     return `<details class="cell-row cell-${cssToken(cell.status)}">
-      <summary><span class="cell-dot"></span><span><strong>${escapeHtml(cell.label || `Cell ${cell.cell_index + 1}`)}</strong><small>${escapeHtml(`${cell.cell_type} · ${stateCopy}${attemptCopy}${cell.error_name ? ` · ${cell.error_name}` : ''}`)}</small></span><span class="mono muted">${fmtDuration(cell.elapsed_seconds)}</span></summary>
+      <summary><span class="cell-dot"></span><span><strong>${escapeHtml(cell.label || `Cell ${cell.cell_index + 1}`)}</strong><small>${escapeHtml(`${cell.cell_type}${cell.cell_id ? ` · ${cell.cell_id}` : ''} · ${stateCopy}${attemptCopy}${cell.error_name ? ` · ${cell.error_name}` : ''}`)}</small></span><span class="mono muted">${fmtDuration(cell.elapsed_seconds)}</span></summary>
+      ${cell.skip_reason ? `<p class="muted">${escapeHtml(cell.skip_reason)}</p>` : ''}
+      ${cell.parents?.length ? `<p class="muted">Depends on: ${cell.parents.map(escapeHtml).join(', ')}</p>` : ''}
       ${detail ? `<pre class="cell-output">${escapeHtml(detail)}</pre>` : '<div class="empty small">No captured output.</div>'}
     </details>`;
   }).join('');
@@ -880,7 +883,7 @@ function highlightedCells(cells, run) {
   const add = cell => { if (cell) selected.set(cell.cell_index, cell); };
   cells.filter(cell => cell.status === 'failed').forEach(add);
   add(cells.find(cell => cell.cell_index === run.current_cell_index));
-  add(cells.find(cell => cell.status === 'running'));
+  cells.filter(cell => ['running', 'settling', 'blocked', 'interrupted', 'stale'].includes(cell.status)).forEach(add);
   cells.filter(cell => cell.cell_type === 'code' && ['succeeded', 'skipped', 'not_replayed'].includes(cell.status)).slice(-2).forEach(add);
   const currentIndex = run.current_cell_index ?? -1;
   add(cells.find(cell => cell.cell_type === 'code' && cell.status === 'pending' && cell.cell_index > currentIndex));
@@ -979,7 +982,7 @@ function renderEvents(events) {
 function render() {
   const {run, cells, resources, events, capabilities} = state;
   renderShare();
-  $('run-name').textContent = run.name;
+  $('run-name').textContent = `${run.name} · ${run.backend === 'marimo' ? 'Marimo' : 'Jupyter'}`;
   $('run-message').textContent = run.message || 'Monitoring notebook execution.';
   $('run-status').textContent = friendlyStatus(run.status);
   $('run-status').className = `status status-${cssToken(run.status)}`;

@@ -1,53 +1,48 @@
----
-title: "Releasing Runwatch"
-subject: "Runwatch Documentation"
-short_title: "Releasing"
-description: "Maintainer workflow for publishing verified Runwatch distributions to PyPI."
----
-
-# Releasing Runwatch
-
-Runwatch publishes the `runwatch-notebook` distribution from GitHub Releases through
-PyPI Trusted Publishing. The release workflow stores no PyPI API token: only its
-`pypi-publish` job can request a short-lived OIDC credential, after an unprivileged job
-has built and verified the distributions.
-
-## One-time trust configuration
-
-The repository needs a protected GitHub environment named `pypi`. PyPI's trusted
-publisher must match these values exactly:
-
-```text
-Project:      runwatch-notebook
-Owner:        EssenceSentry
-Repository:   runwatch
-Workflow:     release.yml
-Environment:  pypi
+```{include} ../RELEASE.md
 ```
 
-For the first release, register a pending publisher from the PyPI account publishing
-page. After the project exists, manage the publisher from the project's **Publishing**
-page. Keep manual approval enabled on the GitHub environment and restrict deployments
-to version tags.
+## Install a chosen source snapshot
 
-## Prepare a release
+Replace `<full-commit-sha>` with the commit you have selected and validated:
 
-1. Update `project.version` in `pyproject.toml`. It is the canonical package version;
-   documentation and wheel checks derive the version from package metadata.
-2. Update user-facing documentation and release notes for the version.
-3. Refresh `uv.lock`, then run `uv run pre-commit run --all-files`.
-4. Commit and push the exact validated tree to `main`.
-5. Create a GitHub Release whose tag is exactly `v<project.version>`, such as
-   `v0.2.0`, and target the release commit on `main`.
+```bash
+python -m pip install 'runwatch-notebook[supervisor] @ git+https://github.com/EssenceSentry/runwatch.git@<full-commit-sha>'
+```
 
-Publishing the GitHub Release starts `.github/workflows/release.yml`. It rechecks tag
-and version equality, proves the tagged commit belongs to `main`, reruns the complete
-quality gate, builds both the wheel and source distribution, validates their metadata,
-and uploads them as one immutable workflow artifact. The separate `pypi-publish` job
-downloads only those verified files and waits for approval on the `pypi` environment
-before publishing them with provenance attestations.
+Use `supervisor,marimo` for native Marimo notebooks. A local checkout can be installed
+with `python -m pip install '.[supervisor,marimo]'` from its repository root.
 
-PyPI distributions and version numbers are immutable. If publication fails before any
-file is accepted, fix the release workflow and rerun it. If any file was published,
-increment the package version; do not enable duplicate-skipping or replace an existing
-release.
+## Prepare a snapshot release
+
+1. Update the code and release notes, refresh `uv.lock` when dependencies change, and
+   run `uv run pre-commit run --all-files`.
+2. Commit the tested changes and push the selected commit to `main`. There is no
+   manual package version to bump.
+3. Run `uv sync --locked --extra dev`, then `uv run python scripts/check_release.py`
+   to display the commit-derived version. The dynamic root package has no fixed
+   version in `uv.lock`, so committing does not require another lockfile update.
+4. Create a GitHub Release targeting that commit with the exact tag `v<snapshot
+   version>`, for example `v0.0.dev1788274865`. Record the full source commit SHA
+   in the release notes and mark the GitHub Release as a prerelease.
+
+Publishing the GitHub Release starts `.github/workflows/release.yml`. Its build job
+checks tag/version equality and main-branch ancestry, runs the complete quality gate,
+builds wheel and source distributions, and validates them with `twine check --strict`.
+The gate also rebuilds an sdist without Git identity and checks the resulting wheel's
+version, contents, isolated installations, and notebook execution.
+
+A separate publishing job downloads only those verified distributions and uploads
+them to PyPI with attestations through Trusted Publishing. The build job has
+read-only repository access. Only the publishing job receives `id-token: write`,
+and it uses the protected `pypi` environment. Keep its required reviewers and `v*`
+tag restriction configured. No long-lived PyPI API token is stored in the workflow.
+
+The PyPI trusted publisher must match owner `EssenceSentry`, repository `runwatch`,
+workflow `release.yml`, and environment `pypi`. Existing publisher configuration for
+`runwatch-notebook` continues to apply.
+
+PyPI versions and files are immutable. If publication fails before any file is
+accepted, fix the workflow and rerun it. After a partial upload, inspect the accepted
+files and publish a new commit/version; do not enable duplicate-skipping or replace
+existing files. Verify the exact version on PyPI and install its wheel in an isolated
+environment before reporting publication complete.

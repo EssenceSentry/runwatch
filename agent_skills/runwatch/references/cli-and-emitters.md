@@ -136,3 +136,16 @@ S3 prefix polling is incremental between periodic full reconciliations. Pass
 ```
 
 Status is `running`, `completed`, or `failed`; metrics are scalar values.
+
+## Marimo backend
+
+Use `runwatch validate notebook.py`, `execute notebook.py`, and the same status, context,
+events, resume, restart, and open commands. The `.py` must be a valid Marimo notebook.
+`notebook.backend: auto | jupyter | marimo` defaults to auto;
+`notebook.marimo.python_executable` selects an already prepared environment. The
+optional Marimo extra is bounded to 0.24.x because code-mode is a private API.
+
+Edit `source.py`; preserve `input.py` and the runner-owned runtime copy. A plain restart
+runs the whole graph. Explicit `--from-cell N` runs N and descendants with prerequisites.
+`--output result.html` publishes `result.html` and `result.session.json`. Manifest v4
+records the backend; v2/v3 runs keep Jupyter semantics.

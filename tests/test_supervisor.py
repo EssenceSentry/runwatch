@@ -89,12 +89,12 @@ def manifest_payload(*, schema_version: object = 3) -> dict[str, Any]:
     }
 
 
-def test_new_run_manifest_has_an_independent_v3_schema(tmp_path: Path) -> None:
+def test_new_run_manifest_has_an_independent_v4_schema(tmp_path: Path) -> None:
     supervisor = build_supervisor(tmp_path)
 
     manifest = RunSupervisor.read_manifest(supervisor.run_dir)
 
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["config"]["schema_version"] == 2
     supervisor.store.close()
 
@@ -191,7 +191,7 @@ def test_current_manifest_requires_explicit_cleanup_policy(tmp_path: Path) -> No
         RunSupervisor.read_manifest(run_dir)
 
 
-@pytest.mark.parametrize("schema_version", ["3", 3.0, True, 4, None])
+@pytest.mark.parametrize("schema_version", ["3", 3.0, True, 5, None])
 def test_manifest_schema_dispatch_rejects_coercion_and_unknown_versions(
     tmp_path: Path, schema_version: object
 ) -> None:

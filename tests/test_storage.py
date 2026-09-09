@@ -108,7 +108,7 @@ def test_v2_store_persists_actions_cursors_and_bounded_observations(
     assert recovered and recovered["action_id"] == action_id
     store.finish_action(action_id, ActionStatus.COMPLETED, result={"ok": True})
     snapshot = store.snapshot("run")
-    assert snapshot["schema_version"] == 2
+    assert snapshot["schema_version"] == 3
     assert snapshot["resources"][0]["cursor"] == {"offset": 4}
     assert snapshot["resources"][0]["observations"][0]["metrics"] == {"value": 2}
     assert snapshot["actions"][0]["result"] == {"ok": True}
@@ -925,7 +925,7 @@ def test_v2_database_migration_keeps_existing_terminal_runs_unfinalized(
     version = migrated._connection.execute(  # noqa: SLF001 - schema assertion
         "SELECT value FROM runwatch_meta WHERE key = 'schema_version'"
     ).fetchone()
-    assert version is not None and version["value"] == "3"
+    assert version is not None and version["value"] == "4"
     migrated.close()
 
 

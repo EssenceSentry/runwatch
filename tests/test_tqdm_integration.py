@@ -259,6 +259,9 @@ async def test_tqdm_capture_can_be_disabled_without_starting_a_kernel(
         config=_config(capture_tqdm=False),
     )
 
+    from runwatch.notebook import NotebookRunner
+
+    assert isinstance(supervisor.runner, NotebookRunner)
     assert supervisor.runner.client is None
     await supervisor.runner._install_tqdm_instrumentation()
     assert supervisor.runner.client is None

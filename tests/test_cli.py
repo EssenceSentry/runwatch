@@ -1538,7 +1538,7 @@ def test_status_context_and_events_exclude_internal_canaries(tmp_path: Path) -> 
     ):
         assert secret not in serialized
     status_payload = json.loads(results[0].stdout)
-    assert status_payload["schema_version"] == 1
+    assert status_payload["schema_version"] == 2
     assert set(status_payload["run"]).isdisjoint(
         {"metadata", "process_token", "kernel_id", "notebook_path", "working_dir"}
     )

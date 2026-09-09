@@ -31,7 +31,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install locked release toolchain
-        run: uv sync --locked --extra supervisor --extra test --extra dev --extra docs
+        run: uv sync --locked --extra supervisor --extra marimo --extra test --extra dev --extra docs
       - name: Verify release tag and main ancestry
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}

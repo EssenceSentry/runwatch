@@ -10,7 +10,7 @@ description: "The local and GitHub quality gates required for every Runwatch cha
 Install all development dependencies and hooks once:
 
 ```bash
-uv sync --extra supervisor --extra test --extra dev --extra docs
+uv sync --extra supervisor --extra marimo --extra test --extra dev --extra docs
 uv run pre-commit install
 ```
 
@@ -42,7 +42,9 @@ resolve from the same environment used by the gate.
 supported Python version and on macOS for Python 3.12. These jobs cover the supported
 local POSIX execution platforms; they do not imply Windows or shared-filesystem support.
 `scripts/check_quality_gate_parity.py` prevents the Ruff and Black target lists from
-drifting between local and remote gates.
+drifting between local and remote gates. It also compares test targets, coverage
+arguments, and the supervisor/Marimo/test extras. Native integration and wheel probes
+exercise the locked Marimo API alongside the Jupyter regression suite.
 
 The main jobs use the committed lockfile for reproducibility. A separate compatibility
 matrix deliberately resolves without that lockfile: Python 3.10 uses uv's
@@ -57,16 +59,17 @@ The cognitive-complexity ceiling is 15. Exceptions must be explicit in
 `scripts/complexity_allowlist.json`, include a reason and follow-up, and fail once
 unused. Runwatch currently carries no exceptions.
 
-The wheel gate builds the actual distribution in a temporary directory and verifies the
+The wheel gate builds the snapshot wheel and sdist, verifies the version against
+Git identity, and rebuilds the sdist using only its persisted metadata. It builds the actual distribution in a temporary directory and verifies the
 package, default config, typing marker, dashboard assets, and console command. It first
 installs the base wheel and proves that the root API, AWS/local emitter modules, and a
 generic resource event work without supervisor dependencies. It then installs the
 `supervisor` extra in the same isolated environment and checks the dashboard assets and
 CLI. The wheel must not contain an `auto_classifier` namespace.
 
-The release workflow is intentionally separate from ordinary CI and runs only when a
-GitHub Release is published. It requires an exact `v<project.version>` tag, main-branch
-ancestry, the complete local quality gate, valid wheel and source-distribution metadata,
-and approval through the protected `pypi` environment. Its build job has no OIDC
-permission; only the dependency-free publishing job can request a short-lived PyPI
-credential. See {doc}`releasing` for the maintainer procedure.
+The release workflow runs only when a GitHub Release is published. It requires an
+exact `v<snapshot version>` tag, main-branch ancestry, the complete local quality gate,
+and valid wheel and source-distribution metadata. A separate job publishes verified
+distributions to PyPI with `id-token: write`, retaining approval through the protected
+`pypi` environment; the build job remains read-only. See {doc}`releasing` for the
+maintainer procedure and snapshot policy.

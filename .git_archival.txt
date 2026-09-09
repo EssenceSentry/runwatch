@@ -1,0 +1,2 @@
+commit_hash = $Format:%H$
+commit_timestamp = $Format:%ct$

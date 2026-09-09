@@ -165,7 +165,7 @@ _TQDM_BOOTSTRAP = dedent("""
     """)
 
 
-def tqdm_bootstrap_code(min_interval_seconds: float) -> str:
+def tqdm_bootstrap_code(min_interval_seconds: float, *, stream: bool = False) -> str:
     """Return isolated Python kernel code that installs tqdm progress capture."""
 
     payload = _TQDM_BOOTSTRAP.replace(
@@ -176,4 +176,9 @@ def tqdm_bootstrap_code(min_interval_seconds: float) -> str:
         "__RUNWATCH_RESOURCE_EVENT_SCHEMA_VERSION__",
         repr(RESOURCE_EVENT_SCHEMA_VERSION),
     )
+    if stream:
+        payload = payload.replace(
+            "from IPython.display import display as _runwatch_display\n    from IPython.display import update_display as _runwatch_update_display",
+            "import json as _runwatch_json\n    def _runwatch_display(bundle, **kwargs):\n        for mime, event in bundle.items():\n            print('__RUNWATCH_EVENT_JSON__=' + _runwatch_json.dumps({'mime_type': mime, 'payload': event}))\n    _runwatch_update_display = _runwatch_display",
+        )
     return f"exec({payload!r}, {{}})"

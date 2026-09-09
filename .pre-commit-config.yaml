@@ -24,7 +24,7 @@ repos:
         entry: .venv/bin/python scripts/check_release.py
         language: system
         pass_filenames: false
-        files: ^(pyproject\.toml|scripts/check_release\.py)$
+        files: ^(pyproject\.toml|build_backend\.py|\.git_archival\.txt|scripts/check_release\.py)$
 
       - id: quality-gate-parity
         name: quality gate parity
@@ -42,13 +42,13 @@ repos:
 
       - id: runwatch-ruff
         name: runwatch ruff
-        entry: .venv/bin/ruff check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py
+        entry: .venv/bin/ruff check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py build_backend.py
         language: system
         pass_filenames: false
 
       - id: runwatch-black
         name: runwatch black
-        entry: .venv/bin/black --check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py
+        entry: .venv/bin/black --check src tests scripts agent_skills web_artifacts_fake_sessions/runwatch/run.py docs/conf.py build_backend.py
         language: system
         pass_filenames: false
 
@@ -90,7 +90,7 @@ repos:
 
       - id: runwatch-tests-coverage
         name: runwatch tests with coverage
-        entry: uv run --extra supervisor --extra test python -m pytest tests --cov=runwatch --cov-branch --cov-report=term-missing --cov-fail-under=80
+        entry: uv run --extra supervisor --extra marimo --extra test python -m pytest tests --cov=runwatch --cov=build_backend --cov-branch --cov-report=term-missing --cov-fail-under=80
         language: system
         pass_filenames: false
 

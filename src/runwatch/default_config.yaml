@@ -4,6 +4,12 @@
 schema_version: 2
 
 notebook:
+  # auto selects Jupyter .ipynb or statically validated Marimo .py source.
+  backend: auto
+  marimo:
+    # Use a prepared interpreter; null uses Runwatch's Python. No dependencies are installed.
+    python_executable: null
+    capture_native_progress: true
   # null selects the notebook kernelspec; otherwise use an installed kernel name.
   kernel_name: null
   # Per-cell execution timeout. null allows long-running cells.

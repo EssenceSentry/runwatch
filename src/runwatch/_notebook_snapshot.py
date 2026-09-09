@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -184,7 +185,19 @@ def _timestamp(value: float) -> str:
 
 
 def _render_notebook(payload: bytes) -> str:
-    notebook = nbformat.reads(payload.decode("utf-8"), as_version=4)
+    text = payload.decode("utf-8")
+    if (
+        not text.lstrip().startswith("{")
+        and "import marimo" in text
+        and "marimo.App(" in text
+    ):
+        notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(text)])
+    elif json.loads(text).get("backend") == "marimo":
+        from ._marimo_snapshot import read_snapshot
+
+        notebook = read_snapshot(payload)
+    else:
+        notebook = nbformat.reads(text, as_version=4)
     metadata = notebook.get("metadata")
     if isinstance(metadata, dict):
         cast(dict[str, Any], metadata).pop("widgets", None)

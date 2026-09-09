@@ -9,7 +9,7 @@ description: "Durable notebook execution and typed resource monitoring with runw
 
 # Runwatch
 
-`runwatch` provides durable `nbclient` execution, failure pause and
+`runwatch` provides durable Jupyter and Marimo execution, failure pause and
 recovery, typed AWS and local resource monitors, and a mobile dashboard. Runwatch is
 agent-agnostic: edit the run-owned `source.ipynb` with ordinary `nbformat`, then use the
 `runwatch` CLI to resume or restart.
@@ -18,10 +18,12 @@ Optional native sleep inhibition keeps a macOS or Linux execution host awake for
 unattended run. Opt-in ntfy section notifications announce Markdown-headed transitions
 immediately before the next code cell begins.
 
-Install the package:
+Install a chosen snapshot from
+[PyPI](https://pypi.org/project/runwatch-notebook/#history), replacing the timestamp
+below. See {doc}`releasing` for versioning and source installation:
 
 ```bash
-python -m pip install "runwatch-notebook[supervisor]"
+python -m pip install "runwatch-notebook[supervisor]==0.0.dev<commit_timestamp>"
 runwatch init-config runwatch.yaml
 runwatch validate notebook.ipynb --config runwatch.yaml
 runwatch execute notebook.ipynb --config runwatch.yaml
@@ -52,6 +54,7 @@ complete emitter examples.
 :hidden:
 
 api
+marimo
 architecture
 resource-events
 security

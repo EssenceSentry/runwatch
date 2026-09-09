@@ -1,4 +1,13 @@
+# setuptools-scm lists every file in an unpacked Git archive. Keep the sdist
+# limited to build inputs even when a local archive contains runtime artifacts.
+global-exclude *
+include pyproject.toml
+include MANIFEST.in
 include LICENSE
 include README.md
+include RELEASE.md
+include build_backend.py
+include .git_archival.txt
+include .gitattributes
 recursive-include src/runwatch *.py *.typed *.yaml
-recursive-include web_artifacts *.css *.html *.js
+recursive-include web_artifacts *.css *.html *.js *.png *.json

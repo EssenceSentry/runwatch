@@ -72,6 +72,9 @@ class CellStatus(StrEnum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     SKIPPED = "skipped"
+    SETTLING = "settling"
+    STALE = "stale"
+    BLOCKED = "blocked"
 
 
 class ResourceStatus(StrEnum):
@@ -249,9 +252,18 @@ class ResourceRegistration(BaseModel):
     lifecycle: ResourceLifecycle = Field(default_factory=ResourceLifecycle)
 
 
+class MarimoSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    python_executable: str | None = None
+    capture_native_progress: bool = True
+
+
 class NotebookSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    backend: Literal["auto", "jupyter", "marimo"] = "auto"
+    marimo: MarimoSettings = Field(default_factory=MarimoSettings)
     kernel_name: str | None = None
     timeout_seconds: int | None = Field(default=None, gt=0)
     startup_timeout_seconds: int = Field(default=60, gt=0)
@@ -462,7 +474,7 @@ class RunnerCommand(BaseModel):
 
     action_id: str
     kind: Literal["resume", "restart", "cancel"]
-    from_cell: int = Field(default=0, ge=0)
+    from_cell: int | None = Field(default=None, ge=0)
     expected_kernel_epoch: int
     expected_failed_attempt: int | None = None
     requested_source_hash: str = ""

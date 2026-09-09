@@ -13,6 +13,11 @@ from .storage import controller_is_alive
 
 class CliRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    backend: str = "jupyter"
+    source_generation: int = 0
+    execution_batch: int = 0
+    active_cell_ids: list[str] = Field(default_factory=list)
+    failed_cell_ids: list[str] = Field(default_factory=list)
 
     name: str = Field(max_length=200)
     status: str = Field(max_length=32)
@@ -36,7 +41,7 @@ class CliResourceCounts(BaseModel):
 class CliStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = CLI_PRESENTATION_SCHEMA_VERSION
+    schema_version: Literal[2] = CLI_PRESENTATION_SCHEMA_VERSION
     run: CliRun
     source_path: str
     resources: CliResourceCounts
@@ -45,6 +50,9 @@ class CliStatus(BaseModel):
 
 class CliFailedCell(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    cell_id: str = ""
+    skip_reason: str | None = None
+    parents: list[str] = Field(default_factory=list)
 
     cell_index: int = Field(ge=0)
     label: str | None = Field(default=None, max_length=160)
@@ -71,7 +79,7 @@ class CliResource(BaseModel):
 class CliEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = CLI_PRESENTATION_SCHEMA_VERSION
+    schema_version: Literal[2] = CLI_PRESENTATION_SCHEMA_VERSION
     seq: int = Field(ge=0)
     timestamp: str
     type: str = Field(max_length=160)
@@ -88,9 +96,13 @@ class CliSuggestedCommands(BaseModel):
 class CliContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = CLI_PRESENTATION_SCHEMA_VERSION
+    schema_version: Literal[2] = CLI_PRESENTATION_SCHEMA_VERSION
     run: CliRun
     failed_cell: CliFailedCell | None = None
+    failed_cells: list[CliFailedCell] = Field(
+        default_factory=lambda: list[CliFailedCell]()
+    )
+    cells: list[CliFailedCell] = Field(default_factory=lambda: list[CliFailedCell]())
     resources: list[CliResource]
     recent_events: list[CliEvent]
     source_path: str
@@ -125,7 +137,7 @@ class CliPresenter:
         resources = cast(list[dict[str, Any]], self.snapshot.get("resources", []))
         return CliStatus(
             run=self._run(run),
-            source_path=str(self.run_dir / "source.ipynb"),
+            source_path=str(run.get("source_path", self.run_dir / "source.ipynb")),
             resources=CliResourceCounts(
                 total=len(resources),
                 active=sum(
@@ -150,10 +162,16 @@ class CliPresenter:
         )
         events = cast(list[dict[str, Any]], self.snapshot.get("events", []))[-40:]
         resources = cast(list[dict[str, Any]], self.snapshot.get("resources", []))
-        source_path = str(self.run_dir / "source.ipynb")
+        source_path = str(run.get("source_path", self.run_dir / "source.ipynb"))
         return CliContext(
             run=self._run(run),
             failed_cell=self._failed_cell(failed) if failed else None,
+            failed_cells=[
+                self._failed_cell(cell)
+                for cell in cells
+                if cell.get("status") in {"failed", "interrupted"}
+            ],
+            cells=[self._failed_cell(cell) for cell in cells],
             resources=[self._resource(resource) for resource in resources],
             recent_events=[self.event(event) for event in events],
             source_path=source_path,
@@ -179,6 +197,11 @@ class CliPresenter:
 
     def _run(self, run: dict[str, Any]) -> CliRun:
         return CliRun(
+            backend=str(run.get("backend", "jupyter")),
+            source_generation=int(run.get("source_generation", 0)),
+            execution_batch=int(run.get("execution_batch", 0)),
+            active_cell_ids=run.get("active_cell_ids", []),
+            failed_cell_ids=run.get("failed_cell_ids", []),
             name=self.redactor.text(run.get("name", "run"), max_chars=200),
             status=self.redactor.text(run.get("status", "unknown"), max_chars=32),
             message=_run_message(run),
@@ -194,6 +217,9 @@ class CliPresenter:
     def _failed_cell(self, cell: dict[str, Any]) -> CliFailedCell:
         error_name = cell.get("error_name")
         return CliFailedCell(
+            cell_id=str(cell.get("cell_id", "")),
+            skip_reason=cell.get("skip_reason"),
+            parents=[str(parent) for parent in cell.get("parents", [])],
             cell_index=max(0, int(cell.get("cell_index", 0))),
             label=(
                 self.redactor.text(cell["label"], max_chars=160)

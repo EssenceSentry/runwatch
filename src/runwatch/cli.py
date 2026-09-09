@@ -20,6 +20,7 @@ import typer
 import uvicorn
 
 from . import __version__
+from ._backends import default_output, resolve_backend, source_path_for_run
 from ._fs import PRIVATE_DIRECTORY_MODE, atomic_write_bytes, ensure_private_directory
 from .cli_presentation import CliPresenter
 from .config import dump_default_config, load_config
@@ -822,7 +823,9 @@ def _wait_action(
     raise TimeoutError(f"Timed out waiting for action {action_id}")
 
 
-def _queue_live_recovery(run_dir: Path, kind: ActionKind, from_cell: int) -> bool:
+def _queue_live_recovery(
+    run_dir: Path, kind: ActionKind, from_cell: int | None
+) -> bool:
     manifest, _config, store = _run_store(run_dir)
     try:
         run = store.get_run(manifest["run_id"])
@@ -837,7 +840,7 @@ def _queue_live_recovery(run_dir: Path, kind: ActionKind, from_cell: int) -> boo
             },
             expected_kernel_epoch=int(run["kernel_epoch"]),
             expected_cell_attempt=run.get("failed_attempt"),
-            expected_source_hash=source_hash(run_dir.resolve() / "source.ipynb"),
+            expected_source_hash=source_hash(source_path_for_run(run_dir.resolve())),
         )
         action = _wait_action(store, action_id, 60)
         if action["status"] != ActionStatus.COMPLETED.value:
@@ -851,7 +854,7 @@ def _queue_live_recovery(run_dir: Path, kind: ActionKind, from_cell: int) -> boo
 def _offline_recovery_action(
     run_dir: Path,
     kind: ActionKind,
-    from_cell: int,
+    from_cell: int | None,
     *,
     run_lock: RunLock,
 ) -> str:
@@ -867,7 +870,7 @@ def _offline_recovery_action(
                 "stopped-process recovery; retry the command"
             )
         store.recover_incomplete_actions(run_id)
-        digest = source_hash(run_dir.resolve() / "source.ipynb")
+        digest = source_hash(source_path_for_run(run_dir.resolve()))
         if kind is ActionKind.RESUME and RunStatus(run["status"]).terminal:
             raise RuntimeError(
                 "A terminal run cannot be resumed; use restart to rerun it"
@@ -881,7 +884,7 @@ def _offline_recovery_action(
                 continue
             matches = (
                 action["kind"] == kind.value
-                and int(action["payload"].get("from_cell", 0)) == from_cell
+                and action["payload"].get("from_cell") == from_cell
                 and action.get("expected_source_hash") == digest
                 and action.get("expected_kernel_epoch") == run["kernel_epoch"]
                 and action.get("expected_cell_attempt") == failed_attempt
@@ -910,7 +913,9 @@ def _offline_recovery_action(
         store.close()
 
 
-def _serve_stopped_recovery(run_dir: Path, kind: ActionKind, from_cell: int) -> int:
+def _serve_stopped_recovery(
+    run_dir: Path, kind: ActionKind, from_cell: int | None
+) -> int:
     lock = RunLock(run_dir)
     lock.acquire()
     try:
@@ -986,7 +991,12 @@ def execute(
         _require_new_run_dir(target_run_dir, run_lock=lock)
         supervisor = RunSupervisor(
             notebook_path=notebook,
-            output_path=(output or target_run_dir / "executed.ipynb").resolve(),
+            output_path=(
+                output
+                or default_output(
+                    notebook, target_run_dir, resolve_backend(notebook, loaded.notebook)
+                )
+            ).resolve(),
             working_dir=working,
             run_dir=target_run_dir,
             config=loaded,
@@ -1041,6 +1051,7 @@ def validate(
             "notebook": str(notebook),
             "working_dir": str(working),
             "kernel_name": "unknown",
+            "backend": "unknown",
             "cell_count": 0,
             "code_cell_count": 0,
             "configured_resources": [],
@@ -1074,10 +1085,10 @@ def resume(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
 ) -> None:
     """Resume a paused live run or reconstruct a stopped run from cell zero."""
-    if _queue_live_recovery(run_dir, ActionKind.RESUME, 0):
+    if _queue_live_recovery(run_dir, ActionKind.RESUME, None):
         return
     try:
-        raise typer.Exit(_serve_stopped_recovery(run_dir, ActionKind.RESUME, 0))
+        raise typer.Exit(_serve_stopped_recovery(run_dir, ActionKind.RESUME, None))
     except KeyboardInterrupt:
         raise typer.Exit(130) from None
 
@@ -1085,7 +1096,7 @@ def resume(
 @app.command()
 def restart(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
-    from_cell: Annotated[int, typer.Option("--from-cell", min=0)] = 0,
+    from_cell: Annotated[int | None, typer.Option("--from-cell", min=0)] = None,
 ) -> None:
     """Create a new kernel epoch and replay from FROM_CELL (zero-based)."""
     if _queue_live_recovery(run_dir, ActionKind.RESTART, from_cell):
@@ -1119,6 +1130,10 @@ def status(
                 f"{presented.run.name}: {presented.run.status} — "
                 f"{presented.run.message or ''}"
             )
+            typer.echo(f"Backend: {presented.run.backend}")
+            typer.echo(
+                f"Cells: {len(presented.run.active_cell_ids)} active, {len(presented.run.failed_cell_ids)} failed"
+            )
             typer.echo(f"Source: {presented.source_path}")
             typer.echo(f"Resources: {presented.resources.total}")
     finally:
@@ -1148,10 +1163,11 @@ def context(
         typer.echo(f"# Runwatch context: {dossier.run.name}\n")
         typer.echo(f"- Status: `{dossier.run.status}`")
         typer.echo(f"- Message: {dossier.run.message or '—'}")
+        typer.echo(f"- Backend: {dossier.run.backend}")
         typer.echo(f"- Kernel epoch: {dossier.run.kernel_epoch}")
+        typer.echo(f"- Active cells: {len(dossier.run.active_cell_ids)}")
         typer.echo(f"- Editable notebook: `{dossier.source_path}`")
-        if dossier.failed_cell:
-            failed = dossier.failed_cell
+        for failed in dossier.failed_cells:
             typer.echo(f"\n## Failed cell {failed.cell_index + 1}\n")
             typer.echo(f"- Attempt: {failed.attempt}")
             typer.echo(f"- Error type: `{failed.error_type or 'unknown'}`")

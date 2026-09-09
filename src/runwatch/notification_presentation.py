@@ -409,7 +409,11 @@ class NotificationPresenter:
                     cell_index=cell_index,
                 ),
             ),
-            dedup_key=f"section-started:{epoch}:{cell_index}",
+            dedup_key=(
+                f"section-started:{epoch}:{cell_index}:batch:{_nonnegative_int(payload['execution_batch'], 'execution_batch')}"
+                if "execution_batch" in payload
+                else f"section-started:{epoch}:{cell_index}"
+            ),
             destination_kinds=("ntfy",),
         )
 

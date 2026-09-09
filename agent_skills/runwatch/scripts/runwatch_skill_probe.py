@@ -107,11 +107,42 @@ async def _imported_source_restart(root: Path) -> dict[str, object]:
         await supervisor.close()
 
 
+async def _marimo_repair(root: Path) -> dict[str, object]:
+    path = root / "native.py"
+    path.write_text(
+        "import marimo\napp = marimo.App()\n@app.cell\ndef _():\n    value = 1 / 0\n    print(value)\n    return\n"
+    )
+    supervisor = RunSupervisor(
+        notebook_path=path,
+        output_path=root / "native.executed.html",
+        working_dir=root,
+        run_dir=root / "native-run",
+        config=RunwatchConfig(
+            notebook=NotebookSettings(wait_for_blocking_resources=False)
+        ),
+    )
+    try:
+        await supervisor.start()
+        await asyncio.wait_for(supervisor.runner.wait_until_paused(), 30)
+        supervisor.source_path.write_text(
+            supervisor.source_path.read_text().replace("1 / 0", "42")
+        )
+        supervisor.create_recovery_action(ActionKind.RESUME)
+        status = await asyncio.wait_for(supervisor.wait(), 30)
+        snapshot = json.loads((root / "native.executed.session.json").read_text())
+        if status.value != "succeeded" or snapshot["cells"][0]["attempt"] != 2:
+            raise AssertionError("Marimo repair did not retain the live epoch")
+        return {"status": status.value, "generation": snapshot["generation"]}
+    finally:
+        await supervisor.close()
+
+
 async def _main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         results = {
             "cell_local_repair": await _cell_local_repair(root),
+            "marimo_repair": await _marimo_repair(root),
             "imported_source_restart": await _imported_source_restart(root),
         }
     print(json.dumps(results, indent=2, default=str))

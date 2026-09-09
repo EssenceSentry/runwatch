@@ -31,7 +31,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qrcode.constants import ERROR_CORRECT_L
 
 from ._notebook_snapshot import (
@@ -83,6 +83,11 @@ class StopRequest(BaseModel):
 
 
 class DashboardRun(BaseModel):
+    backend: str = "jupyter"
+    source_generation: int = 0
+    execution_batch: int = 0
+    active_cell_ids: list[str] = Field(default_factory=list)
+    failed_cell_ids: list[str] = Field(default_factory=list)
     name: str
     status: str
     message: str | None = None
@@ -94,6 +99,9 @@ class DashboardRun(BaseModel):
 
 
 class DashboardCell(BaseModel):
+    cell_id: str = ""
+    skip_reason: str | None = None
+    parents: list[str] = Field(default_factory=list)
     cell_index: int
     cell_type: str
     label: str | None = None
@@ -170,7 +178,7 @@ class _NotebookSnapshotPresentation(BaseModel):
 
 
 class DashboardState(BaseModel):
-    schema_version: Literal[1] = DASHBOARD_SCHEMA_VERSION
+    schema_version: Literal[2] = DASHBOARD_SCHEMA_VERSION
     run: DashboardRun
     cells: list[DashboardCell]
     resources: list[DashboardResource]
@@ -505,6 +513,9 @@ def _dashboard_cell_label(cell: dict[str, Any]) -> str | None:
 
 def _dashboard_cell(cell: dict[str, Any]) -> DashboardCell:
     return DashboardCell(
+        cell_id=str(cell.get("cell_id", "")),
+        skip_reason=cell.get("skip_reason"),
+        parents=[str(parent) for parent in cell.get("parents", [])],
         cell_index=int(cell["cell_index"]),
         cell_type=str(cell["cell_type"]),
         label=_dashboard_cell_label(cell),
@@ -705,6 +716,11 @@ def _dashboard_state(supervisor: RunSupervisor) -> DashboardState:
     run = raw["run"]
     return DashboardState(
         run=DashboardRun(
+            backend=str(run.get("backend", "jupyter")),
+            source_generation=int(run.get("source_generation", 0)),
+            execution_batch=int(run.get("execution_batch", 0)),
+            active_cell_ids=run.get("active_cell_ids", []),
+            failed_cell_ids=run.get("failed_cell_ids", []),
             name=str(run["name"]),
             status=str(run["status"]),
             message=run.get("message"),
@@ -998,7 +1014,11 @@ def create_app(
     app.state.runwatch_notebook_renderer = NotebookSnapshotRenderer(
         source_path=supervisor.source_path,
         partial_output_path=supervisor.partial_output_path,
-        output_path=supervisor.output_path,
+        output_path=(
+            supervisor.output_path.with_suffix(".session.json")
+            if supervisor.source_path.suffix == ".py"
+            else supervisor.output_path
+        ),
     )
     app.state.runwatch_templates = templates
     app.state.runwatch_asset_version = asset_digest.hexdigest()[:12]

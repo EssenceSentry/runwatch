@@ -11,14 +11,14 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/runwatch-notebook/"><img src="https://img.shields.io/pypi/v/runwatch-notebook?logo=pypi&amp;logoColor=white&amp;label=PyPI" alt="PyPI package version"></a>
+  <a href="RELEASE.md"><img src="https://img.shields.io/badge/versions-commit%20snapshots-blue" alt="Commit snapshot versions"></a>
   <a href="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml"><img src="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main" alt="Quality gate"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
   <a href=".pre-commit-config.yaml"><img src="https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&amp;logoColor=white" alt="pre-commit enabled"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
-Runwatch is a reliability layer for Jupyter notebooks. It combines cell-by-cell
+Runwatch is a reliability layer for Jupyter and Marimo notebooks. It combines cell-by-cell
 `nbclient` execution with durable checkpoints, live resource monitoring, notifications,
 and a mobile-friendly dashboard. When a cell fails, the run pauses with its state and
 monitors intact, ready for you—or your coding agent—to repair and continue.
@@ -29,6 +29,19 @@ monitors intact, ready for you—or your coding agent—to repair and continue.
 [Run from VS Code](#run-from-vs-code) ·
 [Explore resource monitoring](#resource-emission) ·
 [See failure recovery](#failure-and-recovery) · [Read the docs](https://essencesentry.github.io/runwatch/)
+
+## Marimo notebooks
+
+Install a snapshot with the `supervisor,marimo` extras, then use `runwatch validate analysis.py`
+and `runwatch execute analysis.py`. Runwatch owns a private session with explicit
+execution and recovery. Edit the run-owned `source.py` and use `resume` for mapped body
+repairs or `restart` for a new graph execution. Prepared environments are required;
+Runwatch never installs notebook dependencies.
+
+Native results are `.executed.html` and `.executed.session.json`, with conflict-guarded
+repaired source written back to the original `.py`. Read the [Marimo workflow](docs/marimo.md)
+for graph recovery, selective restart, configuration, and the private API boundary.
+The Jupyter examples below retain their existing sequential semantics.
 
 ## Built for notebook jobs that have outgrown “Run All”
 
@@ -73,14 +86,15 @@ Python 3.10 or newer is required. Runwatch supports local POSIX filesystems on L
 and macOS; those are the platforms exercised in CI. Windows and shared/network
 filesystems are not currently supported execution targets.
 
-Install the published package from
-[PyPI](https://pypi.org/project/runwatch-notebook/) in the virtual environment used by
-your notebook project:
+Choose a snapshot version from the
+[PyPI release history](https://pypi.org/project/runwatch-notebook/#history), then install
+it in your notebook project environment. Replace `<commit_timestamp>` below:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install 'runwatch-notebook[supervisor]'
+RUNWATCH_VERSION="0.0.dev<commit_timestamp>"
+python -m pip install "runwatch-notebook[supervisor]==${RUNWATCH_VERSION}"
 ```
 
 The `supervisor` extra is the recommended installation for people running notebooks.
@@ -92,19 +106,24 @@ The smaller, Pydantic-only base package is intended for kernels or integrations 
 only emit generic Runwatch protocol events:
 
 ```bash
-python -m pip install runwatch-notebook
+python -m pip install "runwatch-notebook==${RUNWATCH_VERSION}"
 ```
 
 Install optional NVIDIA monitoring support with:
 
 ```bash
-python -m pip install 'runwatch-notebook[supervisor,gpu]'
+python -m pip install "runwatch-notebook[supervisor,gpu]==${RUNWATCH_VERSION}"
 ```
+
+Versions use `0.0.dev<commit_timestamp>`. Each commit may contain
+breaking changes; pin a chosen snapshot and validate it in your project. The
+[release policy](RELEASE.md) explains source installs and archive builds. Pin the
+exact version: these development snapshots sort below historical PyPI `0.2.0`.
 
 To develop Runwatch itself from a source checkout:
 
 ```bash
-uv sync --extra supervisor --extra test --extra dev --extra docs
+uv sync --extra supervisor --extra marimo --extra test --extra dev --extra docs
 uv run pytest tests
 uv run ruff check src tests
 ```
@@ -185,13 +204,15 @@ below is project-local: it uses the project's `.venv`, reads notification secret
 an ignored `.env`, prepares a matching Jupyter kernel, and runs whichever saved
 notebook is active in the editor.
 
-First create the project's virtual environment and install Runwatch from PyPI together
-with `ipykernel` and the `dotenv` command. No Runwatch source checkout is required:
+First create the project's virtual environment and install a chosen Runwatch snapshot
+together with `ipykernel` and the `dotenv` command. Replace the timestamp below;
+no Runwatch source checkout is required:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install 'runwatch-notebook[supervisor]' ipykernel 'python-dotenv[cli]'
+RUNWATCH_VERSION="0.0.dev<commit_timestamp>"
+python -m pip install "runwatch-notebook[supervisor]==${RUNWATCH_VERSION}" ipykernel 'python-dotenv[cli]'
 ```
 
 Create `.vscode/runwatch.yaml`:

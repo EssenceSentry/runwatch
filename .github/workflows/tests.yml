@@ -32,11 +32,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra supervisor --extra test
+        run: uv sync --locked --extra supervisor --extra marimo --extra test
       - name: Pytest
         run: >
           uv run python -m pytest tests
           --cov=runwatch
+          --cov=build_backend
           --cov-branch
           --cov-report=term-missing
           --cov-fail-under=80

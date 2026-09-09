@@ -514,7 +514,7 @@ class RunStore:
             "SELECT value FROM runwatch_meta WHERE key = 'schema_version'"
         ).fetchone()
         version = int(row["value"]) if row else 0
-        if version not in {2, DATABASE_SCHEMA_VERSION}:
+        if version not in {2, 3, DATABASE_SCHEMA_VERSION}:
             raise UnsupportedRunSchema(
                 "Unsupported Runwatch database schema version "
                 f"{version}; expected {DATABASE_SCHEMA_VERSION}"
@@ -536,6 +536,12 @@ class RunStore:
             )
         if version == 2:
             self._migrate_schema_v2_to_v3()
+        if version in {2, 3}:
+            self._connection.execute(
+                "UPDATE runwatch_meta SET value = ? WHERE key = 'schema_version'",
+                (str(DATABASE_SCHEMA_VERSION),),
+            )
+            self._connection.commit()
         integrity = self._connection.execute("PRAGMA quick_check").fetchone()
         if integrity is None or integrity[0] != "ok":
             detail = integrity[0] if integrity else "no result"
@@ -4008,6 +4014,21 @@ class RunStore:
             self._connection.commit()
         return updated.rowcount == 1
 
+    def update_notebook_state(self, run_id: str, state: dict[str, Any]) -> None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT metadata_json FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            metadata = json_loads(row["metadata_json"], {})
+            metadata["notebook"] = {**metadata.get("notebook", {}), **state}
+            self._connection.execute(
+                "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                (json_dumps(metadata), run_id),
+            )
+            self._connection.commit()
+
     def snapshot(self, run_id: str, *, chart_points: int = 300) -> dict[str, Any]:
         run = self.get_run(run_id)
         with self._lock:
@@ -4022,10 +4043,30 @@ class RunStore:
             resource["observations"] = observation_histories.get(
                 str(resource["internal_id"]), []
             )
+        cells = [self._decode_cell(row) for row in cell_rows]
+        native = run.get("metadata", {}).get("notebook", {})
+        graph = {
+            cell["id"]: cell.get("parents", []) for cell in native.get("cells", [])
+        }
+        run["backend"] = native.get("backend", "jupyter")
+        run["source_generation"] = native.get("generation", 0)
+        run["execution_batch"] = native.get("batch", 0)
+        run["active_cell_ids"] = [
+            cell["cell_id"] for cell in cells if cell["status"] == "running"
+        ]
+        run["failed_cell_ids"] = [
+            cell["cell_id"]
+            for cell in cells
+            if cell["status"] in {"failed", "interrupted"}
+        ]
+        reasons = {c["id"]: c.get("skip_reason") for c in native.get("cells", [])}
+        for cell in cells:
+            cell["parents"] = graph.get(cell["cell_id"], [])
+            cell["skip_reason"] = reasons.get(cell["cell_id"])
         return {
             "schema_version": RUN_SNAPSHOT_SCHEMA_VERSION,
             "run": run,
-            "cells": [self._decode_cell(row) for row in cell_rows],
+            "cells": cells,
             "resources": resources,
             "events": self.recent_events(run_id),
             "actions": self.list_actions(run_id),

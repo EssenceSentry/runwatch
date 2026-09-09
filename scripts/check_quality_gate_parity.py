@@ -109,6 +109,29 @@ def _parity_errors(tool: str) -> list[str]:
     return errors
 
 
+def _test_gate_parity() -> list[str]:
+    local = shlex.split(_local_hook_entries()["runwatch-tests-coverage"])
+    workflow = _load_yaml(ROOT / ".github/workflows/tests.yml")
+    steps = {
+        step["name"]: step
+        for step in workflow["jobs"]["tests"]["steps"]
+        if "name" in step
+    }
+    remote = shlex.split(steps["Pytest"]["run"])
+    install = shlex.split(steps["Install"]["run"])
+    errors: list[str] = []
+    if local[local.index("pytest") :] != remote[remote.index("pytest") :]:
+        errors.append(
+            "pytest targets and coverage arguments differ between local and CI gates"
+        )
+    for extra in ("supervisor", "marimo", "test"):
+        for label, command in (("local", local), ("CI", install)):
+            pairs = set(zip(command, command[1:]))
+            if ("--extra", extra) not in pairs:
+                errors.append(f"{label} test environment is missing the {extra} extra")
+    return errors
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -124,6 +147,7 @@ def main() -> int:
     args = parse_args()
     tools = args.tool or sorted(PRE_COMMIT_HOOKS)
     errors = [error for tool in tools for error in _parity_errors(tool)]
+    errors.extend(_test_gate_parity())
     if errors:
         for error in errors:
             print(error)
