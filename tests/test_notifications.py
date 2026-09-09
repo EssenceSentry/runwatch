@@ -448,7 +448,9 @@ async def test_failed_delivery_retries_then_deduplicates_only_after_success(
 
 
 @pytest.mark.asyncio
-async def test_delivery_failures_are_bounded_and_persisted(tmp_path: Path) -> None:
+async def test_delivery_failures_are_bounded_and_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -467,6 +469,16 @@ async def test_delivery_failures_are_bounded_and_persisted(tmp_path: Path) -> No
         bus=EventBus(store, "run"),
         run_id="run",
     )
+    publish = manager.bus.publish
+
+    async def delayed_failure_event(
+        event_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if event_type == "notification.failed":
+            await asyncio.sleep(0.02)
+        return await publish(event_type, payload)
+
+    monkeypatch.setattr(manager.bus, "publish", delayed_failure_event)
     await manager._client.aclose()
     replace_client(manager, handler)
     await manager.start()
@@ -474,6 +486,14 @@ async def test_delivery_failures_are_bounded_and_persisted(tmp_path: Path) -> No
     assert intent is not None
     await wait_until(
         lambda: notification_intent_has_status(store, intent["intent_id"], "failed")
+    )
+    # Delivery state is committed before the delivery loop reports transitions.
+    # Await that separate publication before inspecting the persisted event.
+    await wait_until(
+        lambda: any(
+            event["type"] == "notification.failed"
+            for event in store.recent_events("run")
+        )
     )
 
     assert len(requests) == 2
