@@ -13,8 +13,8 @@ source changes; use the Runwatch CLI for run transitions and resource control.
 1. Run the notebook with `runwatch execute`. Use `--share lan` on a trusted local
    network, or `--share cloudflared` when the other device needs a public route.
 2. Stay attached to the command output until Runwatch prints its `Dashboard:` line.
-   If the command yields a background session, keep polling that session. Do not infer
-   or construct the URL yourself.
+   If the command yields a background session, read that session until the line
+   appears. Do not infer or construct the URL yourself.
 3. After every launch, immediately give the user the exact URL from `Dashboard:`,
    including its token. Present it both as a clickable Markdown link and as raw text.
    In Cloudflare mode this is the local control page; its current public link and QR
@@ -33,6 +33,21 @@ source changes; use the Runwatch CLI for run transitions and resource control.
    `execute`. By default the final dashboard remains observable for 90 seconds, then a
    successful run directory is removed unless the run was launched with `--keep-run`;
    failed and recoverable runs are retained.
+
+## Wait for a run to finish
+
+Re-running `runwatch status` to wait spends a turn on every check. When the `ax` CLI
+is available, hand the wait to it:
+
+1. `ax job watch runwatch RUN_DIR --key NAME` registers the run. Add `--wake auto` when
+   the run may outlast your session; it resumes your session when the run ends.
+2. In Claude Code, run `ax job wait NAME` as a background command; its exit wakes you.
+   In Codex, run `ax job wait NAME --timeout 1500`, or end the turn after `--wake codex`.
+3. Exit 0 means the run succeeded. Exit 1 means it failed or paused for repair: run
+   `runwatch context RUN_DIR --json` and recover it as below. A paused run ends its ax
+   job, so after `runwatch resume` register it again under a new key.
+
+Without `ax`, check `runwatch status RUN_DIR --json` at long intervals.
 
 ## Recover a Jupyter run
 
