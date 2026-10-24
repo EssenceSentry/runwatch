@@ -518,6 +518,19 @@ function displayedResourceStatus(resource, run) {
   return {label: friendlyStatus(resource.status), tone: resource.status};
 }
 
+// A resource stops needing the user once the work it belonged to has been retried: its
+// cell ran again (a later attempt, or a new kernel epoch after a restart), or Runwatch
+// marked it superseded, cancelled or ignored. Its card stays under Resources as history.
+// Cells a restart skipped (not_replayed) did not run again, so their failures stand.
+function supersededResource(resource, cells) {
+  if (resource.disposition && resource.disposition !== 'active') return true;
+  if (resource.cell_index == null) return false;
+  const cell = cells.find(item => item.cell_index === resource.cell_index);
+  if (!cell || cell.status === 'not_replayed') return false;
+  if ((cell.kernel_epoch ?? 0) > (resource.kernel_epoch ?? 0)) return true;
+  return resource.attempt != null && cell.attempt > resource.attempt;
+}
+
 function collectIssues(snapshot) {
   const issues = [];
   const {run, cells, resources} = snapshot;
@@ -529,6 +542,7 @@ function collectIssues(snapshot) {
     severity: 'error',
   }));
   resources.forEach(resource => {
+    if (supersededResource(resource, cells)) return;
     if (RESOURCE_ERRORS.has(resource.status)) issues.push({
       title: `${resourceName(resource)} needs attention`,
       detail: resource.message || `Resource status: ${friendlyStatus(resource.status)}.`,

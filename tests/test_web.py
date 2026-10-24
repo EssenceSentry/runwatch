@@ -1171,3 +1171,106 @@ def test_runwatch_web_artifact_is_unbranded_and_uses_shared_components() -> None
     assert "/static/common/neumorphic-gloss-components.css" in template
     assert "pixability" not in bundle.lower()
     assert "pixability.jpg" not in bundle.lower()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_carries_cell_and_resource_kernel_epochs(
+    tmp_path: Path,
+) -> None:
+    notebook_path = tmp_path / "one.ipynb"
+    notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("1")])
+    nbformat.write(notebook, notebook_path)
+    supervisor = RunSupervisor(
+        notebook_path=notebook_path,
+        output_path=tmp_path / "out.ipynb",
+        working_dir=tmp_path,
+        run_dir=tmp_path / "run",
+        config=RunwatchConfig(),
+    )
+    supervisor.store.register_resource(
+        run_id=supervisor.run_id,
+        event=ResourceEvent(
+            resource=ResourceSpec(
+                provider="aws",
+                type="sagemaker_processing_job",
+                id="embeddings-1785866245",
+                ownership=Ownership.EXCLUSIVE,
+            ),
+            lifecycle=ResourceLifecycle(blocking=False),
+        ),
+        cell_index=0,
+        attempt=1,
+        kernel_epoch=0,
+        supports_stop=False,
+    )
+    client = TestClient(create_app(supervisor, "secret-token"))
+    client.get("/?token=secret-token")
+    snapshot = client.get("/api/state").json()
+
+    assert snapshot["resources"][0]["kernel_epoch"] == 0
+    assert snapshot["cells"][0]["kernel_epoch"] == 0
+
+    await supervisor.close()
+
+
+def _superseded_resource(
+    resource: dict[str, object], cells: list[dict[str, object]]
+) -> bool:
+    script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
+    start = script.index("function supersededResource")
+    source = script[start : script.index("\nfunction ", start + 1)]
+    program = (
+        f"{source}\n"
+        f"process.stdout.write(JSON.stringify(supersededResource("
+        f"{json.dumps(resource)}, {json.dumps(cells)})));"
+    )
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, text=True, timeout=30, check=True
+    )
+    return bool(json.loads(done.stdout))
+
+
+@pytest.mark.parametrize(
+    ("resource", "cell", "expected"),
+    [
+        # The screenshot in todo.md: retry 2 runs while attempt 1's job stays failed.
+        ({"cell_index": 24, "attempt": 1, "kernel_epoch": 0}, {"attempt": 2}, True),
+        ({"cell_index": 24, "attempt": 2, "kernel_epoch": 0}, {"attempt": 2}, False),
+        # A restart rebuilds the cells in a new kernel epoch with fresh attempt counts.
+        (
+            {"cell_index": 24, "attempt": 2, "kernel_epoch": 0},
+            {"attempt": 1, "kernel_epoch": 1},
+            True,
+        ),
+        # Cells before --from-cell are not replayed, so their failures still stand.
+        (
+            {"cell_index": 24, "attempt": 1, "kernel_epoch": 0},
+            {"attempt": 0, "kernel_epoch": 1, "status": "not_replayed"},
+            False,
+        ),
+        (
+            {"cell_index": 24, "attempt": 1, "disposition": "superseded"},
+            {"attempt": 1},
+            True,
+        ),
+        ({"cell_index": None, "attempt": None}, {"attempt": 3}, False),
+    ],
+)
+def test_a_failed_resource_stops_needing_the_user_once_its_cell_is_retried(
+    resource: dict[str, object], cell: dict[str, object], expected: bool
+) -> None:
+    resource = {"disposition": "active", "status": "failed", **resource}
+    cells = [{"cell_index": 24, "kernel_epoch": 0, "status": "running", **cell}]
+    assert _superseded_resource(resource, cells) is expected
+
+
+def test_attention_skips_resources_superseded_by_a_retry() -> None:
+    script = (_WEB_ARTIFACTS / "runwatch/app.js").read_text(encoding="utf-8")
+    collect = script.split("function collectIssues", 1)[1].split("\nfunction ", 1)[0]
+    assert "supersededResource(resource, cells)" in collect

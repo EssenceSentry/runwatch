@@ -107,6 +107,7 @@ class DashboardCell(BaseModel):
     label: str | None = None
     status: str
     attempt: int
+    kernel_epoch: int = 0
     started_at: str | None = None
     ended_at: str | None = None
     elapsed_seconds: float | None = None
@@ -134,6 +135,7 @@ class DashboardResource(BaseModel):
     internal_id: str
     cell_index: int | None = None
     attempt: int | None = None
+    kernel_epoch: int | None = None
     provider: str
     resource_type: str
     external_id: str
@@ -521,6 +523,7 @@ def _dashboard_cell(cell: dict[str, Any]) -> DashboardCell:
         label=_dashboard_cell_label(cell),
         status=str(cell["status"]),
         attempt=int(cell["attempt"]),
+        kernel_epoch=int(cell.get("kernel_epoch") or 0),
         started_at=cell.get("started_at"),
         ended_at=cell.get("ended_at"),
         elapsed_seconds=cell.get("elapsed_seconds"),
@@ -604,6 +607,7 @@ def _dashboard_resource(resource: dict[str, Any]) -> DashboardResource:
         internal_id=str(resource["internal_id"]),
         cell_index=resource.get("cell_index"),
         attempt=resource.get("attempt"),
+        kernel_epoch=resource.get("kernel_epoch"),
         provider=str(resource["provider"]),
         resource_type=resource_type,
         external_id=_dashboard_external_id(resource),
