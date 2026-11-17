@@ -4,11 +4,7 @@
 
 <h1 align="center">Runwatch</h1>
 
-<p align="center"><strong>Turn long-running notebooks into durable, observable jobs—without turning them into pipelines.</strong></p>
-
-<p align="center">
-  Run the notebook you already have. Follow it from your phone. Recover where the work failed.
-</p>
+If the last cell of a long notebook fails, the earlier work may still be sitting in a live kernel. Runwatch pauses at the failure, keeps the dashboard available, and lets you repair the run-owned source and resume. It supports Jupyter and Marimo notebooks, with recovery rules for each.
 
 <p align="center">
   <a href="RELEASE.md"><img src="https://img.shields.io/badge/versions-commit%20snapshots-blue" alt="Commit snapshot versions"></a>
@@ -18,17 +14,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
-Runwatch is a reliability layer for Jupyter and Marimo notebooks. It combines cell-by-cell
-`nbclient` execution with durable checkpoints, live resource monitoring, notifications,
-and a mobile-friendly dashboard. When a cell fails, the run pauses with its state and
-monitors intact, ready for you—or your coding agent—to repair and continue.
+**See a run in progress.** The [replayable example](web_artifacts_fake_sessions/runwatch/README.md) runs a real notebook against local fixtures. Follow its batch progress, watch a results file grow, and inspect the dashboard. The example uses local resources and needs no AWS credentials.
 
-**Keep notebook ergonomics. Gain the confidence of an operational job.**
+For your own experiment, [install a pinned snapshot](#installation), [launch a notebook](#first-run), and keep the dashboard URL printed by the CLI. If a cell fails, use the [recovery guide](#failure-and-recovery) to choose between resuming the live session and replaying in a fresh kernel.
 
-[Install from PyPI](#installation) · [Run your first notebook](#first-run) ·
-[Run from VS Code](#run-from-vs-code) ·
-[Explore resource monitoring](#resource-emission) ·
-[See failure recovery](#failure-and-recovery) · [Read the docs](https://essencesentry.github.io/runwatch/)
+[VS Code workflow](#run-from-vs-code) · [Resource monitoring](#resource-emission) · [Documentation](docs/index.md)
 
 ## Marimo notebooks
 
