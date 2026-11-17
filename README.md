@@ -9,6 +9,7 @@ If the last cell of a long notebook fails, the earlier work may still be sitting
 <p align="center">
   <a href="RELEASE.md"><img src="https://img.shields.io/badge/versions-commit%20snapshots-blue" alt="Commit snapshot versions"></a>
   <a href="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml"><img src="https://github.com/EssenceSentry/runwatch/actions/workflows/quality-gate.yml/badge.svg?branch=main" alt="Quality gate"></a>
+  <a href="https://github.com/EssenceSentry/runwatch/actions/workflows/tests.yml"><img src="https://github.com/EssenceSentry/runwatch/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11.5%2B-blue" alt="Python 3.11.5+"></a>
   <a href=".pre-commit-config.yaml"><img src="https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&amp;logoColor=white" alt="pre-commit enabled"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
