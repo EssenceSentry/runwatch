@@ -209,15 +209,17 @@ jobs:
 
   compatibility:
     name: compatibility-${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: minimum-direct
+            os: ubuntu-24.04
             python-version: "3.11.5"
             resolution: lowest-direct
           - name: latest
+            os: ubuntu-latest
             python-version: "3.13"
             resolution: highest
     steps:

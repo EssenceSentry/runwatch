@@ -18,8 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11.5", "3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
         include:
+          - os: ubuntu-24.04
+            python-version: "3.11.5"
           - os: macos-latest
             python-version: "3.12"
     steps:
