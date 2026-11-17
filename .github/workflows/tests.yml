@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.11.5", "3.11", "3.12", "3.13"]
         include:
           - os: macos-latest
             python-version: "3.12"
@@ -32,10 +32,10 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install
-        run: uv sync --locked --extra supervisor --extra marimo --extra test
+        run: uv sync --locked --python "${{ matrix.python-version }}" --extra supervisor --extra marimo --extra test
       - name: Pytest
         run: >
-          uv run python -m pytest tests
+          .venv/bin/python -m pytest tests
           --cov=runwatch
           --cov=build_backend
           --cov-branch

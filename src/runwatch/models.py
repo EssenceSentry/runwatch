@@ -36,7 +36,7 @@ def _validate_json_value(value: Any, *, path: str = "value") -> None:
 
 
 class StrEnum(str, Enum):
-    """Python 3.10-compatible string enum."""
+    """String enum that renders its stored value."""
 
     def __str__(self) -> str:
         return self.value

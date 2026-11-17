@@ -47,7 +47,7 @@ arguments, and the supervisor/Marimo/test extras. Native integration and wheel p
 exercise the locked Marimo API alongside the Jupyter regression suite.
 
 The main jobs use the committed lockfile for reproducibility. A separate compatibility
-matrix deliberately resolves without that lockfile: Python 3.10 uses uv's
+matrix deliberately resolves without that lockfile: Python 3.11.5 uses uv's
 `lowest-direct` strategy to exercise declared dependency floors, while Python 3.13 uses
 the latest available versions within Runwatch's declared bounds. Both lanes execute the
 private `nbclient` hook signature probes, cleanup serialization, and a real fallback

@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
-import tomllib
 import yaml
 from yaml.constructor import ConstructorError
 

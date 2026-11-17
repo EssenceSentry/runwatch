@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "setuptools-scm", "wheel"]
+requires = ["setuptools>=84.1.0", "setuptools-scm", "wheel"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -8,7 +8,7 @@ name = "runwatch-notebook"
 dynamic = ["version"]
 description = "Durable notebook execution with typed resource monitoring and a mobile dashboard"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11.5"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Agustín Sellanes"}]
@@ -20,7 +20,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -45,7 +44,7 @@ supervisor = [
     "jinja2>=3.1",
     "jupyter-client>=8.9.1",
     "nbclient>=0.10.4,<0.12",
-    "nbconvert>=7.17.1,<8",
+    "nbconvert>=7.17.2,<8",
     "nbformat>=5.10,<6",
     "numpy>=1.26,<3",
     "psutil>=5.9",
@@ -62,19 +61,18 @@ test = [
     "pytest>=7",
     "pytest-asyncio>=0.21",
     "pytest-cov>=5",
-    "setuptools>=68",  # Tests exercise the snapshot build backend directly.
+    "setuptools>=84.1.0",  # Tests exercise the snapshot build backend directly.
     "tqdm>=4.66,<5",
 ]
 dev = [
-    "black>=22",
+    "black>=26.10.1",
     "build>=1.5,<1.5.1",
     "flake8>=7.1",
     "flake8-cognitive-complexity>=0.1",
     "pre-commit>=2.17",
     "pyright>=1.1.409,<2",
     "ruff>=0.4",
-    "setuptools>=68",  # Release and wheel checks load the build backend.
-    "tomli>=2,<3; python_version < '3.11'",
+    "setuptools>=84.1.0",  # Release and wheel checks load the build backend.
     "twine>=6,<7",
     "pyyaml>=6",
     "types-PyYAML>=6.0.12,<7",
@@ -150,7 +148,7 @@ runwatch = ["py.typed", "*.yaml"]
 
 [tool.black]
 line-length = 88
-target-version = ["py310"]
+target-version = ["py311"]
 include = "\\.pyi?$"
 extend-exclude = """
 /(
@@ -166,7 +164,7 @@ extend-exclude = """
 """
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 exclude = ["typings"]
 
