@@ -14,6 +14,8 @@ If the last cell of a long notebook fails, the earlier work may still be sitting
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
+**[Watch a failed notebook recover](examples/recovery/README.md).** The execution counter stays at one after a live repair and reaches two when the kernel dies. Both runs produce the same result.
+
 **See a run in progress.** The [replayable example](web_artifacts_fake_sessions/runwatch/README.md) runs a real notebook against local fixtures. Follow its batch progress, watch a results file grow, and inspect the dashboard. The example uses local resources and needs no AWS credentials.
 
 For your own experiment, [install a pinned snapshot](#installation), [launch a notebook](#first-run), and keep the dashboard URL printed by the CLI. If a cell fails, use the [recovery guide](#failure-and-recovery) to choose between resuming the live session and replaying in a fresh kernel.
