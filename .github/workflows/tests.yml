@@ -22,7 +22,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             python-version: "3.11.5"
-          - os: macos-latest
+          - os: macos-15
             python-version: "3.12"
     steps:
       - uses: actions/checkout@v4

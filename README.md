@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="web_artifacts/runwatch/mascot/ready.png" width="160" alt="Runwatch mascot">
-</p>
+![Runwatch — Long notebook runs. A clear way back from failure.](.github/assets/banner.svg)
 
-<h1 align="center">Runwatch</h1>
-
-If the last cell of a long notebook fails, the earlier work may still be sitting in a live kernel. Runwatch pauses at the failure, keeps the dashboard available, and lets you repair the run-owned source and resume. It supports Jupyter and Marimo notebooks, with recovery rules for each.
+# Runwatch
 
 <p align="center">
   <a href="RELEASE.md"><img src="https://img.shields.io/badge/versions-commit%20snapshots-blue" alt="Commit snapshot versions"></a>
@@ -15,13 +11,15 @@ If the last cell of a long notebook fails, the earlier work may still be sitting
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
-**[Watch a failed notebook recover](examples/recovery/README.md).** The execution counter stays at one after a live repair and reaches two when the kernel dies. Both runs produce the same result.
+**A failed cell should come with a recovery path.** Runwatch executes Jupyter and Marimo notebooks with a live dashboard, durable run state, and explicit repair-and-resume workflows. Inspect what happened, edit the run-owned source, and continue when the kernel and edit are eligible for live recovery.
 
-**See a run in progress.** The [replayable example](web_artifacts_fake_sessions/runwatch/README.md) runs a real notebook against local fixtures. Follow its batch progress, watch a results file grow, and inspect the dashboard. The example uses local resources and needs no AWS credentials.
+**[Watch a notebook recover →](examples/recovery/README.md)** · [Try the replayable demo](web_artifacts_fake_sessions/runwatch/README.md) · [Install a pinned snapshot](#installation)
 
-For your own experiment, [install a pinned snapshot](#installation), [launch a notebook](#first-run), and keep the dashboard URL printed by the CLI. If a cell fails, use the [recovery guide](#failure-and-recovery) to choose between resuming the live session and replaying in a fresh kernel.
+- **Keep useful work in view.** Follow cells, output, tracebacks, progress, and linked resources from a desktop or phone.
+- **Choose the right recovery.** Resume an eligible live session or replay in a fresh kernel after a restart. The recovery example makes the difference visible through execution counts.
+- **Use the workflow from a terminal or an agent.** Ordinary files, structured context, and explicit CLI commands keep control with the person running the experiment.
 
-[VS Code workflow](#run-from-vs-code) · [Resource monitoring](#resource-emission) · [Documentation](docs/index.md)
+The replayable demo runs a real notebook against local fixtures and needs no AWS credentials. [Failure and recovery](#failure-and-recovery) · [VS Code workflow](#run-from-vs-code) · [Documentation](docs/index.md)
 
 ## Marimo notebooks
 
